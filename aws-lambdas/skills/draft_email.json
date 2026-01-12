@@ -1,0 +1,43 @@
+{
+  "skill_id": "draft_email",
+  "name": "draft_email",
+  "description": "Draft a professional email",
+  "category": "communication",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "email_type": {
+        "type": "string",
+        "enum": ["outreach", "followup", "introduction", "request", "notification"],
+        "description": "Type of email to draft"
+      },
+      "recipient_name": {
+        "type": "string",
+        "description": "Name of the recipient"
+      },
+      "subject_matter": {
+        "type": "string",
+        "description": "Subject or topic of the email"
+      },
+      "tone": {
+        "type": "string",
+        "enum": ["formal", "friendly", "urgent"],
+        "description": "Tone of the email"
+      },
+      "key_points": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Key points to include in the email"
+      }
+    },
+    "required": ["email_type", "recipient_name"]
+  },
+  "output_format": {
+    "type": "object",
+    "properties": {
+      "subject": {"type": "string"},
+      "body": {"type": "string"},
+      "suggested_send_time": {"type": "string"}
+    }
+  }
+}

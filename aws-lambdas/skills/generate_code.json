@@ -1,0 +1,49 @@
+{
+  "skill_id": "generate_code",
+  "name": "generate_code",
+  "description": "Generate code for data processing or automation tasks",
+  "category": "development",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "task_type": {
+        "type": "string",
+        "enum": ["data_enrichment", "api_integration", "workflow_automation", "data_analysis", "email_template"],
+        "description": "Type of code to generate"
+      },
+      "description": {
+        "type": "string",
+        "description": "Detailed description of what the code should do"
+      },
+      "language": {
+        "type": "string",
+        "enum": ["python", "javascript", "typescript"],
+        "default": "python",
+        "description": "Programming language"
+      },
+      "dependencies": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Required libraries/dependencies"
+      },
+      "input_format": {
+        "type": "object",
+        "description": "Expected input data format"
+      },
+      "output_format": {
+        "type": "object",
+        "description": "Expected output data format"
+      }
+    },
+    "required": ["task_type", "description"]
+  },
+  "output_format": {
+    "type": "object",
+    "properties": {
+      "code": {"type": "string"},
+      "explanation": {"type": "string"},
+      "dependencies": {"type": "array", "items": {"type": "string"}},
+      "usage_example": {"type": "string"}
+    }
+  }
+}

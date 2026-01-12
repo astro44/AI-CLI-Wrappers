@@ -1,0 +1,41 @@
+{
+  "skill_id": "enrich_profile",
+  "name": "enrich_profile",
+  "description": "Analyze and enrich a data profile with insights",
+  "category": "data",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "profile": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string"},
+          "email": {"type": "string"},
+          "url": {"type": "string"},
+          "role": {"type": "string"},
+          "organization": {"type": "string"},
+          "location": {"type": "string"},
+          "tags": {"type": "array", "items": {"type": "string"}}
+        },
+        "description": "Raw profile data"
+      },
+      "enrichment_fields": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "enum": ["summary", "categorization", "sentiment", "key_attributes", "recommendations"]
+        },
+        "description": "Fields to enrich"
+      }
+    },
+    "required": ["profile"]
+  },
+  "output_format": {
+    "type": "object",
+    "properties": {
+      "enriched_profile": {"type": "object"},
+      "insights": {"type": "array", "items": {"type": "string"}},
+      "confidence_scores": {"type": "object"}
+    }
+  }
+}
