@@ -115,6 +115,18 @@ The wrappers print JSON to **stdout**. The output typically follows this structu
 - Supports workspace configuration for context awareness.
 - Auto-approves MCP tool usage when `--allowed-tools` is set.
 
+## AWS Lambda Integration
+
+This repository also contains serverless implementations for AI agents, located in the `aws-lambdas/` directory. These Lambdas provide direct API access to agent capabilities without requiring a local CLI environment.
+
+### Components
+- **AI-Agent-Claude**: AWS Lambda implementation for Anthropic's Claude.
+- **AI-Agent-Gemini**: AWS Lambda implementation for Google's Gemini.
+- **AI-Agent-Codex**: AWS Lambda implementation for OpenAI's Codex/GPT models.
+- **sync_config.py**: Utility script to sync persona and skill definitions to DynamoDB or S3.
+
+See [aws-lambdas/README.md](aws-lambdas/README.md) for detailed deployment and usage instructions.
+
 ## Integration with CLIManager
 
 The `go-autonom8/climanager` package relies on these wrappers to:
