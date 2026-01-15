@@ -228,12 +228,20 @@ get_latest_gemini_session() {
   if [[ -n "$session_output" ]]; then
     # Gemini lists sessions oldest-first (1 = oldest, N = newest)
     # Get the LAST session line for the newest session
-    # Format: "  323. INSTRUCTIONS: ... (Just now) [uuid]"
-    local latest_index=""
-    # Use [[:space:]]* for portable whitespace matching (macOS sed doesn't support \s)
-    # Use tail -1 to get the newest (last) session
-    latest_index="$(echo "$session_output" | grep -E '^[[:space:]]+[0-9]+\.' | tail -1 | sed 's/^[[:space:]]*//' | cut -d'.' -f1)"
+    # Format: "  374. INSTRUCTIONS: ... (Just now) [42dd8d44-313f-48ae-a422-87b42e1c4393]"
+    # Extract the UUID from brackets, not the index number
+    local latest_uuid=""
+    # Use tail -1 to get the newest (last) session, then extract UUID from [brackets]
+    latest_uuid="$(echo "$session_output" | grep -E '^[[:space:]]+[0-9]+\.' | tail -1 | grep -oE '\[[a-f0-9-]+\]$' | tr -d '[]')"
 
+    if [[ -n "$latest_uuid" && ${#latest_uuid} -ge 32 ]]; then
+      printf "%s" "$latest_uuid"
+      return 0
+    fi
+
+    # Fallback: try to get index if UUID extraction failed
+    local latest_index=""
+    latest_index="$(echo "$session_output" | grep -E '^[[:space:]]+[0-9]+\.' | tail -1 | sed 's/^[[:space:]]*//' | cut -d'.' -f1)"
     if [[ -n "$latest_index" && "$latest_index" =~ ^[0-9]+$ ]]; then
       printf "%s" "$latest_index"
       return 0

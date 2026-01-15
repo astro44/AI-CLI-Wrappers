@@ -87,6 +87,32 @@ log_verbose() {
     fi
 }
 
+# Get the latest OpenCode session ID from session list
+# Returns: session ID (ses_xxx format) or empty string
+get_latest_opencode_session() {
+  local work_dir="${1:-$PWD}"
+  local session_output=""
+  session_output="$(cd "$work_dir" && opencode session list 2>/dev/null | tail -n +3 | head -1 || true)"
+  if [[ -n "$session_output" ]]; then
+    # Extract session ID (first column, ses_xxx format)
+    local session_id=""
+    session_id="$(echo "$session_output" | awk '{print $1}')"
+    if [[ "$session_id" == ses_* ]]; then
+      printf "%s" "$session_id"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# Build session args for opencode run command
+build_session_args() {
+  if [[ -n "$SESSION_ID" ]]; then
+    log_verbose "Using session ID: $SESSION_ID"
+    printf "%s" "-s $SESSION_ID"
+  fi
+}
+
 # Determine core directory based on script location
 # Script is in bin/opencode.sh, so CORE_DIR is parent of bin/
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -188,8 +214,8 @@ while [[ $# -gt 0 ]]; do
     --verbose|--debug)
       VERBOSE=true; shift
       ;;
-    --session-id|--resume|--manage-session)
-      # OpenCode doesn't support sessions - ignore but consume the value for CLI consistency
+    --session-id|-s|--resume)
+      # OpenCode session ID for resume (ses_xxx format)
       SESSION_ID="$2"; shift 2
       ;;
     --skill)
@@ -216,6 +242,7 @@ if [[ -n "$SKILL_NAME" ]]; then
   SKILL_FILE=""
   SKILL_LOCATIONS=(
     "$CORE_DIR/modules/Autonom8-Agents/skills/${SKILL_NAME}/SKILL.md"
+    "$CORE_DIR/.opencode/skill/${SKILL_NAME}/SKILL.md"
     "$CORE_DIR/.claude/skills/${SKILL_NAME}/SKILL.md"
     "$CORE_DIR/.codex/skills/${SKILL_NAME}/SKILL.md"
     "$CORE_DIR/.cursor/skills/${SKILL_NAME}/SKILL.md"
@@ -266,13 +293,18 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
   TMPFILE_OUTPUT="$(mktemp)"
   TMPFILE_ERR="$(mktemp)"
 
-  log_verbose "Invoking opencode CLI for skill (model: $OPENCODE_MODEL)"
+  # Build session args if session resume requested
+  SESSION_ARGS="$(build_session_args)"
+
+  log_verbose "Invoking opencode CLI for skill (model: $OPENCODE_MODEL, session: $SESSION_ARGS)"
 
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
-    run_with_timeout "$CLI_TIMEOUT" opencode run --model "$OPENCODE_MODEL" "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+    # shellcheck disable=SC2086
+    run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
   else
-    opencode run --model "$OPENCODE_MODEL" "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+    # shellcheck disable=SC2086
+    opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
   fi
   OPENCODE_EXIT=$?
   set -e
@@ -494,16 +526,24 @@ $TOOL_RULES
 
   set +e
   # Pass the entire prompt as the message to opencode run
-  # Note: --format json causes event streams which are harder to parse
-  # Plain text output with JSON extraction works better
+  # Get session ID from `opencode session list` after run completes
   # Always use Grok model for fast responses
+
+  # Build session args if session resume requested
+  SESSION_ARGS="$(build_session_args)"
+
   echo "🤖 [OpenCode] Using model: $OPENCODE_MODEL" >&2
+  if [[ -n "$SESSION_ARGS" ]]; then
+    echo "🤖 [OpenCode] Session: $SESSION_ARGS" >&2
+  fi
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
-    log_verbose "Running opencode with timeout: ${CLI_TIMEOUT}s, model: $OPENCODE_MODEL"
+    log_verbose "Running opencode with timeout: ${CLI_TIMEOUT}s, model: $OPENCODE_MODEL, session: $SESSION_ARGS"
     echo "🤖 [OpenCode] Timeout: ${CLI_TIMEOUT}s" >&2
-    run_with_timeout "$CLI_TIMEOUT" opencode run --model "$OPENCODE_MODEL" "$FULL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+    # shellcheck disable=SC2086
+    run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$FULL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
   else
-    opencode run --model "$OPENCODE_MODEL" "$FULL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+    # shellcheck disable=SC2086
+    opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$FULL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
   fi
   OPENCODE_EXIT=$?
   set -e
@@ -520,6 +560,10 @@ $TOOL_RULES
   RESPONSE_TEXT="$(cat "$TMPFILE_OUTPUT" 2>/dev/null)"
   rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
 
+  # Get session ID from session list (most recent session)
+  OPENCODE_SESSION_ID="$(get_latest_opencode_session 2>/dev/null || true)"
+  log_verbose "Session ID from list: $OPENCODE_SESSION_ID"
+
   if [[ -n "$RESPONSE_TEXT" && "$RESPONSE_TEXT" != "null" ]]; then
     # Strip markdown code fences if present (```json ... ```)
     if [[ "$RESPONSE_TEXT" =~ ^\`\`\`json[[:space:]]* ]]; then
@@ -528,14 +572,22 @@ $TOOL_RULES
       RESPONSE_TEXT="$(echo "$RESPONSE_TEXT" | sed -e 's/^```[[:space:]]*//' -e 's/```[[:space:]]*$//')"
     fi
 
-    # Wrap in CLIResponse format for Go worker
-    jq -n --arg resp "$RESPONSE_TEXT" '{response: $resp}'
+    # Wrap in CLIResponse format for Go worker (include session_id)
+    if [[ -n "$OPENCODE_SESSION_ID" ]]; then
+      jq -n --arg resp "$RESPONSE_TEXT" --arg sid "$OPENCODE_SESSION_ID" '{response: $resp, session_id: $sid}'
+    else
+      jq -n --arg resp "$RESPONSE_TEXT" '{response: $resp}'
+    fi
   else
     jq -n '{error:"No response from OpenCode CLI"}'
   fi
 else
   # Direct invocation with text prompt
-  # Note: OpenCode doesn't support sandbox bypass flags
+  SESSION_ARGS="$(build_session_args)"
   echo "🤖 [OpenCode] Direct invocation using model: $OPENCODE_MODEL" >&2
-  opencode run --model "$OPENCODE_MODEL" "$@"
+  if [[ -n "$SESSION_ARGS" ]]; then
+    echo "🤖 [OpenCode] Session: $SESSION_ARGS" >&2
+  fi
+  # shellcheck disable=SC2086
+  opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$@"
 fi

@@ -713,9 +713,10 @@ $TOOL_RULES
   fi
 
   # Build cursor-agent args
+  # Use JSON format to capture session_id from response (like claude.sh)
   CURSOR_ARGS=(
     "--print"
-    "--output-format" "text"
+    "--output-format" "json"
     "--workspace" "$WORKSPACE_DIR"
   )
 
@@ -727,31 +728,13 @@ $TOOL_RULES
     CURSOR_ARGS+=("--approve-mcps")
   fi
 
-  # Add session args for session persistence
+  # Add session args for session resume
   CURSOR_SESSION_ID=""
   if [[ -n "$SESSION_ID" ]]; then
-    # Validate session exists before attempting to resume
-    if validate_cursor_session "$SESSION_ID"; then
-      CURSOR_SESSION_ID="$SESSION_ID"
-      log_verbose "Validated session: $SESSION_ID"
-    else
-      log_verbose "Session $SESSION_ID not found, will create new session"
-    fi
-  fi
-
-  # Create new session if no valid session to resume
-  if [[ -z "$CURSOR_SESSION_ID" && -n "$MANAGE_SESSION" ]]; then
-    CURSOR_SESSION_ID="$(create_cursor_session || true)"
-    if [[ -n "$CURSOR_SESSION_ID" ]]; then
-      log_verbose "Created new session: $CURSOR_SESSION_ID"
-    else
-      log_verbose "Failed to create Cursor session; continuing without resume"
-    fi
-  fi
-
-  if [[ -n "$CURSOR_SESSION_ID" ]]; then
-    CURSOR_ARGS+=("--resume" "$CURSOR_SESSION_ID")
-    log_verbose "Resuming session: $CURSOR_SESSION_ID"
+    # Pass session ID directly - cursor-agent will error if invalid
+    CURSOR_SESSION_ID="$SESSION_ID"
+    CURSOR_ARGS+=("--resume" "$SESSION_ID")
+    log_verbose "Resuming session: $SESSION_ID"
   fi
 
   # Run cursor-agent in non-interactive mode (prompt passed as argument)
@@ -815,44 +798,43 @@ $TOOL_RULES
     exit 1
   fi
 
-  # Read the output which should contain the response
-  RESPONSE_TEXT="$(cat "$TMPFILE_OUTPUT" 2>/dev/null)"
-
+  # Read the output (JSON format from cursor-agent)
+  RAW_OUTPUT="$(cat "$TMPFILE_OUTPUT" 2>/dev/null)"
   rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
 
-  if [[ -n "$RESPONSE_TEXT" && "$RESPONSE_TEXT" != "null" ]]; then
-    # Try to extract JSON from the response (cursor-agent may wrap it in markdown)
-    # First try to extract JSON code block
-    JSON_BLOCK=$(echo "$RESPONSE_TEXT" | sed -n '/^```json/,/^```/p' | sed '1d;$d' 2>/dev/null || echo "")
-    
-    FINAL_RESPONSE=""
-    if [[ -n "$JSON_BLOCK" ]]; then
-      # Found JSON in code block
-      if echo "$JSON_BLOCK" | jq empty 2>/dev/null; then
-        FINAL_RESPONSE="$JSON_BLOCK"
-      fi
+  if [[ -n "$RAW_OUTPUT" ]]; then
+    # JSON format: Extract session_id and result from cursor-agent response
+    # cursor-agent returns: {"type":"result","result":"...","session_id":"..."}
+    CURSOR_SESSION_ID="$(echo "$RAW_OUTPUT" | jq -r '.session_id // empty' 2>/dev/null || true)"
+    RESPONSE_TEXT="$(echo "$RAW_OUTPUT" | jq -r '.result // empty' 2>/dev/null || true)"
+
+    # Check for error response
+    IS_ERROR="$(echo "$RAW_OUTPUT" | jq -r '.is_error // false' 2>/dev/null || true)"
+    if [[ "$IS_ERROR" == "true" ]]; then
+      ERROR_MSG="$(echo "$RAW_OUTPUT" | jq -r '.result // "Unknown error"' 2>/dev/null || true)"
+      jq -n --arg err "$ERROR_MSG" '{error: $err}'
+      exit 1
     fi
-    
-    if [[ -z "$FINAL_RESPONSE" ]]; then
-      # No code block or invalid, try the raw response
-      # Strip any markdown fences first just in case
-      CLEAN_TEXT=$(echo "$RESPONSE_TEXT" | sed -e 's/^```json//' -e 's/^```//' -e 's/```$//')
-      if echo "$CLEAN_TEXT" | jq empty 2>/dev/null; then
-        FINAL_RESPONSE="$CLEAN_TEXT"
+
+    log_verbose "Session from response: ${CURSOR_SESSION_ID:-none}"
+
+    if [[ -n "$RESPONSE_TEXT" && "$RESPONSE_TEXT" != "null" ]]; then
+      # Strip markdown code fences if present in result
+      if [[ "$RESPONSE_TEXT" =~ ^\`\`\`json[[:space:]]* ]]; then
+        RESPONSE_TEXT="$(echo "$RESPONSE_TEXT" | sed -e 's/^```json[[:space:]]*//' -e 's/```[[:space:]]*$//')"
+      elif [[ "$RESPONSE_TEXT" =~ ^\`\`\`[[:space:]]* ]]; then
+        RESPONSE_TEXT="$(echo "$RESPONSE_TEXT" | sed -e 's/^```[[:space:]]*//' -e 's/```[[:space:]]*$//')"
       fi
-    fi
-    
-    if [[ -n "$FINAL_RESPONSE" ]]; then
-        # Wrap in CLIResponse format for Go worker
-        # Include session_id if a session was used
-        if [[ -n "${CURSOR_SESSION_ID:-}" ]]; then
-          jq -n --arg resp "$FINAL_RESPONSE" --arg sid "$CURSOR_SESSION_ID" '{response: $resp, session_id: $sid}'
-        else
-          jq -n --arg resp "$FINAL_RESPONSE" '{response: $resp}'
-        fi
+
+      # Wrap in CLIResponse format for Go worker (include session_id)
+      if [[ -n "$CURSOR_SESSION_ID" ]]; then
+        jq -n --arg resp "$RESPONSE_TEXT" --arg sid "$CURSOR_SESSION_ID" '{response: $resp, session_id: $sid}'
+      else
+        jq -n --arg resp "$RESPONSE_TEXT" '{response: $resp}'
+      fi
     else
-        # Not valid JSON - wrap raw text in error or raw_response
-        jq -n --arg text "$RESPONSE_TEXT" '{error:"Response is not valid JSON", raw_response:$text}'
+      # No result field - try raw response as fallback
+      jq -n --arg text "$RAW_OUTPUT" '{error:"No result in response", raw_response:$text}'
     fi
   else
     jq -n '{error:"No response from Cursor CLI"}'
