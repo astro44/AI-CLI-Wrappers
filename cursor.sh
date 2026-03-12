@@ -8,6 +8,7 @@ set -euo pipefail
 # Track child process PID for cleanup on script termination
 CURSOR_PID=""
 CLI_TIMEOUT=""  # Timeout in seconds, passed from Go worker
+RESPONSE_EMITTED=false
 
 # Cleanup function to kill child processes on script termination
 cleanup() {
@@ -21,6 +22,34 @@ cleanup() {
   pkill -P $$ 2>/dev/null || true
 }
 trap cleanup EXIT TERM INT
+
+resolve_cursor_agent_cmd() {
+  local wrapper_path=""
+  wrapper_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
+
+  local candidate=""
+  while IFS= read -r candidate; do
+    [[ -z "$candidate" ]] && continue
+    local resolved=""
+    resolved="$(cd "$(dirname "$candidate")" 2>/dev/null && pwd -P)/$(basename "$candidate")"
+    if [[ "$resolved" == "$wrapper_path" ]]; then
+      continue
+    fi
+    echo "$candidate"
+    return 0
+  done < <(which -a cursor-agent 2>/dev/null | awk '!seen[$0]++')
+
+  return 1
+}
+
+CURSOR_AGENT_BIN="$(resolve_cursor_agent_cmd || true)"
+
+cursor_agent_cli() {
+  if [[ -z "${CURSOR_AGENT_BIN:-}" ]]; then
+    return 127
+  fi
+  "$CURSOR_AGENT_BIN" "$@"
+}
 
 # Run command with timeout (runs in background so we can track PID for cleanup)
 run_with_timeout() {
@@ -72,6 +101,322 @@ run_with_timeout() {
   fi
 }
 
+compact_reasoning_text() {
+  local text="${1:-}"
+  printf "%s" "$text" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' | sed 's/^ //;s/ $//'
+}
+
+is_reasoning_placeholder() {
+  local text="${1:-}"
+  local compacted=""
+  compacted="$(compact_reasoning_text "$text")"
+
+  [[ -z "$compacted" ]] && return 0
+  if [[ "$compacted" == "{}" || "$compacted" == "[]" || "$compacted" == "null" ]]; then
+    return 0
+  fi
+  if printf "%s" "$compacted" | grep -Eq '^`{3,}[[:space:]]*(json|markdown|md|yaml|yml|text|txt)?[[:space:]]*`{0,3}$'; then
+    return 0
+  fi
+  if [[ ${#compacted} -le 6 ]] && printf "%s" "$compacted" | grep -Eq '^[`[:space:]]+$'; then
+    return 0
+  fi
+
+  return 1
+}
+
+emit_cli_response() {
+  local response_text="$1"
+  local session_id="${2:-}"
+  local raw_output="${3:-}"
+  local extra_field_name="${4:-}"
+  local extra_field_value="${5:-}"
+  local stream_output="${6:-}"
+
+  local tokens_json='{"input_tokens":0,"output_tokens":0,"total_tokens":0,"cost_usd":0}'
+  local token_usage_available=false
+  local reasoning_text=""
+  local reasoning_available=false
+  local reasoning_source="none"
+  local reasoning_absent_reason="model_not_emitted"
+
+  if [[ -n "$raw_output" ]]; then
+    local parsed_tokens
+    parsed_tokens="$(printf "%s" "$raw_output" | jq -c '
+      def as_int:
+        if type == "number" then floor
+        elif type == "string" then (tonumber? // 0)
+        else 0 end;
+      def as_num:
+        if type == "number" then .
+        elif type == "string" then (tonumber? // 0)
+        else 0 end;
+      {
+        input_tokens: ((.usage.input_tokens // .usage.inputTokens // .input_tokens // .inputTokens // .token_usage.input_tokens // .token_usage.prompt_tokens // .prompt_tokens // 0) | as_int),
+        output_tokens: ((.usage.output_tokens // .usage.outputTokens // .output_tokens // .outputTokens // .token_usage.output_tokens // .token_usage.completion_tokens // .completion_tokens // 0) | as_int),
+        total_tokens: ((.usage.total_tokens // .usage.totalTokens // .total_tokens // .totalTokens // .token_usage.total_tokens // .token_usage.total // .total_tokens_used // 0) | as_int),
+        cost_usd: ((.usage.cost_usd // .usage.cost // .cost_usd // .token_usage.cost_usd // .cost // 0) | as_num)
+      }
+      | if .total_tokens == 0 and ((.input_tokens + .output_tokens) > 0)
+        then .total_tokens = (.input_tokens + .output_tokens)
+        else .
+        end
+    ' 2>/dev/null || true)"
+    if [[ -n "$parsed_tokens" && "$parsed_tokens" != "null" ]]; then
+      tokens_json="$parsed_tokens"
+      if [[ "$(printf "%s" "$tokens_json" | jq -r '((.input_tokens + .output_tokens + .total_tokens) > 0)' 2>/dev/null || echo false)" == "true" ]]; then
+        token_usage_available=true
+      fi
+    fi
+  fi
+
+  if [[ "$token_usage_available" != "true" && -n "$session_id" ]]; then
+    local session_tokens
+    session_tokens="$(get_cursor_session_token_usage "$session_id" 2>/dev/null || true)"
+    if [[ -n "$session_tokens" ]]; then
+      tokens_json="$session_tokens"
+      token_usage_available=true
+    fi
+  fi
+
+  if [[ "$token_usage_available" != "true" && -n "$stream_output" ]]; then
+    local stream_total_tokens=""
+    stream_total_tokens="$(printf "%s" "$stream_output" | \
+      perl -pe 's/\x1b\[[0-9;]*[A-Za-z]//g' | \
+      grep -ioE 'tokens used[^0-9]*[0-9]+' | \
+      tail -1 | grep -oE '[0-9]+' | tail -1 || true)"
+    if [[ -n "$stream_total_tokens" ]]; then
+      tokens_json="$(printf "%s" "$tokens_json" | jq -c --argjson total "$stream_total_tokens" '
+        .total_tokens = $total
+        | if .output_tokens == 0 then .output_tokens = $total else . end
+      ' 2>/dev/null || echo "$tokens_json")"
+      token_usage_available=true
+    fi
+  fi
+
+  if [[ -n "$raw_output" ]]; then
+    local raw_reasoning
+    raw_reasoning="$(printf "%s" "$raw_output" | jq -r '
+      def stringify:
+        if type == "string" then .
+        elif type == "object" or type == "array" then tojson
+        else tostring end;
+      (._reasoning // .reasoning // .thinking // .thoughts // .analysis // empty)
+      | stringify
+    ' 2>/dev/null || true)"
+    if [[ -n "$raw_reasoning" && "$raw_reasoning" != "null" ]]; then
+      reasoning_text="$raw_reasoning"
+      reasoning_source="raw_output"
+    fi
+  fi
+
+  if [[ -z "$reasoning_text" && -n "$response_text" ]]; then
+    local response_reasoning
+    response_reasoning="$(printf "%s" "$response_text" | jq -r '
+      def stringify:
+        if type == "string" then .
+        elif type == "object" or type == "array" then tojson
+        else tostring end;
+      if type == "object"
+      then (._reasoning // .reasoning // .thinking // .thoughts // .analysis // empty) | stringify
+      else empty
+      end
+    ' 2>/dev/null || true)"
+    if [[ -n "$response_reasoning" && "$response_reasoning" != "null" ]]; then
+      reasoning_text="$response_reasoning"
+      reasoning_source="response_payload"
+    fi
+  fi
+
+  if [[ -z "$reasoning_text" && -n "$session_id" ]]; then
+    local session_reasoning
+    session_reasoning="$(get_cursor_session_reasoning "$session_id" 2>/dev/null || true)"
+    if [[ -n "$session_reasoning" ]]; then
+      reasoning_text="$session_reasoning"
+      reasoning_source="session_log"
+    fi
+  fi
+
+  if [[ -z "$reasoning_text" && -n "$response_text" ]]; then
+    local pre_json_reasoning=""
+    pre_json_reasoning="$(printf "%s" "$response_text" | awk '
+      BEGIN { in_json=0 }
+      /^```json/ { in_json=1; next }
+      in_json == 0 { print }
+    ' | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' | sed 's/^ //;s/ $//')"
+    if [[ -n "$pre_json_reasoning" ]] && ! printf "%s" "$pre_json_reasoning" | jq -e . >/dev/null 2>&1; then
+      reasoning_text="$pre_json_reasoning"
+      reasoning_source="derived_excerpt"
+    fi
+  fi
+
+  if [[ -z "$reasoning_text" && -n "$stream_output" ]]; then
+    local stream_reasoning
+    stream_reasoning="$(printf "%s" "$stream_output" | \
+      perl -pe 's/\x1b\[[0-9;]*[A-Za-z]//g' | \
+      grep -iE 'thought|thinking|reasoning|analysis|plan:|step [0-9]+' | \
+      grep -ivE 'using model|timeout|loaded cached credentials|yolo mode|tokens used|tool call|session id|debug:' | \
+      tail -n 20 | tr '\n' ' ' | sed 's/[[:space:]]\\+/ /g' | sed 's/^ //;s/ $//' || true)"
+    if [[ -n "$stream_reasoning" ]]; then
+      reasoning_text="$stream_reasoning"
+      reasoning_source="stream_log"
+    fi
+  fi
+
+  if [[ -n "$reasoning_text" ]]; then
+    reasoning_text="$(compact_reasoning_text "$reasoning_text")"
+  fi
+
+  if [[ ${#reasoning_text} -gt 2 ]] && ! is_reasoning_placeholder "$reasoning_text"; then
+    reasoning_available=true
+    reasoning_absent_reason="available"
+  else
+    reasoning_text=""
+    reasoning_available=false
+    reasoning_source="none"
+    reasoning_absent_reason="model_not_emitted"
+  fi
+
+  RESPONSE_EMITTED=true
+
+  if [[ -n "$session_id" && -n "$extra_field_name" ]]; then
+    jq -n \
+      --arg resp "$response_text" \
+      --arg sid "$session_id" \
+      --arg reasoning "$reasoning_text" \
+      --arg extra_name "$extra_field_name" \
+      --arg extra_val "$extra_field_value" \
+      --argjson tokens "$tokens_json" \
+      --argjson available "$token_usage_available" \
+      --argjson reasoning_available "$reasoning_available" \
+      --arg reasoning_source "$reasoning_source" \
+      --arg reasoning_absent_reason "$reasoning_absent_reason" \
+      '{response: $resp, session_id: $sid, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}} + {($extra_name): $extra_val}'
+  elif [[ -n "$session_id" ]]; then
+    jq -n \
+      --arg resp "$response_text" \
+      --arg sid "$session_id" \
+      --arg reasoning "$reasoning_text" \
+      --argjson tokens "$tokens_json" \
+      --argjson available "$token_usage_available" \
+      --argjson reasoning_available "$reasoning_available" \
+      --arg reasoning_source "$reasoning_source" \
+      --arg reasoning_absent_reason "$reasoning_absent_reason" \
+      '{response: $resp, session_id: $sid, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}}'
+  elif [[ -n "$extra_field_name" ]]; then
+    jq -n \
+      --arg resp "$response_text" \
+      --arg reasoning "$reasoning_text" \
+      --arg extra_name "$extra_field_name" \
+      --arg extra_val "$extra_field_value" \
+      --argjson tokens "$tokens_json" \
+      --argjson available "$token_usage_available" \
+      --argjson reasoning_available "$reasoning_available" \
+      --arg reasoning_source "$reasoning_source" \
+      --arg reasoning_absent_reason "$reasoning_absent_reason" \
+      '{response: $resp, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}} + {($extra_name): $extra_val}'
+  else
+    jq -n \
+      --arg resp "$response_text" \
+      --arg reasoning "$reasoning_text" \
+      --argjson tokens "$tokens_json" \
+      --argjson available "$token_usage_available" \
+      --argjson reasoning_available "$reasoning_available" \
+      --arg reasoning_source "$reasoning_source" \
+      --arg reasoning_absent_reason "$reasoning_absent_reason" \
+      '{response: $resp, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}}'
+  fi
+}
+
+emit_cli_error_response() {
+  local error_msg="$1"
+  local error_type="${2:-unknown}"
+  local session_id="${3:-}"
+  local exit_code="${4:-1}"
+  local tokens_json='{"input_tokens":0,"output_tokens":0,"total_tokens":0,"cost_usd":0}'
+  local token_usage_available=false
+  local reasoning_text=""
+  local reasoning_available=false
+  local reasoning_source="none"
+  local reasoning_absent_reason="error_path"
+  local recoverable=false
+  case "$error_type" in
+    quota|rate_limit|timeout|invalid_session)
+      recoverable=true
+      ;;
+  esac
+
+  if [[ -n "$session_id" ]]; then
+    local session_tokens=""
+    session_tokens="$(get_cursor_session_token_usage "$session_id" 2>/dev/null || true)"
+    if [[ -n "$session_tokens" ]]; then
+      tokens_json="$session_tokens"
+      token_usage_available=true
+    fi
+
+    local session_reasoning=""
+    session_reasoning="$(get_cursor_session_reasoning "$session_id" 2>/dev/null || true)"
+    if [[ -n "$session_reasoning" ]]; then
+      session_reasoning="$(compact_reasoning_text "$session_reasoning")"
+      if [[ ${#session_reasoning} -gt 2 ]] && ! is_reasoning_placeholder "$session_reasoning"; then
+        reasoning_text="$session_reasoning"
+        reasoning_available=true
+        reasoning_source="session_log_error_fallback"
+        reasoning_absent_reason="available"
+      fi
+    fi
+  fi
+
+  RESPONSE_EMITTED=true
+  if [[ -n "$session_id" ]]; then
+    jq -n \
+      --arg sid "$session_id" \
+      --arg err "$error_msg" \
+      --arg type "$error_type" \
+      --argjson code "$exit_code" \
+      --argjson recoverable "$recoverable" \
+      --arg reasoning "$reasoning_text" \
+      --argjson tokens "$tokens_json" \
+      --argjson available "$token_usage_available" \
+      --argjson reasoning_available "$reasoning_available" \
+      --arg reasoning_source "$reasoning_source" \
+      --arg reasoning_absent_reason "$reasoning_absent_reason" \
+      '{
+        response: "",
+        session_id: $sid,
+        reasoning: $reasoning,
+        tokens_used: $tokens,
+        metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason},
+        error: $err,
+        error_type: $type,
+        exit_code: $code,
+        recoverable: $recoverable
+      }'
+  else
+    jq -n \
+      --arg err "$error_msg" \
+      --arg type "$error_type" \
+      --argjson code "$exit_code" \
+      --argjson recoverable "$recoverable" \
+      --arg reasoning "$reasoning_text" \
+      --argjson tokens "$tokens_json" \
+      --argjson available "$token_usage_available" \
+      --argjson reasoning_available "$reasoning_available" \
+      --arg reasoning_source "$reasoning_source" \
+      --arg reasoning_absent_reason "$reasoning_absent_reason" \
+      '{
+        response: "",
+        reasoning: $reasoning,
+        tokens_used: $tokens,
+        metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason},
+        error: $err,
+        error_type: $type,
+        exit_code: $code,
+        recoverable: $recoverable
+      }'
+  fi
+}
+
 # Verbose logging function
 log_verbose() {
     if [[ "$VERBOSE" == "true" ]]; then
@@ -120,6 +465,113 @@ ensure_cursor_mcp_config() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CORE_DIR="$(dirname "$SCRIPT_DIR")"
 
+extract_tenant_root() {
+  local path="${1:-}"
+  if [[ -z "$path" ]]; then
+    return 1
+  fi
+  if [[ "$path" =~ ^(.*/tenants/[^/]+)(/.*)?$ ]]; then
+    printf "%s" "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+resolve_tenant_root() {
+  local candidate=""
+
+  if [[ -n "${CONTEXT_DIR:-}" ]]; then
+    candidate="$(extract_tenant_root "$CONTEXT_DIR" 2>/dev/null || true)"
+  fi
+  if [[ -z "$candidate" ]]; then
+    candidate="$(extract_tenant_root "$PWD" 2>/dev/null || true)"
+  fi
+  if [[ -z "$candidate" && -d "$CORE_DIR/tenants" ]]; then
+    candidate="$(find "$CORE_DIR/tenants" -mindepth 1 -maxdepth 1 -type d | sort | head -1)"
+  fi
+
+  printf "%s" "$candidate"
+}
+
+# =============================================================================
+# Prompt Utilities (inlined, provider-specific)
+# Cursor uses Claude/GPT models with ~128K token context
+# =============================================================================
+PROMPT_MAX_CHARS=150000        # ~37K tokens - conservative limit for Cursor
+PROMPT_WARN_THRESHOLD=120000   # Warn at ~30K tokens
+
+log_warn() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] WARN: $*" >&2
+}
+
+log_info() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] INFO: $*" >&2
+}
+
+check_prompt_size() {
+    local prompt="$1"
+    local provider="${2:-cursor}"
+    local prompt_size=${#prompt}
+    local estimated_tokens=$((prompt_size / 4))
+
+    if [[ $prompt_size -gt $PROMPT_MAX_CHARS ]]; then
+        log_warn "[$provider] LARGE PROMPT: ${prompt_size} chars (~${estimated_tokens} tokens) exceeds limit of ${PROMPT_MAX_CHARS}"
+        return 1
+    elif [[ $prompt_size -gt $PROMPT_WARN_THRESHOLD ]]; then
+        log_warn "[$provider] Prompt size warning: ${prompt_size} chars (~${estimated_tokens} tokens) approaching limit"
+        return 0
+    fi
+    return 0
+}
+
+get_prompt_stats() {
+    local prompt="$1"
+    local provider="${2:-cursor}"
+    local prompt_size=${#prompt}
+    local estimated_tokens=$((prompt_size / 4))
+    local over_limit="false"
+    [[ $prompt_size -gt $PROMPT_MAX_CHARS ]] && over_limit="true"
+
+    jq -n \
+        --arg provider "$provider" \
+        --argjson size "$prompt_size" \
+        --argjson tokens "$estimated_tokens" \
+        --argjson max "$PROMPT_MAX_CHARS" \
+        --arg over "$over_limit" \
+        '{provider: $provider, prompt_size_chars: $size, estimated_tokens: $tokens, max_chars: $max, over_limit: ($over == "true")}'
+}
+
+save_debug_prompt() {
+    local prompt="$1"
+    local persona_id="$2"
+    local provider="${3:-cursor}"
+    [[ "${DEBUG_PROMPTS:-false}" != "true" ]] && return 0
+
+    local log_dir="${PROMPT_LOG_DIR:-/tmp/autonom8_prompts}"
+    mkdir -p "$log_dir"
+    local timestamp=$(date '+%Y%m%d_%H%M%S')
+    local safe_persona=$(echo "$persona_id" | tr ' ()' '_')
+    local filename="${timestamp}_${provider}_${safe_persona}.txt"
+
+    {
+        echo "# Prompt Debug Log"
+        echo "# Provider: $provider"
+        echo "# Persona: $persona_id"
+        echo "# Size: ${#prompt} chars"
+        echo "---"
+        echo "$prompt"
+    } > "$log_dir/$filename"
+    log_info "Prompt saved to: $log_dir/$filename"
+}
+# =============================================================================
+
+# P6.1: Source shared error handling library
+if [[ -f "$SCRIPT_DIR/lib/error_utils.sh" ]]; then
+    source "$SCRIPT_DIR/lib/error_utils.sh"
+fi
+
 # Agent invocation mode: wrapper expects agent .md file path + optional input data
 # We must extract a single persona block, not pass the whole file.
 
@@ -127,32 +579,40 @@ validate_agent_file() {
   local file="$1"
   # Ensure at least one valid persona section exists (support both ## and ### headers)
   if ! grep -qE '^##+[[:space:]]+Persona:' "$file"; then
-    jq -n --arg file "$file" \
-      '{error:"Invalid agent file format", details:"Missing `## Persona:` or `### Persona:` header in \($file)"}'
+    emit_cli_error_response "Invalid agent file format: Missing ## Persona:/### Persona: header in $file" "invalid_input" "" 3
     exit 3
   fi
 
   # Ensure each persona has at least some description or instructions
   if ! awk '/^##+[[:space:]]+Persona:/{count++} END{exit (count>=1)?0:1}' "$file"; then
-    jq -n --arg file "$file" \
-      '{error:"Invalid agent file format", details:"No valid persona blocks detected in \($file)"}'
+    emit_cli_error_response "Invalid agent file format: No valid persona blocks detected in $file" "invalid_input" "" 3
     exit 3
   fi
 }
 
 extract_persona_block() {
   local file="$1"
-  local persona_id="$2"   # e.g., pm-cursor | po-cursor
-  # Match header "## Persona:" or "### Persona:" (allows trailing labels, e.g. "(Strategic Planner)")
+  local persona_id="$2"   # e.g., pm-cursor | dev-cursor (Implement) | dev-cursor (Design)
+  # P1.5.1 FIX: Match full persona ID including role suffix
+  # Supports both old format (pm-cursor) and new format (dev-cursor (Implement))
+  # Match header "## Persona:" or "### Persona:"
   awk -v id="$persona_id" '
     BEGIN{found=0}
     /^##+[[:space:]]+Persona:[[:space:]]+/{
       if(found){exit}
       hdr=$0
       sub(/^##+[[:space:]]+Persona:[[:space:]]+/, "", hdr)
-      # hdr now like "pm-cursor (Quality Reviewer)" or "po-cursor (Plan)"; compare prefix to id
-      split(hdr,a," ")
-      if(a[1]==id){found=1; print $0; next}
+      # Remove trailing whitespace
+      gsub(/[[:space:]]*$/, "", hdr)
+      # P1.5.1 FIX: Compare full persona ID (exact match) or prefix match for backward compat
+      # Full match: "dev-cursor (Implement)" == "dev-cursor (Implement)"
+      # Prefix match: "pm-cursor" matches "pm-cursor (Quality Reviewer)" for legacy support
+      if(hdr == id){found=1; print $0; next}
+      # Legacy prefix matching: if id has no parentheses, match prefix
+      if(index(id, "(") == 0) {
+        split(hdr,a," ")
+        if(a[1]==id){found=1; print $0; next}
+      }
     }
     found{print}
   ' "$file"
@@ -167,11 +627,68 @@ parse_arg_json_or_stdin() {
   fi
 }
 
+get_cursor_session_file_by_id() {
+  local session_id="$1"
+  [[ -z "$session_id" ]] && return 1
+  find "$HOME/.cursor/projects" -path "*/agent-transcripts/${session_id}.jsonl" -type f 2>/dev/null | head -1
+}
+
+get_cursor_session_token_usage() {
+  local session_id="$1"
+  local session_file=""
+  session_file="$(get_cursor_session_file_by_id "$session_id" 2>/dev/null || true)"
+  [[ -z "$session_file" || ! -f "$session_file" ]] && return 1
+
+  jq -src '
+    def as_int:
+      if type == "number" then floor
+      elif type == "string" then (tonumber? // 0)
+      else 0 end;
+    [
+      .[] | (.usage // .message.usage // empty)
+    ] as $u
+    | select(($u | length) > 0)
+    | ($u[-1]) as $x
+    | {
+        input_tokens: (($x.input_tokens // $x.input // $x.prompt_tokens // 0) | as_int),
+        output_tokens: (($x.output_tokens // $x.output // $x.completion_tokens // 0) | as_int),
+        total_tokens: (($x.total_tokens // $x.total // (($x.input_tokens // $x.input // 0) + ($x.output_tokens // $x.output // 0))) | as_int),
+        cost_usd: 0
+      }
+  ' "$session_file" | tail -1
+}
+
+get_cursor_session_reasoning() {
+  local session_id="$1"
+  local session_file=""
+  session_file="$(get_cursor_session_file_by_id "$session_id" 2>/dev/null || true)"
+  [[ -z "$session_file" || ! -f "$session_file" ]] && return 1
+
+  local reasoning=""
+  reasoning="$(jq -src '
+    [
+      .[]
+      | select(.role == "assistant")
+      | (.message.content // [])[]
+      | select(.type == "text")
+      | (.text // "")
+      | gsub("\\r";"")
+      | gsub("^\\s+|\\s+$";"")
+      | select(length > 0)
+      | select((startswith("```json") | not) and (startswith("{") | not))
+    ]
+    | if length > 8 then .[-8:] else . end
+    | join(" ")
+  ' "$session_file" 2>/dev/null || true)"
+
+  [[ -n "$reasoning" ]] && printf "%s" "$reasoning" | sed 's/[[:space:]]\+/ /g' | sed 's/^ //;s/ $//' | cut -c1-600
+}
+
 create_cursor_session() {
   local raw_output=""
   local session_id=""
 
-  raw_output="$(cursor-agent create-chat 2>/dev/null || true)"
+  raw_output="$(cursor_agent_cli create-chat 2>/dev/null || true)"
   raw_output="${raw_output//$'\r'/}"
 
   if [[ -n "$raw_output" ]]; then
@@ -198,7 +715,7 @@ validate_cursor_session() {
 
   # Try to list sessions and check if our ID is present
   local sessions_output=""
-  sessions_output="$(cursor-agent list-chats 2>/dev/null || true)"
+  sessions_output="$(cursor_agent_cli list-chats 2>/dev/null || true)"
 
   if [[ -n "$sessions_output" ]]; then
     # Check if session ID appears in the output
@@ -225,11 +742,16 @@ TEMPERATURE=""
 CONTEXT_FILE=""
 CONTEXT_DIR=""
 CONTEXT_MAX=51200  # 50KB default max context size
-NO_CONTEXT=false
+SKIP_CONTEXT_FILE=false
 ALLOW_TOOLS=false  # Cursor uses --force/--approve-mcps for tool access
 SESSION_ID=""        # Existing session ID to resume
 MANAGE_SESSION=""    # Request to create a new session (Cursor returns ID)
-SKILL_NAME=""        # Skill to invoke (from .claude/commands/) - beta support
+SKILL_NAME=""        # Skill to invoke (from .cursor/skills/)
+QUOTA_STATUS=false   # Check and return quota status
+HEALTH_CHECK=false   # P6.4: Health check mode
+MODEL=""             # Model selection (cursor passes via --model flag)
+PERMISSION_MODE=""   # Permission mode (cursor supports --mode=plan)
+REASONING_FALLBACK=false # Emit fallback reasoning/tokens from session logs only
 
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
@@ -250,13 +772,13 @@ while [[ $# -gt 0 ]]; do
     --context-max)
       CONTEXT_MAX="$2"; shift 2
       ;;
-    --no-context)
-      NO_CONTEXT=true; shift
+    --skip-context-file)
+      SKIP_CONTEXT_FILE=true; shift
       ;;
     --yolo)
       YOLO_MODE=true; shift
       ;;
-    --allowed-tools)
+    --allow-tools|--allowed-tools)
       # Cursor equivalent: enable tool access and auto-approve MCPs
       ALLOW_TOOLS=true
       YOLO_MODE=true  # Cursor uses --force for command approvals
@@ -283,6 +805,22 @@ while [[ $# -gt 0 ]]; do
     --skill)
       SKILL_NAME="$2"; shift 2
       ;;
+    --health-check)
+      HEALTH_CHECK=true; shift
+      ;;
+    --quota-status)
+      QUOTA_STATUS=true; shift
+      ;;
+    --model)
+      MODEL="$2"; shift 2
+      ;;
+    --mode|--permission-mode)
+      PERMISSION_MODE="$2"; shift 2
+      # Cursor supports --mode=plan for exploration mode
+      ;;
+    --reasoning-fallback|--reasoning-fallback-only)
+      REASONING_FALLBACK=true; shift
+      ;;
     *)
       break
       ;;
@@ -290,24 +828,159 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ===================
-# Skill Execution Mode (Beta)
+# Quota Status Mode
 # ===================
-# Cursor skills support is in beta - using prompt fallback
+# If --quota-status flag is provided, return quota status JSON
+if [[ "$QUOTA_STATUS" == "true" ]]; then
+  # Check for cached usage limit messages
+  SYSTEM_MSG_DIR="$CORE_DIR/context/system-messages/inbox"
+  LATEST_LIMIT_FILE=""
+
+  if [[ -d "$SYSTEM_MSG_DIR" ]]; then
+    # Find most recent cursor usage limit file
+    LATEST_LIMIT_FILE=$(find "$SYSTEM_MSG_DIR" -name "*-cursor-usage-limit.json" -type f 2>/dev/null | xargs ls -t 2>/dev/null | head -1 || true)
+  fi
+
+  if [[ -n "$LATEST_LIMIT_FILE" && -f "$LATEST_LIMIT_FILE" ]]; then
+    # Parse the cached limit file
+    TIMESTAMP=$(jq -r '.timestamp // empty' "$LATEST_LIMIT_FILE" 2>/dev/null)
+    RETRY_TIME=$(jq -r '.retry_time // empty' "$LATEST_LIMIT_FILE" 2>/dev/null)
+
+    # Calculate if quota has likely reset (default: 1 hour from last error)
+    if [[ -n "$TIMESTAMP" ]]; then
+      LIMIT_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$TIMESTAMP" "+%s" 2>/dev/null || echo "0")
+      NOW_EPOCH=$(date "+%s")
+      ELAPSED=$((NOW_EPOCH - LIMIT_EPOCH))
+
+      # Assume quota resets after 1 hour (3600 seconds) if no retry_time specified
+      RESET_SECONDS=3600
+      if [[ $ELAPSED -ge $RESET_SECONDS ]]; then
+        # Quota likely reset
+        jq -n --arg provider "cursor" \
+          '{provider: $provider, quota_exhausted: false, source: "estimated", message: "Quota likely reset (>1h since last limit)"}'
+      else
+        # Still exhausted
+        REMAINING=$((RESET_SECONDS - ELAPSED))
+        RESET_AT=$(date -j -v+${REMAINING}S "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
+        jq -n --arg provider "cursor" \
+              --argjson exhausted true \
+              --arg reset_at "$RESET_AT" \
+              --argjson reset_in_seconds "$REMAINING" \
+              --arg retry_time "$RETRY_TIME" \
+              --arg source "cached" \
+          '{provider: $provider, quota_exhausted: $exhausted, reset_at: $reset_at, reset_in_seconds: $reset_in_seconds, retry_time: $retry_time, source: $source}'
+      fi
+    else
+      jq -n --arg provider "cursor" \
+        '{provider: $provider, quota_exhausted: false, source: "unknown", message: "No valid timestamp in limit file"}'
+    fi
+  else
+    # No cached limit file - quota is likely available
+    jq -n --arg provider "cursor" \
+      '{provider: $provider, quota_exhausted: false, source: "no_cache", message: "No recent quota limit detected"}'
+  fi
+  exit 0
+fi
+
+# ===================
+# P6.4: Health Check Mode
+# ===================
+# If --health-check flag is provided, check provider health and return status
+if [[ "$HEALTH_CHECK" == "true" ]]; then
+  log_verbose "Health check mode: testing cursor CLI availability"
+
+  START_TIME=$(date +%s%N 2>/dev/null || date +%s)
+
+  # Check if cursor-agent CLI is available
+  if [[ -z "$CURSOR_AGENT_BIN" ]]; then
+    jq -n --arg provider "cursor" '{
+      provider: $provider,
+      status: "unavailable",
+      cli_available: false,
+      error: "cursor-agent CLI not found in PATH (non-wrapper binary resolution failed)",
+      session_support: true
+    }'
+    exit 1
+  fi
+
+  # Try a minimal invocation to verify CLI works
+  HEALTH_OUTPUT=$(cursor_agent_cli --version 2>&1 || echo "version_check_failed")
+  HEALTH_EXIT=$?
+
+  END_TIME=$(date +%s%N 2>/dev/null || date +%s)
+
+  # Calculate latency (handle both nanosecond and second precision)
+  if [[ ${#START_TIME} -gt 10 ]]; then
+    LATENCY_MS=$(( (END_TIME - START_TIME) / 1000000 ))
+  else
+    LATENCY_MS=$(( (END_TIME - START_TIME) * 1000 ))
+  fi
+
+  if [[ $HEALTH_EXIT -eq 0 ]]; then
+    # Extract version if available
+    VERSION=$(echo "$HEALTH_OUTPUT" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
+
+    jq -n --arg provider "cursor" \
+          --arg status "ok" \
+          --argjson latency "$LATENCY_MS" \
+          --arg version "$VERSION" \
+          '{
+            provider: $provider,
+            status: $status,
+            latency_ms: $latency,
+            cli_available: true,
+            version: $version,
+            session_support: true
+          }'
+  else
+    jq -n --arg provider "cursor" \
+          --arg error "$HEALTH_OUTPUT" \
+          --argjson latency "$LATENCY_MS" \
+          '{
+            provider: $provider,
+            status: "error",
+            latency_ms: $latency,
+            cli_available: true,
+            error: $error,
+            session_support: true
+          }'
+  fi
+  exit 0
+fi
+
+# ===================
+# Reasoning Fallback Mode
+# ===================
+# Emit telemetry envelope from session logs without invoking provider CLI.
+if [[ "$REASONING_FALLBACK" == "true" ]]; then
+  if [[ -z "$SESSION_ID" ]]; then
+    emit_cli_error_response "reasoning_fallback requires --session-id" "invalid_input" "" 2
+    exit 2
+  fi
+  emit_cli_response "" "$SESSION_ID" "" "" "" ""
+  exit 0
+fi
+
+# ===================
+# Skill Execution Mode
+# ===================
+# Cursor supports Agent Skills Standard via .cursor/skills/ directory
+# Skills are also discoverable from .claude/skills/ and .codex/skills/ (cross-provider compatibility)
 if [[ -n "$SKILL_NAME" ]]; then
-  log_verbose "Skill mode: invoking /$SKILL_NAME (Cursor skills are in beta - using prompt fallback)"
-  echo "⚠️  [Cursor] Skills support is in beta - using prompt-based execution" >&2
+  log_verbose "Skill mode: invoking /$SKILL_NAME"
 
   # Gather input data from remaining args or stdin
   SKILL_INPUT="$(parse_arg_json_or_stdin "$@")"
 
-  # Resolve skill file path - check multiple locations
-  # Skills use Agent Skills Standard format: skills/skill-name/SKILL.md
+  # Resolve skill file path - check multiple locations (Agent Skills Standard)
+  # Priority: .cursor/skills > canonical source > cross-provider compatibility
   SKILL_FILE=""
   SKILL_LOCATIONS=(
+    "$CORE_DIR/.cursor/skills/${SKILL_NAME}/SKILL.md"
     "$CORE_DIR/modules/Autonom8-Agents/skills/${SKILL_NAME}/SKILL.md"
     "$CORE_DIR/.claude/skills/${SKILL_NAME}/SKILL.md"
     "$CORE_DIR/.codex/skills/${SKILL_NAME}/SKILL.md"
-    "$CORE_DIR/.cursor/skills/${SKILL_NAME}/SKILL.md"
+    "$HOME/.cursor/skills/${SKILL_NAME}/SKILL.md"
   )
 
   for loc in "${SKILL_LOCATIONS[@]}"; do
@@ -318,7 +991,7 @@ if [[ -n "$SKILL_NAME" ]]; then
   done
 
   if [[ -z "$SKILL_FILE" ]]; then
-    jq -n --arg skill "$SKILL_NAME" '{error: "Skill not found", skill: $skill, searched: ["/.claude/commands/"]}'
+    emit_cli_error_response "Skill not found: $SKILL_NAME" "invalid_input" "" 2
     exit 2
   fi
 
@@ -354,7 +1027,7 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
   # Dry run mode
   if [[ "$DRY_RUN" == "true" ]]; then
     jq -n --arg skill "$SKILL_NAME" --arg file "$SKILL_FILE" \
-      '{dry_run: true, wrapper: "cursor.sh", mode: "skill", skill: $skill, skill_file: $file, validation: "passed", note: "beta_support"}'
+      '{dry_run: true, wrapper: "cursor.sh", mode: "skill", skill: $skill, skill_file: $file, validation: "passed"}'
     exit 0
   fi
 
@@ -363,11 +1036,17 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
   TMPFILE_ERR="$(mktemp)"
 
   # Determine working directory
-  WORK_DIR=""
+  WORK_DIR="$CORE_DIR"
+  WORK_DIR_SOURCE="core_fallback"
   if [[ -n "$CONTEXT_DIR" && -d "$CONTEXT_DIR" ]]; then
     WORK_DIR="$CONTEXT_DIR"
-  elif [[ -d "$CORE_DIR/tenants/oxygen" ]]; then
-    WORK_DIR="$CORE_DIR/tenants/oxygen"
+    WORK_DIR_SOURCE="context_dir"
+  else
+    TENANT_DIR="$(resolve_tenant_root)"
+    if [[ -n "$TENANT_DIR" ]]; then
+      WORK_DIR="$TENANT_DIR"
+      WORK_DIR_SOURCE="tenant_resolved"
+    fi
   fi
 
   # Build cursor-agent args
@@ -382,25 +1061,38 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
     CURSOR_ARGS+=("--force")
   fi
 
-  log_verbose "Invoking cursor-agent CLI for skill (WorkDir: ${WORK_DIR:-none})"
+  # Add model flag if specified
+  if [[ -n "$MODEL" ]]; then
+    CURSOR_ARGS+=("--model" "$MODEL")
+    log_verbose "Using model: $MODEL"
+  fi
+
+  log_verbose "Invoking cursor-agent CLI for skill (WorkDir: ${WORK_DIR:-none}, Source: ${WORK_DIR_SOURCE:-none}, Model: ${MODEL:-default})"
 
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
-    run_with_timeout "$CLI_TIMEOUT" cursor-agent "${CURSOR_ARGS[@]}" "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+    run_with_timeout "$CLI_TIMEOUT" "$CURSOR_AGENT_BIN" "${CURSOR_ARGS[@]}" "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
   else
-    cursor-agent "${CURSOR_ARGS[@]}" "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+    cursor_agent_cli "${CURSOR_ARGS[@]}" "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
   fi
   CURSOR_EXIT=$?
   set -e
 
   if [[ $CURSOR_EXIT -ne 0 ]]; then
-    ERROR_MSG=$(cat "$TMPFILE_ERR" 2>/dev/null || echo "Unknown error")
+    ERROR_MSG=$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' || echo "Unknown error")
     rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
-    jq -n --arg err "$ERROR_MSG" --arg skill "$SKILL_NAME" '{error: $err, skill: $skill}'
+    ERROR_TYPE="provider_error"
+    if [[ "$CURSOR_EXIT" -eq 124 ]]; then
+      ERROR_TYPE="timeout"
+    elif declare -F classify_error >/dev/null; then
+      ERROR_TYPE="$(classify_error "$ERROR_MSG")"
+    fi
+    emit_cli_error_response "$ERROR_MSG" "$ERROR_TYPE" "" "$CURSOR_EXIT"
     exit 1
   fi
 
-  RESPONSE_TEXT="$(cat "$TMPFILE_OUTPUT" 2>/dev/null)"
+  RESPONSE_TEXT="$(cat "$TMPFILE_OUTPUT" 2>/dev/null | tr -d '\0')"
+  STDERR_TEXT="$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' || true)"
   rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
 
   if [[ -n "$RESPONSE_TEXT" && "$RESPONSE_TEXT" != "null" ]]; then
@@ -419,9 +1111,9 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
     fi
 
     # Wrap in CLIResponse format
-    jq -n --arg resp "$RESPONSE_TEXT" --arg skill "$SKILL_NAME" '{response: $resp, skill: $skill}'
+    emit_cli_response "$RESPONSE_TEXT" "" "$RESPONSE_TEXT" "skill" "$SKILL_NAME" "$STDERR_TEXT"
   else
-    jq -n --arg skill "$SKILL_NAME" '{error: "No response from skill execution", skill: $skill}'
+    emit_cli_error_response "No response from skill execution: $SKILL_NAME" "provider_error" "" 1
   fi
 
   exit 0
@@ -453,8 +1145,8 @@ if [[ -f "${1-}" && "$1" == *.md ]]; then
   CONTEXT_CONTENT=""
   RESOLVED_CONTEXT_FILE=""
 
-  if [[ "$NO_CONTEXT" == "true" ]]; then
-    log_verbose "Context loading disabled (--no-context)"
+  if [[ "$SKIP_CONTEXT_FILE" == "true" ]]; then
+    log_verbose "Context loading disabled (--skip-context-file)"
   else
     # Priority: --context > --context-dir > auto-discover from input JSON
     if [[ -n "$CONTEXT_FILE" && -f "$CONTEXT_FILE" ]]; then
@@ -479,7 +1171,7 @@ if [[ -f "${1-}" && "$1" == *.md ]]; then
   fi
 
   # Load and optionally truncate context
-  if [[ "$NO_CONTEXT" != "true" && -n "$RESOLVED_CONTEXT_FILE" && -f "$RESOLVED_CONTEXT_FILE" ]]; then
+  if [[ "$SKIP_CONTEXT_FILE" != "true" && -n "$RESOLVED_CONTEXT_FILE" && -f "$RESOLVED_CONTEXT_FILE" ]]; then
     CONTEXT_SIZE=$(wc -c < "$RESOLVED_CONTEXT_FILE")
     if [[ $CONTEXT_SIZE -gt $CONTEXT_MAX ]]; then
       log_verbose "Context file exceeds max ($CONTEXT_SIZE > $CONTEXT_MAX), truncating..."
@@ -509,7 +1201,7 @@ if [[ -f "${1-}" && "$1" == *.md ]]; then
   fi
 
   if [[ -z "$PERSONA_ID" ]]; then
-    echo "{\"error\":\"no persona found - specify via --persona flag or ensure agent file has Persona headers\"}"
+    emit_cli_error_response "no persona found - specify via --persona flag or ensure agent file has Persona headers" "invalid_input" "" 2
     exit 2
   fi
 
@@ -519,7 +1211,7 @@ if [[ -f "${1-}" && "$1" == *.md ]]; then
   AGENT_PROMPT="$(extract_persona_block "$AGENT_FILE_ABS" "$PERSONA_ID")"
 
   if [[ -z "$AGENT_PROMPT" ]]; then
-    echo "{\"error\":\"persona '$PERSONA_ID' not found in agent file\"}"
+    emit_cli_error_response "persona '$PERSONA_ID' not found in agent file" "invalid_input" "" 2
     exit 2
   fi
 
@@ -633,18 +1325,31 @@ $TOOL_RULES
 - Respond immediately with your assessment
 - Return ONLY valid JSON matching the schema - no markdown, no explanations, no questions"
     fi
-    if [[ "$NO_CONTEXT" == "true" || -n "$SESSION_ID" ]]; then
-      FULL_PROMPT="$BASE_PROMPT"
-    else
-      FULL_PROMPT="${BASE_PROMPT}${CRITICAL_SUFFIX}"
-    fi
+    FULL_PROMPT="${BASE_PROMPT}${CRITICAL_SUFFIX}"
   else
     FULL_PROMPT="$AGENT_PROMPT"
   fi
 
+  # P2.1: Check prompt size and log warnings
+  if type check_prompt_size &>/dev/null; then
+    check_prompt_size "$FULL_PROMPT" "cursor"
+    PROMPT_OVER_LIMIT=$?
+
+    # Save debug prompt if enabled
+    if type save_debug_prompt &>/dev/null; then
+      save_debug_prompt "$FULL_PROMPT" "$PERSONA_ID" "cursor"
+    fi
+
+    # Log stats in verbose mode
+    if [[ "$VERBOSE" == "true" ]] && type get_prompt_stats &>/dev/null; then
+      PROMPT_STATS=$(get_prompt_stats "$FULL_PROMPT" "cursor")
+      log_verbose "Prompt stats: $PROMPT_STATS"
+    fi
+  fi
+
   if [[ "$DRY_RUN" == "true" ]]; then
     log_verbose "DRY-RUN MODE: Skipping actual CLI call"
-    
+
     MOCK_RESPONSE="{
   \"dry_run\": true,
   \"wrapper\": \"cursor.sh\",
@@ -680,20 +1385,7 @@ $TOOL_RULES
     fi
   fi
 
-  # Change to tenant directory for correct context
-  # Determine tenant directory - look for first directory under tenants/
-  TENANT_DIR=""
-  if [[ "$PWD" =~ .*/tenants/([^/]+)$ ]]; then
-    # Already in tenant directory
-    TENANT_DIR="$PWD"
-  elif [[ -d "$CORE_DIR/tenants" ]]; then
-    # Find first tenant directory (prefer oxygen if it exists)
-    if [[ -d "$CORE_DIR/tenants/oxygen" ]]; then
-      TENANT_DIR="$CORE_DIR/tenants/oxygen"
-    else
-      TENANT_DIR=$(find "$CORE_DIR/tenants" -maxdepth 1 -type d ! -name tenants | head -1)
-    fi
-  fi
+  TENANT_DIR="$(resolve_tenant_root)"
 
   # Cursor CLI doesn't accept temperature directly; log for visibility
   if [[ -n "$TEMPERATURE" ]]; then
@@ -701,10 +1393,15 @@ $TOOL_RULES
   fi
 
   WORKSPACE_DIR="$CORE_DIR"
-  if [[ -n "$TENANT_DIR" ]]; then
+  WORKSPACE_SOURCE="core_fallback"
+  if [[ -n "$CONTEXT_DIR" && -d "$CONTEXT_DIR" ]]; then
+    WORKSPACE_DIR="$CONTEXT_DIR"
+    WORKSPACE_SOURCE="context_dir"
+  elif [[ -n "$TENANT_DIR" ]]; then
     WORKSPACE_DIR="$TENANT_DIR"
+    WORKSPACE_SOURCE="tenant_fallback"
   fi
-  log_verbose "Invoking cursor-agent CLI (Workspace: ${WORKSPACE_DIR}, YOLO: $YOLO_MODE)"
+  log_verbose "Invoking cursor-agent CLI (Workspace: ${WORKSPACE_DIR}, Source: ${WORKSPACE_SOURCE}, YOLO: $YOLO_MODE)"
   if [[ "$ALLOW_TOOLS" == "true" ]]; then
     MCP_CONFIG_PATH="$(get_cursor_mcp_config || true)"
     if [[ -n "$MCP_CONFIG_PATH" ]]; then
@@ -737,31 +1434,75 @@ $TOOL_RULES
     log_verbose "Resuming session: $SESSION_ID"
   fi
 
+  # Add model flag if specified
+  if [[ -n "$MODEL" ]]; then
+    CURSOR_ARGS+=("--model" "$MODEL")
+    log_verbose "Using model: $MODEL"
+  fi
+
+  # Add mode arg if specified (cursor supports --mode=plan for exploration)
+  if [[ -n "$PERMISSION_MODE" ]]; then
+    CURSOR_ARGS+=("--mode" "$PERMISSION_MODE")
+    log_verbose "Using permission mode: $PERMISSION_MODE"
+  fi
+
   # Run cursor-agent in non-interactive mode (prompt passed as argument)
   CURSOR_PROMPT="$(cat "$TMPFILE_PROMPT")"
+
+  # O-6: Set up agent stream logging for per-ticket LLM output capture
+  AGENT_LOG=""
+  if [[ -n "${A8_TICKET_ID:-}" && -n "${WORKSPACE_DIR:-}" ]]; then
+    AGENT_LOG_DIR="${WORKSPACE_DIR}/.autonom8/agent_logs"
+    mkdir -p "$AGENT_LOG_DIR" 2>/dev/null || true
+    AGENT_LOG="${AGENT_LOG_DIR}/${A8_TICKET_ID}_${A8_WORKFLOW}_$(date +%s).log"
+    echo "=== Agent Stream Log ===" > "$AGENT_LOG"
+    echo "Ticket: $A8_TICKET_ID | Workflow: $A8_WORKFLOW | Provider: cursor" >> "$AGENT_LOG"
+    echo "Started: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$AGENT_LOG"
+    echo "===" >> "$AGENT_LOG"
+    log_verbose "O-6: Agent stream logging to $AGENT_LOG"
+  fi
+
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
     log_verbose "Running cursor-agent with timeout: ${CLI_TIMEOUT}s"
-    run_with_timeout "$CLI_TIMEOUT" cursor-agent "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+    if [[ -n "$AGENT_LOG" ]]; then
+      run_with_timeout "$CLI_TIMEOUT" "$CURSOR_AGENT_BIN" "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
+    else
+      run_with_timeout "$CLI_TIMEOUT" "$CURSOR_AGENT_BIN" "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+    fi
     CURSOR_EXIT=$?
   else
-    cursor-agent "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+    if [[ -n "$AGENT_LOG" ]]; then
+      cursor_agent_cli "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
+    else
+      cursor_agent_cli "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+    fi
     CURSOR_EXIT=$?
   fi
   set -e
+
+  # O-9: Append stdout response to agent log (stderr tee only captures progress/errors,
+  # cursor sends the actual response to stdout which may be missing from logs)
+  if [[ -n "$AGENT_LOG" && -f "$TMPFILE_OUTPUT" && -s "$TMPFILE_OUTPUT" ]]; then
+    echo "" >> "$AGENT_LOG"
+    cat "$TMPFILE_OUTPUT" >> "$AGENT_LOG" 2>/dev/null || true
+    echo "" >> "$AGENT_LOG"
+    echo "tokens used" >> "$AGENT_LOG"
+    wc -c < "$TMPFILE_OUTPUT" | xargs -I{} echo "{}" >> "$AGENT_LOG"
+  fi
 
   rm -f "$TMPFILE_PROMPT"
 
   if [[ $CURSOR_EXIT -ne 0 ]]; then
     # Cursor failed - return error with stderr
-    ERROR_MSG=$(cat "$TMPFILE_ERR" 2>/dev/null || echo "Unknown error")
+    ERROR_MSG=$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' || echo "Unknown error")
     log_verbose "Cursor execution failed: $ERROR_MSG"
 
     # Check if this is an invalid session error - fail fast, don't retry
     if echo "$ERROR_MSG" | grep -qi "Invalid session identifier\|session.*not found\|session.*expired"; then
       log_verbose "Invalid session detected - clearing stale session"
       rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
-      jq -n --arg err "$ERROR_MSG" --arg sid "$SESSION_ID" '{error: $err, stale_session: $sid, action: "clear_session"}'
+      emit_cli_error_response "$ERROR_MSG" "invalid_session" "$SESSION_ID" "$CURSOR_EXIT"
       exit 1
     fi
 
@@ -794,12 +1535,19 @@ $TOOL_RULES
     fi
 
     rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
-    jq -n --arg err "$ERROR_MSG" '{error: $err}'
+    ERROR_TYPE="provider_error"
+    if [[ "$CURSOR_EXIT" -eq 124 ]]; then
+      ERROR_TYPE="timeout"
+    elif declare -F classify_error >/dev/null; then
+      ERROR_TYPE="$(classify_error "$ERROR_MSG")"
+    fi
+    emit_cli_error_response "$ERROR_MSG" "$ERROR_TYPE" "$CURSOR_SESSION_ID" "$CURSOR_EXIT"
     exit 1
   fi
 
   # Read the output (JSON format from cursor-agent)
   RAW_OUTPUT="$(cat "$TMPFILE_OUTPUT" 2>/dev/null)"
+  STDERR_TEXT="$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' || true)"
   rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
 
   if [[ -n "$RAW_OUTPUT" ]]; then
@@ -812,7 +1560,7 @@ $TOOL_RULES
     IS_ERROR="$(echo "$RAW_OUTPUT" | jq -r '.is_error // false' 2>/dev/null || true)"
     if [[ "$IS_ERROR" == "true" ]]; then
       ERROR_MSG="$(echo "$RAW_OUTPUT" | jq -r '.result // "Unknown error"' 2>/dev/null || true)"
-      jq -n --arg err "$ERROR_MSG" '{error: $err}'
+      emit_cli_error_response "$ERROR_MSG" "provider_error" "$CURSOR_SESSION_ID" 1
       exit 1
     fi
 
@@ -827,36 +1575,27 @@ $TOOL_RULES
       fi
 
       # Wrap in CLIResponse format for Go worker (include session_id)
-      if [[ -n "$CURSOR_SESSION_ID" ]]; then
-        jq -n --arg resp "$RESPONSE_TEXT" --arg sid "$CURSOR_SESSION_ID" '{response: $resp, session_id: $sid}'
-      else
-        jq -n --arg resp "$RESPONSE_TEXT" '{response: $resp}'
-      fi
+      emit_cli_response "$RESPONSE_TEXT" "$CURSOR_SESSION_ID" "$RAW_OUTPUT" "" "" "$STDERR_TEXT"
     else
       # No result field - try raw response as fallback
-      jq -n --arg text "$RAW_OUTPUT" '{error:"No result in response", raw_response:$text}'
+      emit_cli_error_response "No result in response from cursor-agent" "provider_error" "$CURSOR_SESSION_ID" 1
     fi
   else
-    jq -n '{error:"No response from Cursor CLI"}'
+    emit_cli_error_response "No response from Cursor CLI" "provider_error" "$CURSOR_SESSION_ID" 1
   fi
 else
   # Direct invocation with text prompt
 
-  # Determine tenant directory for direct invocation
-  TENANT_DIR=""
-  if [[ "$PWD" =~ .*/tenants/([^/]+)$ ]]; then
-    TENANT_DIR="$PWD"
-  elif [[ -d "$CORE_DIR/tenants" ]]; then
-    if [[ -d "$CORE_DIR/tenants/oxygen" ]]; then
-      TENANT_DIR="$CORE_DIR/tenants/oxygen"
-    else
-      TENANT_DIR=$(find "$CORE_DIR/tenants" -maxdepth 1 -type d ! -name tenants | head -1)
-    fi
-  fi
+  TENANT_DIR="$(resolve_tenant_root)"
 
   WORKSPACE_DIR="$CORE_DIR"
-  if [[ -n "$TENANT_DIR" ]]; then
+  WORKSPACE_SOURCE="core_fallback"
+  if [[ -n "$CONTEXT_DIR" && -d "$CONTEXT_DIR" ]]; then
+    WORKSPACE_DIR="$CONTEXT_DIR"
+    WORKSPACE_SOURCE="context_dir"
+  elif [[ -n "$TENANT_DIR" ]]; then
     WORKSPACE_DIR="$TENANT_DIR"
+    WORKSPACE_SOURCE="tenant_fallback"
   fi
 
   # Build cursor-agent args
@@ -874,6 +1613,18 @@ else
     CURSOR_ARGS+=("--approve-mcps")
   fi
 
-  log_verbose "Running in direct invocation mode"
-  cursor-agent "${CURSOR_ARGS[@]}" "$@"
+  # Add model flag if specified
+  if [[ -n "$MODEL" ]]; then
+    CURSOR_ARGS+=("--model" "$MODEL")
+    log_verbose "Using model: $MODEL"
+  fi
+
+  # Add mode arg if specified (cursor supports --mode=plan for exploration)
+  if [[ -n "$PERMISSION_MODE" ]]; then
+    CURSOR_ARGS+=("--mode" "$PERMISSION_MODE")
+    log_verbose "Using permission mode: $PERMISSION_MODE"
+  fi
+
+  log_verbose "Running in direct invocation mode (Workspace: ${WORKSPACE_DIR}, Source: ${WORKSPACE_SOURCE}, Model: ${MODEL:-default}, Mode: ${PERMISSION_MODE:-default})"
+  cursor_agent_cli "${CURSOR_ARGS[@]}" "$@"
 fi

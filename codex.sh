@@ -8,6 +8,7 @@ set -euo pipefail
 # Track child process PID for cleanup on script termination
 CODEX_PID=""
 CLI_TIMEOUT=""  # Timeout in seconds, passed from Go worker
+RESPONSE_EMITTED=false
 
 # Cleanup function to kill child processes on script termination
 cleanup() {
@@ -21,6 +22,25 @@ cleanup() {
   pkill -P $$ 2>/dev/null || true
 }
 trap cleanup EXIT TERM INT
+
+resolve_codex_cmd() {
+  local wrapper_path=""
+  wrapper_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
+
+  local candidate=""
+  while IFS= read -r candidate; do
+    [[ -z "$candidate" ]] && continue
+    local resolved=""
+    resolved="$(cd "$(dirname "$candidate")" 2>/dev/null && pwd -P)/$(basename "$candidate")"
+    if [[ "$resolved" == "$wrapper_path" ]]; then
+      continue
+    fi
+    echo "$candidate"
+    return 0
+  done < <(which -a codex 2>/dev/null | awk '!seen[$0]++')
+
+  return 1
+}
 
 # Run command with timeout (preserves stdin for piped input)
 run_with_timeout() {
@@ -66,6 +86,309 @@ run_with_timeout() {
   fi
 }
 
+compact_reasoning_text() {
+  local text="${1:-}"
+  printf "%s" "$text" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' | sed 's/^ //;s/ $//'
+}
+
+is_reasoning_placeholder() {
+  local text="${1:-}"
+  local compacted=""
+  compacted="$(compact_reasoning_text "$text")"
+
+  [[ -z "$compacted" ]] && return 0
+  if [[ "$compacted" == "{}" || "$compacted" == "[]" || "$compacted" == "null" ]]; then
+    return 0
+  fi
+  if printf "%s" "$compacted" | grep -Eq '^`{3,}[[:space:]]*(json|markdown|md|yaml|yml|text|txt)?[[:space:]]*`{0,3}$'; then
+    return 0
+  fi
+  if [[ ${#compacted} -le 6 ]] && printf "%s" "$compacted" | grep -Eq '^[`[:space:]]+$'; then
+    return 0
+  fi
+
+  return 1
+}
+
+emit_cli_response() {
+  local response_text="$1"
+  local session_id="${2:-}"
+  local raw_output="${3:-}"
+  local extra_field_name="${4:-}"
+  local extra_field_value="${5:-}"
+  local stream_output="${6:-}"
+
+  local tokens_json='{"input_tokens":0,"output_tokens":0,"total_tokens":0,"cost_usd":0}'
+  local token_usage_available=false
+  local reasoning_text=""
+  local reasoning_available=false
+  local reasoning_source="none"
+  local reasoning_absent_reason="model_not_emitted"
+
+  if [[ -n "$raw_output" ]]; then
+    local parsed_tokens
+    parsed_tokens="$(printf "%s" "$raw_output" | jq -c '
+      def as_int:
+        if type == "number" then floor
+        elif type == "string" then (tonumber? // 0)
+        else 0 end;
+      def as_num:
+        if type == "number" then .
+        elif type == "string" then (tonumber? // 0)
+        else 0 end;
+      {
+        input_tokens: ((.usage.input_tokens // .usage.inputTokens // .input_tokens // .inputTokens // .token_usage.input_tokens // .token_usage.prompt_tokens // .prompt_tokens // 0) | as_int),
+        output_tokens: ((.usage.output_tokens // .usage.outputTokens // .output_tokens // .outputTokens // .token_usage.output_tokens // .token_usage.completion_tokens // .completion_tokens // 0) | as_int),
+        total_tokens: ((.usage.total_tokens // .usage.totalTokens // .total_tokens // .totalTokens // .token_usage.total_tokens // .token_usage.total // .total_tokens_used // 0) | as_int),
+        cost_usd: ((.usage.cost_usd // .usage.cost // .cost_usd // .token_usage.cost_usd // .cost // 0) | as_num)
+      }
+      | if .total_tokens == 0 and ((.input_tokens + .output_tokens) > 0)
+        then .total_tokens = (.input_tokens + .output_tokens)
+        else .
+        end
+    ' 2>/dev/null || true)"
+    if [[ -n "$parsed_tokens" && "$parsed_tokens" != "null" ]]; then
+      tokens_json="$parsed_tokens"
+      if [[ "$(printf "%s" "$tokens_json" | jq -r '((.input_tokens + .output_tokens + .total_tokens) > 0)' 2>/dev/null || echo false)" == "true" ]]; then
+        token_usage_available=true
+      fi
+    fi
+  fi
+
+  if [[ "$token_usage_available" != "true" && -n "$session_id" ]]; then
+    local session_tokens
+    session_tokens="$(get_codex_session_token_usage "$session_id" 2>/dev/null || true)"
+    if [[ -n "$session_tokens" ]]; then
+      tokens_json="$session_tokens"
+      token_usage_available=true
+    fi
+  fi
+
+  if [[ "$token_usage_available" != "true" && -n "$stream_output" ]]; then
+    local stream_total_tokens=""
+    stream_total_tokens="$(printf "%s" "$stream_output" | \
+      perl -pe 's/\x1b\[[0-9;]*[A-Za-z]//g' | \
+      grep -ioE 'tokens used[^0-9]*[0-9]+' | \
+      tail -1 | grep -oE '[0-9]+' | tail -1 || true)"
+    if [[ -n "$stream_total_tokens" ]]; then
+      tokens_json="$(printf "%s" "$tokens_json" | jq -c --argjson total "$stream_total_tokens" '
+        .total_tokens = $total
+        | if .output_tokens == 0 then .output_tokens = $total else . end
+      ' 2>/dev/null || echo "$tokens_json")"
+      token_usage_available=true
+    fi
+  fi
+
+  if [[ -n "$raw_output" ]]; then
+    local raw_reasoning
+    raw_reasoning="$(printf "%s" "$raw_output" | jq -r '
+      def stringify:
+        if type == "string" then .
+        elif type == "object" or type == "array" then tojson
+        else tostring end;
+      (._reasoning // .reasoning // .thinking // .thoughts // .analysis // empty)
+      | stringify
+    ' 2>/dev/null || true)"
+    if [[ -n "$raw_reasoning" && "$raw_reasoning" != "null" ]]; then
+      reasoning_text="$raw_reasoning"
+      reasoning_source="raw_output"
+    fi
+  fi
+
+  if [[ -z "$reasoning_text" && -n "$session_id" ]]; then
+    local session_reasoning
+    session_reasoning="$(get_codex_session_reasoning "$session_id" 2>/dev/null || true)"
+    if [[ -n "$session_reasoning" ]]; then
+      reasoning_text="$session_reasoning"
+      reasoning_source="session_log"
+    fi
+  fi
+
+  if [[ -z "$reasoning_text" && -n "$response_text" ]]; then
+    local response_reasoning
+    response_reasoning="$(printf "%s" "$response_text" | jq -r '
+      def stringify:
+        if type == "string" then .
+        elif type == "object" or type == "array" then tojson
+        else tostring end;
+      if type == "object"
+      then (._reasoning // .reasoning // .thinking // .thoughts // .analysis // empty) | stringify
+      else empty
+      end
+    ' 2>/dev/null || true)"
+    if [[ -n "$response_reasoning" && "$response_reasoning" != "null" ]]; then
+      reasoning_text="$response_reasoning"
+      reasoning_source="response_payload"
+    fi
+  fi
+
+  if [[ -z "$reasoning_text" && -n "$stream_output" ]]; then
+    local stream_reasoning
+    stream_reasoning="$(printf "%s" "$stream_output" | \
+      perl -pe 's/\x1b\[[0-9;]*[A-Za-z]//g' | \
+      grep -iE 'thought|thinking|reasoning|analysis|plan:|step [0-9]+' | \
+      grep -ivE 'using model|timeout|loaded cached credentials|yolo mode|tokens used|tool call|session id|debug:' | \
+      tail -n 20 | tr '\n' ' ' | sed 's/[[:space:]]\\+/ /g' | sed 's/^ //;s/ $//' || true)"
+    if [[ -n "$stream_reasoning" ]]; then
+      reasoning_text="$stream_reasoning"
+      reasoning_source="stream_log"
+    fi
+  fi
+
+  if [[ -n "$reasoning_text" ]]; then
+    reasoning_text="$(compact_reasoning_text "$reasoning_text")"
+  fi
+
+  if [[ ${#reasoning_text} -gt 2 ]] && ! is_reasoning_placeholder "$reasoning_text"; then
+    reasoning_available=true
+    reasoning_absent_reason="available"
+  else
+    reasoning_text=""
+    reasoning_available=false
+    reasoning_source="none"
+    reasoning_absent_reason="model_not_emitted"
+  fi
+
+  RESPONSE_EMITTED=true
+
+  if [[ -n "$session_id" && -n "$extra_field_name" ]]; then
+    jq -n \
+      --arg resp "$response_text" \
+      --arg sid "$session_id" \
+      --arg reasoning "$reasoning_text" \
+      --arg extra_name "$extra_field_name" \
+      --arg extra_val "$extra_field_value" \
+      --argjson tokens "$tokens_json" \
+      --argjson available "$token_usage_available" \
+      --argjson reasoning_available "$reasoning_available" \
+      --arg reasoning_source "$reasoning_source" \
+      --arg reasoning_absent_reason "$reasoning_absent_reason" \
+      '{response: $resp, session_id: $sid, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}} + {($extra_name): $extra_val}'
+  elif [[ -n "$session_id" ]]; then
+    jq -n \
+      --arg resp "$response_text" \
+      --arg sid "$session_id" \
+      --arg reasoning "$reasoning_text" \
+      --argjson tokens "$tokens_json" \
+      --argjson available "$token_usage_available" \
+      --argjson reasoning_available "$reasoning_available" \
+      --arg reasoning_source "$reasoning_source" \
+      --arg reasoning_absent_reason "$reasoning_absent_reason" \
+      '{response: $resp, session_id: $sid, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}}'
+  elif [[ -n "$extra_field_name" ]]; then
+    jq -n \
+      --arg resp "$response_text" \
+      --arg reasoning "$reasoning_text" \
+      --arg extra_name "$extra_field_name" \
+      --arg extra_val "$extra_field_value" \
+      --argjson tokens "$tokens_json" \
+      --argjson available "$token_usage_available" \
+      --argjson reasoning_available "$reasoning_available" \
+      --arg reasoning_source "$reasoning_source" \
+      --arg reasoning_absent_reason "$reasoning_absent_reason" \
+      '{response: $resp, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}} + {($extra_name): $extra_val}'
+  else
+    jq -n \
+      --arg resp "$response_text" \
+      --arg reasoning "$reasoning_text" \
+      --argjson tokens "$tokens_json" \
+      --argjson available "$token_usage_available" \
+      --argjson reasoning_available "$reasoning_available" \
+      --arg reasoning_source "$reasoning_source" \
+      --arg reasoning_absent_reason "$reasoning_absent_reason" \
+      '{response: $resp, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}}'
+  fi
+}
+
+emit_cli_error_response() {
+  local error_msg="$1"
+  local error_type="${2:-unknown}"
+  local session_id="${3:-}"
+  local exit_code="${4:-1}"
+  local tokens_json='{"input_tokens":0,"output_tokens":0,"total_tokens":0,"cost_usd":0}'
+  local token_usage_available=false
+  local reasoning_text=""
+  local reasoning_available=false
+  local reasoning_source="none"
+  local reasoning_absent_reason="error_path"
+  local recoverable=false
+  case "$error_type" in
+    quota|rate_limit|timeout|invalid_session)
+      recoverable=true
+      ;;
+  esac
+
+  if [[ -n "$session_id" ]]; then
+    local session_tokens=""
+    session_tokens="$(get_codex_session_token_usage "$session_id" 2>/dev/null || true)"
+    if [[ -n "$session_tokens" ]]; then
+      tokens_json="$session_tokens"
+      token_usage_available=true
+    fi
+
+    local session_reasoning=""
+    session_reasoning="$(get_codex_session_reasoning "$session_id" 2>/dev/null || true)"
+    if [[ -n "$session_reasoning" ]]; then
+      session_reasoning="$(compact_reasoning_text "$session_reasoning")"
+      if [[ ${#session_reasoning} -gt 2 ]] && ! is_reasoning_placeholder "$session_reasoning"; then
+        reasoning_text="$session_reasoning"
+        reasoning_available=true
+        reasoning_source="session_log_error_fallback"
+        reasoning_absent_reason="available"
+      fi
+    fi
+  fi
+
+  RESPONSE_EMITTED=true
+  if [[ -n "$session_id" ]]; then
+    jq -n \
+      --arg sid "$session_id" \
+      --arg err "$error_msg" \
+      --arg type "$error_type" \
+      --argjson code "$exit_code" \
+      --argjson recoverable "$recoverable" \
+      --arg reasoning "$reasoning_text" \
+      --argjson tokens "$tokens_json" \
+      --argjson available "$token_usage_available" \
+      --argjson reasoning_available "$reasoning_available" \
+      --arg reasoning_source "$reasoning_source" \
+      --arg reasoning_absent_reason "$reasoning_absent_reason" \
+      '{
+        response: "",
+        session_id: $sid,
+        reasoning: $reasoning,
+        tokens_used: $tokens,
+        metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason},
+        error: $err,
+        error_type: $type,
+        exit_code: $code,
+        recoverable: $recoverable
+      }'
+  else
+    jq -n \
+      --arg err "$error_msg" \
+      --arg type "$error_type" \
+      --argjson code "$exit_code" \
+      --argjson recoverable "$recoverable" \
+      --arg reasoning "$reasoning_text" \
+      --argjson tokens "$tokens_json" \
+      --argjson available "$token_usage_available" \
+      --argjson reasoning_available "$reasoning_available" \
+      --arg reasoning_source "$reasoning_source" \
+      --arg reasoning_absent_reason "$reasoning_absent_reason" \
+      '{
+        response: "",
+        reasoning: $reasoning,
+        tokens_used: $tokens,
+        metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason},
+        error: $err,
+        error_type: $type,
+        exit_code: $code,
+        recoverable: $recoverable
+      }'
+  fi
+}
+
 # Verbose logging function
 log_verbose() {
     if [[ "$VERBOSE" == "true" ]]; then
@@ -92,14 +415,14 @@ ensure_codex_mcp_servers() {
 
   while read -r server_name; do
     [[ -z "$server_name" ]] && continue
-    if ! codex mcp get "$server_name" --json >/dev/null 2>&1; then
+    if ! "$CODEX_CMD" mcp get "$server_name" --json >/dev/null 2>&1; then
       local command
       command=$(jq -r ".mcpServers.\"$server_name\".command" "$config_path" 2>/dev/null || true)
       if [[ -z "$command" || "$command" == "null" ]]; then
         continue
       fi
       mapfile -t args < <(jq -r ".mcpServers.\"$server_name\".args[]?" "$config_path" 2>/dev/null || true)
-      codex mcp add "$server_name" "$command" "${args[@]}" >/dev/null 2>&1 || true
+      "$CODEX_CMD" mcp add "$server_name" "$command" "${args[@]}" >/dev/null 2>&1 || true
       log_verbose "Registered MCP server for codex: $server_name"
     fi
   done <<< "$server_names"
@@ -110,6 +433,85 @@ ensure_codex_mcp_servers() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CORE_DIR="$(dirname "$SCRIPT_DIR")"
 
+# =============================================================================
+# Prompt Utilities (inlined, provider-specific)
+# Codex (GPT-5.2) has 128K token context window (~512K chars)
+# =============================================================================
+PROMPT_MAX_CHARS=150000        # ~37K tokens - conservative limit for Codex
+PROMPT_WARN_THRESHOLD=120000   # Warn at ~30K tokens
+
+log_warn() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] WARN: $*" >&2
+}
+
+log_info() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] INFO: $*" >&2
+}
+
+check_prompt_size() {
+    local prompt="$1"
+    local provider="${2:-codex}"
+    local prompt_size=${#prompt}
+    local estimated_tokens=$((prompt_size / 4))
+
+    if [[ $prompt_size -gt $PROMPT_MAX_CHARS ]]; then
+        log_warn "[$provider] LARGE PROMPT: ${prompt_size} chars (~${estimated_tokens} tokens) exceeds limit of ${PROMPT_MAX_CHARS}"
+        return 1
+    elif [[ $prompt_size -gt $PROMPT_WARN_THRESHOLD ]]; then
+        log_warn "[$provider] Prompt size warning: ${prompt_size} chars (~${estimated_tokens} tokens) approaching limit"
+        return 0
+    fi
+    return 0
+}
+
+get_prompt_stats() {
+    local prompt="$1"
+    local provider="${2:-codex}"
+    local prompt_size=${#prompt}
+    local estimated_tokens=$((prompt_size / 4))
+    local over_limit="false"
+    [[ $prompt_size -gt $PROMPT_MAX_CHARS ]] && over_limit="true"
+
+    jq -n \
+        --arg provider "$provider" \
+        --argjson size "$prompt_size" \
+        --argjson tokens "$estimated_tokens" \
+        --argjson max "$PROMPT_MAX_CHARS" \
+        --arg over "$over_limit" \
+        '{provider: $provider, prompt_size_chars: $size, estimated_tokens: $tokens, max_chars: $max, over_limit: ($over == "true")}'
+}
+
+save_debug_prompt() {
+    local prompt="$1"
+    local persona_id="$2"
+    local provider="${3:-codex}"
+    [[ "${DEBUG_PROMPTS:-false}" != "true" ]] && return 0
+
+    local log_dir="${PROMPT_LOG_DIR:-/tmp/autonom8_prompts}"
+    mkdir -p "$log_dir"
+    local timestamp=$(date '+%Y%m%d_%H%M%S')
+    local safe_persona=$(echo "$persona_id" | tr ' ()' '_')
+    local filename="${timestamp}_${provider}_${safe_persona}.txt"
+
+    {
+        echo "# Prompt Debug Log"
+        echo "# Provider: $provider"
+        echo "# Persona: $persona_id"
+        echo "# Size: ${#prompt} chars"
+        echo "---"
+        echo "$prompt"
+    } > "$log_dir/$filename"
+    log_info "Prompt saved to: $log_dir/$filename"
+}
+# =============================================================================
+
+# P6.1: Source shared error handling library
+if [[ -f "$SCRIPT_DIR/lib/error_utils.sh" ]]; then
+    source "$SCRIPT_DIR/lib/error_utils.sh"
+fi
+
 # Agent invocation mode: wrapper expects agent .md file path + optional input data
 # We must extract a single persona block, not pass the whole file.
 
@@ -117,32 +519,40 @@ validate_agent_file() {
   local file="$1"
   # Ensure at least one valid persona section exists (support both ## and ### headers)
   if ! grep -qE '^##+[[:space:]]+Persona:' "$file"; then
-    jq -n --arg file "$file" \
-      '{error:"Invalid agent file format", details:"Missing `## Persona:` or `### Persona:` header in \($file)"}'
+    emit_cli_error_response "Invalid agent file format: Missing ## Persona:/### Persona: header in $file" "invalid_input" "" 3
     exit 3
   fi
 
   # Ensure each persona has at least some description or instructions
   if ! awk '/^##+[[:space:]]+Persona:/{count++} END{exit (count>=1)?0:1}' "$file"; then
-    jq -n --arg file "$file" \
-      '{error:"Invalid agent file format", details:"No valid persona blocks detected in \($file)"}'
+    emit_cli_error_response "Invalid agent file format: No valid persona blocks detected in $file" "invalid_input" "" 3
     exit 3
   fi
 }
 
 extract_persona_block() {
   local file="$1"
-  local persona_id="$2"   # e.g., pm-codex | pm-gemini | pm-claude | po-codex
-  # Match header "## Persona:" or "### Persona:" (allows trailing labels, e.g. "(Strategic Planner)")
+  local persona_id="$2"   # e.g., pm-codex | dev-codex (Implement) | dev-claudecode (Design)
+  # P1.5.1 FIX: Match full persona ID including role suffix
+  # Supports both old format (pm-codex) and new format (dev-codex (Implement))
+  # Match header "## Persona:" or "### Persona:"
   awk -v id="$persona_id" '
     BEGIN{found=0}
     /^##+[[:space:]]+Persona:[[:space:]]+/{
       if(found){exit}
       hdr=$0
       sub(/^##+[[:space:]]+Persona:[[:space:]]+/, "", hdr)
-      # hdr now like "pm-codex (Strategic Planner)" or "po-codex (Stories)"; compare prefix to id
-      split(hdr,a," ")
-      if(a[1]==id){found=1; print $0; next}
+      # Remove trailing whitespace
+      gsub(/[[:space:]]*$/, "", hdr)
+      # P1.5.1 FIX: Compare full persona ID (exact match) or prefix match for backward compat
+      # Full match: "dev-codex (Implement)" == "dev-codex (Implement)"
+      # Prefix match: "pm-codex" matches "pm-codex (Strategic Planner)" for legacy support
+      if(hdr == id){found=1; print $0; next}
+      # Legacy prefix matching: if id has no parentheses, match prefix
+      if(index(id, "(") == 0) {
+        split(hdr,a," ")
+        if(a[1]==id){found=1; print $0; next}
+      }
     }
     found{print}
   ' "$file"
@@ -163,6 +573,48 @@ get_codex_sessions() {
   if [[ -d "$HOME/.codex/sessions" ]]; then
     ls -t "$HOME/.codex/sessions" 2>/dev/null | head -20
   fi
+}
+
+get_codex_session_file_by_id() {
+  local session_id="$1"
+  [[ -z "$session_id" ]] && return 1
+  find "$HOME/.codex/sessions" -name "*-${session_id}.jsonl" -type f 2>/dev/null | head -1
+}
+
+get_codex_session_token_usage() {
+  local session_id="$1"
+  local session_file=""
+  session_file="$(get_codex_session_file_by_id "$session_id" 2>/dev/null || true)"
+  [[ -z "$session_file" || ! -f "$session_file" ]] && return 1
+
+  tail -n 4000 "$session_file" 2>/dev/null | jq -rc '
+    def as_int:
+      if type == "number" then floor
+      elif type == "string" then (tonumber? // 0)
+      else 0 end;
+    select(.type == "event_msg" and .payload.type == "token_count")
+    | .payload.info.last_token_usage
+    | {
+        input_tokens: ((.input_tokens // 0) | as_int),
+        output_tokens: (((.output_tokens // 0) + (.reasoning_output_tokens // 0)) | as_int),
+        total_tokens: ((.total_tokens // ((.input_tokens // 0) + (.output_tokens // 0) + (.reasoning_output_tokens // 0))) | as_int),
+        cost_usd: 0
+      }
+  ' | tail -1
+}
+
+get_codex_session_reasoning() {
+  local session_id="$1"
+  local session_file=""
+  session_file="$(get_codex_session_file_by_id "$session_id" 2>/dev/null || true)"
+  [[ -z "$session_file" || ! -f "$session_file" ]] && return 1
+
+  local reasoning
+  reasoning="$(tail -n 4000 "$session_file" 2>/dev/null | jq -r '
+    select(.type == "event_msg" and .payload.type == "agent_reasoning")
+    | (.payload.text // empty)
+  ' | tail -n 5 | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' | sed 's/^ //;s/ $//')"
+  [[ -n "$reasoning" ]] && printf "%s" "$reasoning"
 }
 
 get_latest_codex_session() {
@@ -201,12 +653,16 @@ TEMPERATURE=""
 CONTEXT_FILE=""
 CONTEXT_DIR=""
 CONTEXT_MAX=51200  # 50KB default max context size
-NO_CONTEXT=false
+SKIP_CONTEXT_FILE=false
 ALLOW_TOOLS=false  # Codex handles tool access via --dangerously-bypass-approvals-and-sandbox
 SESSION_ID=""        # Existing session ID to resume
 MANAGE_SESSION=""    # Placeholder for new session tracking
 SKILL_NAME=""        # Skill to invoke (from .claude/commands/)
 QUOTA_STATUS=false   # Check and return quota status
+HEALTH_CHECK=false   # P6.4: Health check mode
+MODEL=""             # Model selection (gpt4o, o3, o4-mini, or full model name)
+PERMISSION_MODE=""   # Permission mode (ignored by codex - no plan mode support)
+REASONING_FALLBACK=false # Emit fallback reasoning/tokens from session logs only
 
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
@@ -226,13 +682,13 @@ while [[ $# -gt 0 ]]; do
     --context-max)
       CONTEXT_MAX="$2"; shift 2
       ;;
-    --no-context)
-      NO_CONTEXT=true; shift
+    --skip-context-file)
+      SKIP_CONTEXT_FILE=true; shift
       ;;
     --yolo)
       YOLO_MODE=true; shift
       ;;
-    --allowed-tools)
+    --allow-tools|--allowed-tools)
       # Codex equivalent: enable tool access via bypass flag
       # This flag is consumed here and translates to enabling YOLO mode
       ALLOW_TOOLS=true
@@ -250,7 +706,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --session-id|--resume)
       # Codex supports sessions via ~/.codex/sessions/ directory
-      # Resume with: codex exec resume "$SESSION_ID"
+      # Resume with: "$CODEX_CMD" exec resume "$SESSION_ID"
       SESSION_ID="$2"; shift 2
       ;;
     --manage-session)
@@ -263,11 +719,29 @@ while [[ $# -gt 0 ]]; do
     --quota-status)
       QUOTA_STATUS=true; shift
       ;;
+    --health-check)
+      HEALTH_CHECK=true; shift
+      ;;
+    --model)
+      MODEL="$2"; shift 2
+      ;;
+    --mode|--permission-mode)
+      PERMISSION_MODE="$2"; shift 2
+      # Note: Codex ignores mode flag - no plan mode support
+      ;;
+    --reasoning-fallback|--reasoning-fallback-only)
+      REASONING_FALLBACK=true; shift
+      ;;
     *)
       break
       ;;
   esac
 done
+
+CODEX_CMD="${AUTONOM8_CODEX_CMD:-}"
+if [[ -z "$CODEX_CMD" ]]; then
+  CODEX_CMD="$(resolve_codex_cmd || true)"
+fi
 
 # ===================
 # Quota Status Mode
@@ -325,6 +799,85 @@ if [[ "$QUOTA_STATUS" == "true" ]]; then
 fi
 
 # ===================
+# P6.4: Health Check Mode
+# ===================
+# If --health-check flag is provided, check provider health and return status
+if [[ "$HEALTH_CHECK" == "true" ]]; then
+  log_verbose "Health check mode: testing codex CLI availability"
+
+  START_TIME=$(date +%s%N 2>/dev/null || date +%s)
+
+  # Check if codex CLI is available
+  if [[ -z "$CODEX_CMD" ]]; then
+    jq -n --arg provider "codex" '{
+      provider: $provider,
+      status: "unavailable",
+      cli_available: false,
+      error: "codex CLI not found in PATH or resolved to wrapper recursion",
+      session_support: true
+    }'
+    exit 1
+  fi
+
+  # Try a minimal invocation to verify CLI works
+  HEALTH_OUTPUT=$("$CODEX_CMD" --version 2>&1 || echo "version_check_failed")
+  HEALTH_EXIT=$?
+
+  END_TIME=$(date +%s%N 2>/dev/null || date +%s)
+
+  # Calculate latency (handle both nanosecond and second precision)
+  if [[ ${#START_TIME} -gt 10 ]]; then
+    LATENCY_MS=$(( (END_TIME - START_TIME) / 1000000 ))
+  else
+    LATENCY_MS=$(( (END_TIME - START_TIME) * 1000 ))
+  fi
+
+  if [[ $HEALTH_EXIT -eq 0 ]]; then
+    # Extract version if available
+    VERSION=$(echo "$HEALTH_OUTPUT" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
+
+    jq -n --arg provider "codex" \
+          --arg status "ok" \
+          --argjson latency "$LATENCY_MS" \
+          --arg version "$VERSION" \
+          '{
+            provider: $provider,
+            status: $status,
+            latency_ms: $latency,
+            cli_available: true,
+            version: $version,
+            session_support: true
+          }'
+  else
+    jq -n --arg provider "codex" \
+          --arg error "$HEALTH_OUTPUT" \
+          --argjson latency "$LATENCY_MS" \
+          '{
+            provider: $provider,
+            status: "error",
+            latency_ms: $latency,
+            cli_available: true,
+            error: $error,
+            session_support: true
+          }'
+  fi
+  exit 0
+fi
+
+# ===================
+# Reasoning Fallback Mode
+# ===================
+# Emit telemetry envelope from session logs without invoking provider CLI.
+if [[ "$REASONING_FALLBACK" == "true" ]]; then
+  if [[ -z "$SESSION_ID" ]]; then
+    emit_cli_error_response "reasoning_fallback requires explicit --session-id" "invalid_input" "" 2
+    exit 2
+  fi
+  emit_cli_response "" "$SESSION_ID" "" "" "" ""
+  exit 0
+fi
+
+# ===================
 # Skill Execution Mode
 # ===================
 # If --skill flag is provided, invoke skill directly via Codex
@@ -352,7 +905,7 @@ if [[ -n "$SKILL_NAME" ]]; then
   done
 
   if [[ -z "$SKILL_FILE" ]]; then
-    jq -n --arg skill "$SKILL_NAME" '{error: "Skill not found", skill: $skill, searched: ["/.claude/commands/"]}'
+    emit_cli_error_response "Skill not found: $SKILL_NAME" "invalid_input" "" 2
     exit 2
   fi
 
@@ -386,7 +939,7 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
   fi
 
   # Dry run mode
-  if [[ "$DRY_RUN" == "true" ]]; then
+if [[ "$DRY_RUN" == "true" ]]; then
     jq -n --arg skill "$SKILL_NAME" --arg file "$SKILL_FILE" \
       '{dry_run: true, wrapper: "codex.sh", mode: "skill", skill: $skill, skill_file: $file, validation: "passed"}'
     exit 0
@@ -426,7 +979,14 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
     fi
   fi
 
-  log_verbose "Invoking codex CLI for skill (WorkDir: ${WORK_DIR:-none}, Resume: ${RESUME_ARG:-none})"
+  # Build model argument if specified
+  MODEL_ARG=""
+  if [[ -n "$MODEL" ]]; then
+    MODEL_ARG="-m $MODEL"
+    log_verbose "Using model: $MODEL"
+  fi
+
+  log_verbose "Invoking codex CLI for skill (WorkDir: ${WORK_DIR:-none}, Resume: ${RESUME_ARG:-none}, Model: ${MODEL_ARG:-default})"
 
   # Export CODEX_SANDBOX so Playwright skips WebKit and Firefox (crashes in sandbox)
   export CODEX_SANDBOX=1
@@ -438,29 +998,29 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
     if [[ -n "$WORK_DIR" ]]; then
       if [[ -n "$RESUME_ARG" ]]; then
         # Resume mode: --sandbox/-o not supported, capture stdout directly with '-' for stdin prompt
-        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" codex exec $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR")
+        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR")
       else
-        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" codex exec $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null)
+        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null)
       fi
     else
       if [[ -n "$RESUME_ARG" ]]; then
-        echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" codex exec $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR"
+        echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR"
       else
-        echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" codex exec $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null
+        echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null
       fi
     fi
   else
     if [[ -n "$WORK_DIR" ]]; then
       if [[ -n "$RESUME_ARG" ]]; then
-        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | codex exec $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR")
+        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR")
       else
-        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | codex exec $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null)
+        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null)
       fi
     else
       if [[ -n "$RESUME_ARG" ]]; then
-        echo "$SKILL_PROMPT" | codex exec $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR"
+        echo "$SKILL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR"
       else
-        echo "$SKILL_PROMPT" | codex exec $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null
+        echo "$SKILL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null
       fi
     fi
   fi
@@ -477,14 +1037,27 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
   fi
 
   if [[ $CODEX_EXIT -ne 0 ]]; then
-    ERROR_MSG=$(cat "$TMPFILE_ERR" 2>/dev/null || echo "Unknown error")
+    # P58: Filter out Codex session banner from stderr to get actual error
+    ERROR_MSG=$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' | \
+      grep -v "^Reading prompt" | \
+      grep -v "^OpenAI Codex" | \
+      grep -v "^--------" | \
+      grep -v "^workdir:" | \
+      grep -v "^model:" | \
+      grep -v "^provider:" | \
+      grep -v "^$" || echo "Unknown error")
+    # If filtering removed everything, provide a generic message with exit code
+    if [[ -z "$ERROR_MSG" || "$ERROR_MSG" == "Unknown error" ]]; then
+      ERROR_MSG="Codex exited with status $CODEX_EXIT (no error details captured)"
+    fi
     rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
     # Truncate error to avoid "argument list too long"
-    jq -n --arg err "$(echo "$ERROR_MSG" | head -c 4000)" --arg skill "$SKILL_NAME" '{error: $err, skill: $skill}'
+    emit_cli_error_response "$(echo "$ERROR_MSG" | head -c 4000)" "provider_error" "$CODEX_SESSION_ID" "$CODEX_EXIT"
     exit 1
   fi
 
-  RESPONSE_TEXT="$(cat "$TMPFILE_OUTPUT" 2>/dev/null)"
+  RESPONSE_TEXT="$(cat "$TMPFILE_OUTPUT" 2>/dev/null | tr -d '\0')"
+  STDERR_TEXT="$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' || true)"
   rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
 
   if [[ -n "$RESPONSE_TEXT" && "$RESPONSE_TEXT" != "null" ]]; then
@@ -496,17 +1069,17 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
     fi
 
     # Wrap in CLIResponse format with session_id if captured
-    if [[ -n "$CODEX_SESSION_ID" ]]; then
-      jq -n --arg resp "$RESPONSE_TEXT" --arg skill "$SKILL_NAME" --arg sid "$CODEX_SESSION_ID" \
-        '{response: $resp, skill: $skill, session_id: $sid}'
-    else
-      jq -n --arg resp "$RESPONSE_TEXT" --arg skill "$SKILL_NAME" '{response: $resp, skill: $skill}'
-    fi
+    emit_cli_response "$RESPONSE_TEXT" "$CODEX_SESSION_ID" "$RESPONSE_TEXT" "skill" "$SKILL_NAME" "$STDERR_TEXT"
   else
-    jq -n --arg skill "$SKILL_NAME" '{error: "No response from skill execution", skill: $skill}'
+    emit_cli_error_response "No response from skill execution: $SKILL_NAME" "provider_error" "$CODEX_SESSION_ID" 1
   fi
 
   exit 0
+fi
+
+if [[ -z "$CODEX_CMD" ]]; then
+  emit_cli_error_response "codex CLI not found in PATH or resolved to wrapper recursion" "provider_error" "$SESSION_ID" 127
+  exit 1
 fi
 
 if [[ -f "${1-}" && "$1" == *.md ]]; then
@@ -535,8 +1108,8 @@ if [[ -f "${1-}" && "$1" == *.md ]]; then
   CONTEXT_CONTENT=""
   RESOLVED_CONTEXT_FILE=""
 
-  if [[ "$NO_CONTEXT" == "true" ]]; then
-    log_verbose "Context loading disabled (--no-context)"
+  if [[ "$SKIP_CONTEXT_FILE" == "true" ]]; then
+    log_verbose "Context loading disabled (--skip-context-file)"
   else
     # Priority: --context > --context-dir > auto-discover from input JSON
     if [[ -n "$CONTEXT_FILE" && -f "$CONTEXT_FILE" ]]; then
@@ -561,7 +1134,7 @@ if [[ -f "${1-}" && "$1" == *.md ]]; then
   fi
 
   # Load and optionally truncate context
-  if [[ "$NO_CONTEXT" != "true" && -n "$RESOLVED_CONTEXT_FILE" && -f "$RESOLVED_CONTEXT_FILE" ]]; then
+  if [[ "$SKIP_CONTEXT_FILE" != "true" && -n "$RESOLVED_CONTEXT_FILE" && -f "$RESOLVED_CONTEXT_FILE" ]]; then
     CONTEXT_SIZE=$(wc -c < "$RESOLVED_CONTEXT_FILE")
     if [[ $CONTEXT_SIZE -gt $CONTEXT_MAX ]]; then
       log_verbose "Context file exceeds max ($CONTEXT_SIZE > $CONTEXT_MAX), truncating..."
@@ -591,7 +1164,7 @@ if [[ -f "${1-}" && "$1" == *.md ]]; then
   fi
 
   if [[ -z "$PERSONA_ID" ]]; then
-    echo "{\"error\":\"no persona found - specify via --persona flag or ensure agent file has Persona headers\"}"
+    emit_cli_error_response "no persona found - specify via --persona flag or ensure agent file has Persona headers" "invalid_input" "$SESSION_ID" 2
     exit 2
   fi
 
@@ -601,7 +1174,7 @@ if [[ -f "${1-}" && "$1" == *.md ]]; then
   AGENT_PROMPT="$(extract_persona_block "$AGENT_FILE_ABS" "$PERSONA_ID")"
 
   if [[ -z "$AGENT_PROMPT" ]]; then
-    echo "{\"error\":\"persona '$PERSONA_ID' not found in agent file\"}"
+    emit_cli_error_response "persona '$PERSONA_ID' not found in agent file" "invalid_input" "$SESSION_ID" 2
     exit 2
   fi
 
@@ -732,27 +1305,83 @@ $TOOL_RULES
 - Respond immediately with your assessment
 - Return ONLY valid JSON matching the schema - no markdown, no explanations, no questions"
     fi
-    if [[ "$NO_CONTEXT" == "true" || -n "$SESSION_ID" ]]; then
-      FULL_PROMPT="$BASE_PROMPT"
-    else
-      FULL_PROMPT="${BASE_PROMPT}${CRITICAL_SUFFIX}"
-    fi
+    FULL_PROMPT="${BASE_PROMPT}${CRITICAL_SUFFIX}"
   else
     FULL_PROMPT="$AGENT_PROMPT"
   fi
 
+  # P2.1: Check prompt size and log warnings
+  if type check_prompt_size &>/dev/null; then
+    check_prompt_size "$FULL_PROMPT" "codex"
+    PROMPT_OVER_LIMIT=$?
+
+    # Save debug prompt if enabled
+    if type save_debug_prompt &>/dev/null; then
+      save_debug_prompt "$FULL_PROMPT" "$PERSONA_ID" "codex"
+    fi
+
+    # Log stats in verbose mode
+    if [[ "$VERBOSE" == "true" ]] && type get_prompt_stats &>/dev/null; then
+      PROMPT_STATS=$(get_prompt_stats "$FULL_PROMPT" "codex")
+      log_verbose "Prompt stats: $PROMPT_STATS"
+    fi
+  fi
+
   if [[ "$DRY_RUN" == "true" ]]; then
     log_verbose "DRY-RUN MODE: Skipping actual CLI call"
-    
-    MOCK_RESPONSE="{
-  \"dry_run\": true,
-  \"wrapper\": \"codex.sh\",
-  \"persona\": \"$PERSONA_ID\",
-  \"agent_file\": \"$AGENT_FILE_ABS\",
-  \"validation\": \"passed\",
-  \"message\": \"Dry-run validation successful - no actual CLI call made\"
-}"
-    echo "$MOCK_RESPONSE"
+
+    # P6.3: Enhanced dry-run output with comprehensive information
+    PROMPT_SIZE=${#FULL_PROMPT}
+    ESTIMATED_TOKENS=$((PROMPT_SIZE / 4))
+
+    # Determine context info
+    CONTEXT_INFO="none"
+    if [[ -n "$RESOLVED_CONTEXT_FILE" ]]; then
+      CONTEXT_INFO="$RESOLVED_CONTEXT_FILE"
+    fi
+
+    # Determine session mode
+    SESSION_MODE="new"
+    if [[ -n "$SESSION_ID" ]]; then
+      SESSION_MODE="resume:$SESSION_ID"
+    fi
+
+    # Build comprehensive dry-run response
+    jq -n \
+      --arg wrapper "codex.sh" \
+      --arg provider "codex" \
+      --arg persona "$PERSONA_ID" \
+      --arg agent_file "$AGENT_FILE_ABS" \
+      --argjson prompt_size "$PROMPT_SIZE" \
+      --argjson estimated_tokens "$ESTIMATED_TOKENS" \
+      --argjson timeout "${CLI_TIMEOUT:-0}" \
+      --arg context_file "$CONTEXT_INFO" \
+      --arg session_mode "$SESSION_MODE" \
+      --arg yolo_mode "$YOLO_MODE" \
+      --arg allow_tools "$ALLOW_TOOLS" \
+      --argjson max_prompt_chars "${PROMPT_MAX_CHARS:-30000}" \
+      '{
+        dry_run: true,
+        validation: "passed",
+        wrapper: $wrapper,
+        provider: $provider,
+        persona: $persona,
+        agent_file: $agent_file,
+        prompt: {
+          size_chars: $prompt_size,
+          estimated_tokens: $estimated_tokens,
+          max_chars: $max_prompt_chars,
+          over_limit: ($prompt_size > $max_prompt_chars)
+        },
+        config: {
+          timeout_seconds: (if $timeout == 0 then "unlimited" else $timeout end),
+          context_file: (if $context_file == "none" then null else $context_file end),
+          session_mode: $session_mode,
+          yolo_mode: ($yolo_mode == "true"),
+          allow_tools: ($allow_tools == "true")
+        },
+        message: "Dry-run validation successful - no actual CLI call made"
+      }'
     log_verbose "Dry-run completed successfully"
     exit 0
   fi
@@ -796,7 +1425,7 @@ $TOOL_RULES
   fi
 
   # Codex uses -c config override for temperature (not --temperature flag)
-  # Syntax: codex exec -c temperature=0.4 ...
+  # Syntax: "$CODEX_CMD" exec -c temperature=0.4 ...
   TEMP_ARG=""
   if [[ -n "$TEMPERATURE" ]]; then
     TEMP_ARG="-c temperature=$TEMPERATURE"
@@ -816,7 +1445,7 @@ $TOOL_RULES
 
   # Session handling for Codex
   # Sessions stored in ~/.codex/sessions/<session_id>/
-  # Resume with: codex exec resume "$SESSION_ID" or codex resume "$SESSION_ID"
+  # Resume with: "$CODEX_CMD" exec resume "$SESSION_ID" or codex resume "$SESSION_ID"
   RESUME_ARG=""
   CODEX_SESSION_ID=""
 
@@ -830,11 +1459,19 @@ $TOOL_RULES
       log_verbose "Session $SESSION_ID not found in ~/.codex/sessions/, starting fresh"
     fi
   elif [[ -n "$MANAGE_SESSION" ]]; then
-    # New session will be created; we'll capture the ID after execution
-    log_verbose "Creating new session (will capture ID after execution)"
+    # New session requested by caller; retain explicit request ID for error/cancel attribution.
+    CODEX_SESSION_ID="$MANAGE_SESSION"
+    log_verbose "Creating new session requested by caller: $MANAGE_SESSION"
   fi
 
-  log_verbose "Invoking codex CLI (WorkDir: ${WORK_DIR:-none}, Bypass: ${BYPASS_ARG:-none}, Temp: ${TEMPERATURE:-default}, Resume: ${RESUME_ARG:-none})"
+  # Build model argument if specified
+  MODEL_ARG=""
+  if [[ -n "$MODEL" ]]; then
+    MODEL_ARG="-m $MODEL"
+    log_verbose "Using model: $MODEL"
+  fi
+
+  log_verbose "Invoking codex CLI (WorkDir: ${WORK_DIR:-none}, Bypass: ${BYPASS_ARG:-none}, Temp: ${TEMPERATURE:-default}, Resume: ${RESUME_ARG:-none}, Model: ${MODEL_ARG:-default})"
 
   # Note: Removed --json flag because it causes streaming JSONL output which conflicts with -o flag
   # The -o flag already writes only the last message, and --output-schema enforces JSON structure
@@ -846,47 +1483,101 @@ $TOOL_RULES
   export SKIP_WEBKIT=1
   export SKIP_FIREFOX=1
 
+  # O-6: Set up agent stream logging for per-ticket LLM output capture
+  AGENT_LOG=""
+  if [[ -n "${A8_TICKET_ID:-}" && -n "$WORK_DIR" ]]; then
+    AGENT_LOG_DIR="${WORK_DIR}/.autonom8/agent_logs"
+    mkdir -p "$AGENT_LOG_DIR" 2>/dev/null || true
+    AGENT_LOG="${AGENT_LOG_DIR}/${A8_TICKET_ID}_${A8_WORKFLOW}_$(date +%s).log"
+    echo "=== Agent Stream Log ===" > "$AGENT_LOG"
+    echo "Ticket: $A8_TICKET_ID | Workflow: $A8_WORKFLOW | Provider: codex" >> "$AGENT_LOG"
+    echo "Started: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$AGENT_LOG"
+    echo "===" >> "$AGENT_LOG"
+    log_verbose "O-6: Agent stream logging to $AGENT_LOG"
+  fi
+
+  # Helper: stderr redirect with optional tee for O-6 logging
+  STDERR_REDIR="$TMPFILE_ERR"
+
   # Temporarily disable set -e to capture exit code properly
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
     log_verbose "Running codex with timeout: ${CLI_TIMEOUT}s"
     if [[ -n "$WORK_DIR" ]]; then
       if [[ -n "$RESUME_ARG" ]]; then
-        # Resume mode: --sandbox/-o not supported, capture stdout directly with '-' for stdin prompt
-        (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" codex exec $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR")
+        if [[ -n "$AGENT_LOG" ]]; then
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR"))
+        else
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR")
+        fi
       else
-        (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" codex exec $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null)
+        if [[ -n "$AGENT_LOG" ]]; then
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > /dev/null)
+        else
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null)
+        fi
       fi
       CODEX_EXIT=$?
     else
       if [[ -n "$RESUME_ARG" ]]; then
-        # Resume mode: --sandbox/-o not supported, capture stdout directly with '-' for stdin prompt
-        echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" codex exec $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR"
+        if [[ -n "$AGENT_LOG" ]]; then
+          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR")
+        else
+          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR"
+        fi
       else
-        echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" codex exec $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null
+        if [[ -n "$AGENT_LOG" ]]; then
+          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > /dev/null
+        else
+          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null
+        fi
       fi
       CODEX_EXIT=$?
     fi
   else
     if [[ -n "$WORK_DIR" ]]; then
       if [[ -n "$RESUME_ARG" ]]; then
-        # Resume mode: --sandbox/-o not supported, capture stdout directly with '-' for stdin prompt
-        (cd "$WORK_DIR" && echo "$FULL_PROMPT" | codex exec $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR")
+        if [[ -n "$AGENT_LOG" ]]; then
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR"))
+        else
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR")
+        fi
       else
-        (cd "$WORK_DIR" && echo "$FULL_PROMPT" | codex exec $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null)
+        if [[ -n "$AGENT_LOG" ]]; then
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > /dev/null)
+        else
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null)
+        fi
       fi
       CODEX_EXIT=$?
     else
       if [[ -n "$RESUME_ARG" ]]; then
-        # Resume mode: --sandbox/-o not supported, capture stdout directly with '-' for stdin prompt
-        echo "$FULL_PROMPT" | codex exec $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR"
+        if [[ -n "$AGENT_LOG" ]]; then
+          echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR")
+        else
+          echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR"
+        fi
       else
-        echo "$FULL_PROMPT" | codex exec $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null
+        if [[ -n "$AGENT_LOG" ]]; then
+          echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > /dev/null
+        else
+          echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null
+        fi
       fi
       CODEX_EXIT=$?
     fi
   fi
   set -e
+
+  # O-9: Append stdout response to agent log (stderr tee captures tool calls/thinking,
+  # but the final JSON response goes to stdout via -o flag and may be missed)
+  if [[ -n "$AGENT_LOG" && -f "$TMPFILE_OUTPUT" && -s "$TMPFILE_OUTPUT" ]]; then
+    echo "" >> "$AGENT_LOG"
+    cat "$TMPFILE_OUTPUT" >> "$AGENT_LOG" 2>/dev/null || true
+    echo "" >> "$AGENT_LOG"
+    echo "tokens used" >> "$AGENT_LOG"
+    wc -c < "$TMPFILE_OUTPUT" | xargs -I{} echo "{}" >> "$AGENT_LOG"
+  fi
 
   # Capture session ID if new session was created (always capture for fresh calls)
   if [[ -z "$CODEX_SESSION_ID" && $CODEX_EXIT -eq 0 ]]; then
@@ -897,31 +1588,52 @@ $TOOL_RULES
   fi
 
   if [[ $CODEX_EXIT -ne 0 ]]; then
-    # Codex failed - return error with stderr
-    ERROR_MSG=$(cat "$TMPFILE_ERR" 2>/dev/null || echo "Unknown error")
+    # P6.1: Standardized error handling
+    # P58: Filter out Codex session banner from stderr to get actual error
+    ERROR_MSG=$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' | \
+      grep -v "^Reading prompt" | \
+      grep -v "^OpenAI Codex" | \
+      grep -v "^--------" | \
+      grep -v "^workdir:" | \
+      grep -v "^model:" | \
+      grep -v "^provider:" | \
+      grep -v "^$" || echo "Unknown error")
+    # If filtering removed everything, provide a generic message with exit code
+    if [[ -z "$ERROR_MSG" || "$ERROR_MSG" == "Unknown error" ]]; then
+      ERROR_MSG="Codex exited with status $CODEX_EXIT (no error details captured)"
+    fi
     log_verbose "Codex execution failed: $ERROR_MSG"
+
+    # Classify the error type
+    ERROR_TYPE="unknown"
+    if type classify_error &>/dev/null; then
+      ERROR_TYPE=$(classify_error "$ERROR_MSG")
+    fi
+
+    # Timeout classification (emit structured envelope below).
+    if [[ $CODEX_EXIT -eq 124 ]]; then
+      ERROR_TYPE="timeout"
+    fi
 
     # Check if this is an invalid session error - fail fast
     if echo "$ERROR_MSG" | grep -qi "session.*not found\|invalid session\|session.*expired\|no such session"; then
       log_verbose "Invalid session detected - clearing stale session"
       rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
       # Use heredoc to avoid "argument list too long" for large error messages
-      jq -n --arg sid "$SESSION_ID" --arg err "$(echo "$ERROR_MSG" | head -c 4000)" '{error: $err, stale_session: $sid, action: "clear_session"}'
+      emit_cli_error_response "$(echo "$ERROR_MSG" | head -c 4000)" "invalid_session" "${CODEX_SESSION_ID:-$SESSION_ID}" "$CODEX_EXIT"
       exit 1
     fi
 
-    # Check if this is a usage limit error
-    if echo "$ERROR_MSG" | grep -qi "usage limit\|out of.*messages\|out of.*credits\|purchase more credits"; then
-      # Extract retry time if available (e.g., "try again at 6:13 PM")
+    # Create system message for recoverable errors (quota, rate_limit)
+    if type create_system_message &>/dev/null; then
+      create_system_message "codex" "$ERROR_TYPE" "$ERROR_MSG" "$CORE_DIR"
+    elif [[ "$ERROR_TYPE" == "quota" ]]; then
+      # Fallback: create system message manually for quota errors
       RETRY_TIME=$(echo "$ERROR_MSG" | grep -oE "try again at [0-9]{1,2}:[0-9]{2} [AP]M" || echo "")
-
-      # Create system message for usage limit
       SYSTEM_MSG_DIR="$CORE_DIR/context/system-messages/inbox"
       mkdir -p "$SYSTEM_MSG_DIR"
-
       TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
       MSG_FILE="$SYSTEM_MSG_DIR/$(date +%s)-codex-usage-limit.json"
-
       jq -n \
         --arg ts "$TIMESTAMP" \
         --arg cli "codex" \
@@ -939,15 +1651,15 @@ $TOOL_RULES
     fi
 
     rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
-    # Truncate error to avoid "argument list too long"
-    jq -n --arg err "$(echo "$ERROR_MSG" | head -c 4000)" '{error: $err}'
+
+    # Return structured error response with wrapper envelope.
+    emit_cli_error_response "$(echo "$ERROR_MSG" | head -c 4000)" "$ERROR_TYPE" "${CODEX_SESSION_ID:-$SESSION_ID}" "$CODEX_EXIT"
     exit 1
   fi
 
   # Read the output file which should contain the last message
-  RESPONSE_TEXT="$(cat "$TMPFILE_OUTPUT" 2>/dev/null)"
-
-  rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
+  RESPONSE_TEXT="$(cat "$TMPFILE_OUTPUT" 2>/dev/null | tr -d '\0')"
+  STDERR_TEXT="$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' || true)"
 
   if [[ -n "$RESPONSE_TEXT" && "$RESPONSE_TEXT" != "null" ]]; then
     # Strip markdown code fences if present (```json ... ```)
@@ -959,14 +1671,24 @@ $TOOL_RULES
 
     # Wrap in CLIResponse format for Go worker
     # Include session_id if session was used or created
-    if [[ -n "$CODEX_SESSION_ID" ]]; then
-      jq -n --arg resp "$RESPONSE_TEXT" --arg sid "$CODEX_SESSION_ID" '{response: $resp, session_id: $sid}'
-    else
-      jq -n --arg resp "$RESPONSE_TEXT" '{response: $resp}'
-    fi
+    emit_cli_response "$RESPONSE_TEXT" "$CODEX_SESSION_ID" "$RESPONSE_TEXT" "" "" "$STDERR_TEXT"
   else
-    jq -n '{error:"No response from Codex CLI"}'
+    # P31.5: Codex exits 0 but output is empty when API returns errors (HTTP 400/401/403).
+    # Scan stderr for the actual error detail so Go code gets a meaningful message.
+    STDERR_CONTENT=""
+    if [[ -f "$TMPFILE_ERR" ]]; then
+      STDERR_CONTENT=$(cat "$TMPFILE_ERR" 2>/dev/null | \
+        grep -iE "ERROR:|error=|http [45][0-9][0-9]|not supported|unauthorized|forbidden|rate.limit|quota" | \
+        head -3 | tr '\n' ' ' || true)
+    fi
+    if [[ -n "$STDERR_CONTENT" ]]; then
+      emit_cli_error_response "Codex API error: $(echo "$STDERR_CONTENT" | head -c 2000)" "provider_error" "${CODEX_SESSION_ID:-$SESSION_ID}" 1
+    else
+      emit_cli_error_response "No response from Codex CLI" "provider_error" "${CODEX_SESSION_ID:-$SESSION_ID}" 0
+    fi
   fi
+  # Cleanup temp files (moved after response check so stderr is available for error capture)
+  rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
 else
   # Direct invocation with text prompt
   BYPASS_ARG=""
@@ -977,5 +1699,5 @@ else
   fi
 
   log_verbose "Running in direct invocation mode"
-  codex exec $SANDBOX_ARG $BYPASS_ARG "$@"
+  "$CODEX_CMD" exec $SANDBOX_ARG $BYPASS_ARG "$@"
 fi
