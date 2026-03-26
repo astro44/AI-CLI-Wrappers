@@ -5,6 +5,14 @@
 
 set -euo pipefail
 
+WRAPPER_REQ_ID="${AUTONOM8_REQUEST_ID:-${A8_REQUEST_ID:-}}"
+if [[ -n "${WRAPPER_REQ_ID}" ]]; then
+  exec 3>&2
+  exec 2> >(while IFS= read -r __a8_line; do
+    printf '[req=%s] %s\n' "${WRAPPER_REQ_ID}" "${__a8_line}" >&3
+  done)
+fi
+
 # Track child process PID for cleanup on script termination
 CURSOR_PID=""
 CLI_TIMEOUT=""  # Timeout in seconds, passed from Go worker
@@ -133,7 +141,7 @@ emit_cli_response() {
   local extra_field_value="${5:-}"
   local stream_output="${6:-}"
 
-  local tokens_json='{"input_tokens":0,"output_tokens":0,"total_tokens":0,"cost_usd":0}'
+  local tokens_json='{"input_tokens":0,"output_tokens":0,"estimated_output_tokens":0,"total_tokens":0,"cost_usd":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}'
   local token_usage_available=false
   local reasoning_text=""
   local reasoning_available=false
@@ -175,7 +183,9 @@ emit_cli_response() {
     session_tokens="$(get_cursor_session_token_usage "$session_id" 2>/dev/null || true)"
     if [[ -n "$session_tokens" ]]; then
       tokens_json="$session_tokens"
-      token_usage_available=true
+      if [[ "$(printf "%s" "$tokens_json" | jq -r '((.input_tokens + .output_tokens + .total_tokens) > 0)' 2>/dev/null || echo false)" == "true" ]]; then
+        token_usage_available=true
+      fi
     fi
   fi
 
@@ -277,6 +287,17 @@ emit_cli_response() {
     reasoning_absent_reason="model_not_emitted"
   fi
 
+  local response_chars=${#response_text}
+  local estimated_output_tokens=$((response_chars / 4))
+  if [[ $response_chars -gt 0 && $estimated_output_tokens -le 0 ]]; then
+    estimated_output_tokens=1
+  fi
+  tokens_json="$(printf "%s" "$tokens_json" | jq -c --argjson estimated "$estimated_output_tokens" '
+    .estimated_output_tokens = $estimated
+    | if .cache_read_input_tokens == null then .cache_read_input_tokens = 0 else . end
+    | if .cache_creation_input_tokens == null then .cache_creation_input_tokens = 0 else . end
+  ' 2>/dev/null || echo "$tokens_json")"
+
   RESPONSE_EMITTED=true
 
   if [[ -n "$session_id" && -n "$extra_field_name" ]]; then
@@ -333,7 +354,7 @@ emit_cli_error_response() {
   local error_type="${2:-unknown}"
   local session_id="${3:-}"
   local exit_code="${4:-1}"
-  local tokens_json='{"input_tokens":0,"output_tokens":0,"total_tokens":0,"cost_usd":0}'
+  local tokens_json='{"input_tokens":0,"output_tokens":0,"estimated_output_tokens":0,"total_tokens":0,"cost_usd":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}'
   local token_usage_available=false
   local reasoning_text=""
   local reasoning_available=false
@@ -341,7 +362,7 @@ emit_cli_error_response() {
   local reasoning_absent_reason="error_path"
   local recoverable=false
   case "$error_type" in
-    quota|rate_limit|timeout|invalid_session)
+    quota|rate_limit|timeout|invalid_session|invalid_model)
       recoverable=true
       ;;
   esac
@@ -351,7 +372,9 @@ emit_cli_error_response() {
     session_tokens="$(get_cursor_session_token_usage "$session_id" 2>/dev/null || true)"
     if [[ -n "$session_tokens" ]]; then
       tokens_json="$session_tokens"
-      token_usage_available=true
+      if [[ "$(printf "%s" "$tokens_json" | jq -r '((.input_tokens + .output_tokens + .total_tokens) > 0)' 2>/dev/null || echo false)" == "true" ]]; then
+        token_usage_available=true
+      fi
     fi
 
     local session_reasoning=""
@@ -425,11 +448,112 @@ log_verbose() {
     fi
 }
 
+log_warn() {
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] WARN: $*" >&2
+}
+
 get_cursor_mcp_config() {
   if [[ -f "$CORE_DIR/.cursor/mcp.json" ]]; then
     echo "$CORE_DIR/.cursor/mcp.json"
   elif [[ -f "$CORE_DIR/.mcp.json" ]]; then
     echo "$CORE_DIR/.mcp.json"
+  fi
+}
+
+normalize_cursor_mcp_path() {
+  local config_path="$1"
+  local raw_path="$2"
+
+  if [[ -z "$raw_path" ]]; then
+    return 1
+  fi
+
+  if [[ "$raw_path" == /* ]]; then
+    printf "%s" "$raw_path"
+    return 0
+  fi
+
+  if [[ "$raw_path" == -* || "$raw_path" =~ ^https?:// || "$raw_path" =~ ^wss?:// ]]; then
+    printf "%s" "$raw_path"
+    return 0
+  fi
+
+  if [[ "$raw_path" == *"mcp-servers/"* ]]; then
+    local suffix="${raw_path#*mcp-servers/}"
+    printf "%s" "$CORE_DIR/mcp-servers/$suffix"
+    return 0
+  fi
+
+  local config_dir=""
+  config_dir="$(cd "$(dirname "$config_path")" && pwd -P)"
+  printf "%s" "$config_dir/$raw_path"
+}
+
+normalize_cursor_mcp_config() {
+  local config_path="$1"
+  local tmpfile=""
+  local nextfile=""
+  local server_name=""
+
+  [[ -f "$config_path" ]] || return 1
+
+  tmpfile="$(mktemp)"
+  cp "$config_path" "$tmpfile"
+
+  while IFS= read -r server_name; do
+    [[ -z "$server_name" ]] && continue
+
+    local arg_count=0
+    arg_count="$(jq -r --arg name "$server_name" '(.mcpServers[$name].args // []) | length' "$tmpfile" 2>/dev/null || echo 0)"
+    if [[ ! "$arg_count" =~ ^[0-9]+$ ]]; then
+      continue
+    fi
+
+    local i=0
+    while [[ $i -lt $arg_count ]]; do
+      local current_arg=""
+      current_arg="$(jq -r --arg name "$server_name" --argjson idx "$i" '.mcpServers[$name].args[$idx] // empty' "$tmpfile" 2>/dev/null || true)"
+      if [[ -n "$current_arg" ]]; then
+        local normalized_arg=""
+        normalized_arg="$(normalize_cursor_mcp_path "$config_path" "$current_arg" 2>/dev/null || true)"
+        if [[ -n "$normalized_arg" && "$normalized_arg" != "$current_arg" ]]; then
+          nextfile="$(mktemp)"
+          if jq --arg name "$server_name" --argjson idx "$i" --arg value "$normalized_arg" \
+            '.mcpServers[$name].args[$idx] = $value' "$tmpfile" > "$nextfile" 2>/dev/null; then
+            mv "$nextfile" "$tmpfile"
+          else
+            rm -f "$nextfile"
+          fi
+        fi
+      fi
+      i=$((i + 1))
+    done
+  done < <(jq -r '.mcpServers | keys[]?' "$tmpfile" 2>/dev/null || true)
+
+  printf "%s" "$tmpfile"
+}
+
+validate_cursor_mcp_config() {
+  local config_path="$1"
+  local had_invalid=0
+  local name=""
+  local command=""
+  local first_arg=""
+
+  [[ -f "$config_path" ]] || return 0
+
+  while IFS=$'\t' read -r name command first_arg; do
+    [[ -z "$name" ]] && continue
+    if [[ "$command" == "node" && -n "$first_arg" && "$first_arg" == /* && ! -f "$first_arg" ]]; then
+      log_warn "Cursor MCP server '$name' unavailable: script not found at $first_arg"
+      had_invalid=1
+    fi
+  done < <(jq -r '.mcpServers | to_entries[]? | [.key, (.value.command // ""), (.value.args[0] // "")] | @tsv' "$config_path" 2>/dev/null || true)
+
+  if [[ "$had_invalid" -eq 1 ]]; then
+    log_warn "Cursor will continue without one or more configured MCP servers. Browser verification tasks may fail or degrade."
   fi
 }
 
@@ -443,21 +567,33 @@ ensure_cursor_mcp_config() {
 
   local cursor_dir="${workspace_dir}/.cursor"
   local cursor_config="${cursor_dir}/mcp.json"
+  local normalized_config=""
 
   mkdir -p "$cursor_dir"
+
+  normalized_config="$(normalize_cursor_mcp_config "$config_path" 2>/dev/null || true)"
+  if [[ -z "$normalized_config" ]]; then
+    normalized_config="$config_path"
+  fi
 
   if [[ -f "$cursor_config" ]]; then
     local tmpfile
     tmpfile="$(mktemp)"
     if jq -s '.[0] as $existing | .[1] as $incoming | ($existing + $incoming) | .mcpServers = (($existing.mcpServers // {}) + ($incoming.mcpServers // {}))' \
-      "$cursor_config" "$config_path" > "$tmpfile" 2>/dev/null; then
+      "$cursor_config" "$normalized_config" > "$tmpfile" 2>/dev/null; then
       mv "$tmpfile" "$cursor_config"
     else
       rm -f "$tmpfile"
     fi
   else
-    cp "$config_path" "$cursor_config"
+    cp "$normalized_config" "$cursor_config"
   fi
+
+  if [[ "$normalized_config" != "$config_path" ]]; then
+    rm -f "$normalized_config"
+  fi
+
+  validate_cursor_mcp_config "$cursor_config" || true
 }
 
 # Determine core directory based on script location
@@ -571,6 +707,83 @@ save_debug_prompt() {
 if [[ -f "$SCRIPT_DIR/lib/error_utils.sh" ]]; then
     source "$SCRIPT_DIR/lib/error_utils.sh"
 fi
+if [[ -f "$SCRIPT_DIR/lib/model_utils.sh" ]]; then
+    source "$SCRIPT_DIR/lib/model_utils.sh"
+fi
+
+MODEL_REQUESTED_RAW=""
+MODEL_RESOLUTION_NOTE=""
+MODEL_PREPARED_VALUE=""
+
+prepare_requested_model_value() {
+  local provider="${1:-}"
+  local requested="${2:-}"
+  local resolved=""
+
+  if [[ -z "${requested:-}" ]]; then
+    MODEL_PREPARED_VALUE="$requested"
+    return 0
+  fi
+
+  if ! declare -F trim_model_string >/dev/null; then
+    MODEL_PREPARED_VALUE="$requested"
+    return 0
+  fi
+
+  MODEL_REQUESTED_RAW="$(trim_model_string "$requested")"
+  if [[ -z "$MODEL_REQUESTED_RAW" ]]; then
+    MODEL_PREPARED_VALUE=""
+    return 0
+  fi
+
+  resolved="$MODEL_REQUESTED_RAW"
+  if [[ "$provider" == "cursor" ]]; then
+    if declare -F resolve_model_from_cursor_catalog >/dev/null; then
+      resolved="$(resolve_model_from_cursor_catalog "$MODEL_REQUESTED_RAW" 2>/dev/null || true)"
+    fi
+    if [[ -z "$resolved" ]]; then
+      resolved="$(default_fallback_model_for_provider "$provider" "" 2>/dev/null || true)"
+      if [[ -n "$resolved" ]] && declare -F build_model_resolution_summary >/dev/null; then
+        MODEL_RESOLUTION_NOTE="$(build_model_resolution_summary "$provider" "$MODEL_REQUESTED_RAW" "$resolved" "fallback")"
+      fi
+    fi
+  elif declare -F resolve_requested_model_for_provider >/dev/null; then
+    resolved="$(resolve_requested_model_for_provider "$provider" "$MODEL_REQUESTED_RAW" 2>/dev/null || printf "%s" "$MODEL_REQUESTED_RAW")"
+  fi
+
+  if [[ -z "$MODEL_RESOLUTION_NOTE" && "$resolved" != "$MODEL_REQUESTED_RAW" ]] && declare -F build_model_resolution_summary >/dev/null; then
+    MODEL_RESOLUTION_NOTE="$(build_model_resolution_summary "$provider" "$MODEL_REQUESTED_RAW" "$resolved" "normalized")"
+  fi
+
+  MODEL_PREPARED_VALUE="$resolved"
+}
+
+retry_with_provider_default_model() {
+  local provider="${1:-}"
+  local current_model="${2:-}"
+  local fallback=""
+
+  [[ -n "$MODEL_REQUESTED_RAW" ]] || return 1
+  declare -F default_fallback_model_for_provider >/dev/null || return 1
+
+  fallback="$(default_fallback_model_for_provider "$provider" "$current_model" 2>/dev/null || true)"
+  [[ -n "$fallback" ]] || return 1
+
+  if declare -F is_provider_default_model >/dev/null && is_provider_default_model "$fallback"; then
+    MODEL_RESOLUTION_NOTE="$(build_model_resolution_summary "$provider" "$MODEL_REQUESTED_RAW" "provider-default" "fallback")"
+    printf "%s" ""
+    return 0
+  fi
+
+  if [[ "$fallback" == "$current_model" ]]; then
+    return 1
+  fi
+
+  if declare -F build_model_resolution_summary >/dev/null; then
+    MODEL_RESOLUTION_NOTE="$(build_model_resolution_summary "$provider" "$MODEL_REQUESTED_RAW" "$fallback" "fallback")"
+  fi
+  printf "%s" "$fallback"
+}
 
 # Agent invocation mode: wrapper expects agent .md file path + optional input data
 # We must extract a single persona block, not pass the whole file.
@@ -644,6 +857,10 @@ get_cursor_session_token_usage() {
       if type == "number" then floor
       elif type == "string" then (tonumber? // 0)
       else 0 end;
+    def as_num:
+      if type == "number" then .
+      elif type == "string" then (tonumber? // 0)
+      else 0 end;
     [
       .[] | (.usage // .message.usage // empty)
     ] as $u
@@ -653,7 +870,7 @@ get_cursor_session_token_usage() {
         input_tokens: (($x.input_tokens // $x.input // $x.prompt_tokens // 0) | as_int),
         output_tokens: (($x.output_tokens // $x.output // $x.completion_tokens // 0) | as_int),
         total_tokens: (($x.total_tokens // $x.total // (($x.input_tokens // $x.input // 0) + ($x.output_tokens // $x.output // 0))) | as_int),
-        cost_usd: 0
+        cost_usd: (($x.cost_usd // $x.cost // 0) | as_num)
       }
   ' "$session_file" | tail -1
 }
@@ -826,6 +1043,14 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -n "$MODEL" ]]; then
+  prepare_requested_model_value "cursor" "$MODEL"
+  MODEL="$MODEL_PREPARED_VALUE"
+  if [[ -n "$MODEL_RESOLUTION_NOTE" ]]; then
+    log_info "Model resolution: $MODEL_RESOLUTION_NOTE"
+  fi
+fi
 
 # ===================
 # Quota Status Mode
@@ -1084,6 +1309,8 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
     ERROR_TYPE="provider_error"
     if [[ "$CURSOR_EXIT" -eq 124 ]]; then
       ERROR_TYPE="timeout"
+    elif echo "$ERROR_MSG" | grep -qi "Cannot use this model\|Unknown model\|Invalid model"; then
+      ERROR_TYPE="invalid_model"
     elif declare -F classify_error >/dev/null; then
       ERROR_TYPE="$(classify_error "$ERROR_MSG")"
     fi
@@ -1415,6 +1642,7 @@ $TOOL_RULES
     "--print"
     "--output-format" "json"
     "--workspace" "$WORKSPACE_DIR"
+    "--trust"
   )
 
   if [[ "$YOLO_MODE" == "true" ]]; then
@@ -1432,6 +1660,9 @@ $TOOL_RULES
     CURSOR_SESSION_ID="$SESSION_ID"
     CURSOR_ARGS+=("--resume" "$SESSION_ID")
     log_verbose "Resuming session: $SESSION_ID"
+  elif [[ -n "$MANAGE_SESSION" ]]; then
+    CURSOR_SESSION_ID="$MANAGE_SESSION"
+    log_verbose "Tracking caller-managed session: $MANAGE_SESSION"
   fi
 
   # Add model flag if specified
@@ -1574,8 +1805,11 @@ $TOOL_RULES
         RESPONSE_TEXT="$(echo "$RESPONSE_TEXT" | sed -e 's/^```[[:space:]]*//' -e 's/```[[:space:]]*$//')"
       fi
 
-      # Wrap in CLIResponse format for Go worker (include session_id)
-      emit_cli_response "$RESPONSE_TEXT" "$CURSOR_SESSION_ID" "$RAW_OUTPUT" "" "" "$STDERR_TEXT"
+      if [[ -n "$MODEL_RESOLUTION_NOTE" ]]; then
+        emit_cli_response "$RESPONSE_TEXT" "$CURSOR_SESSION_ID" "$RAW_OUTPUT" "model_resolution" "$MODEL_RESOLUTION_NOTE" "$STDERR_TEXT"
+      else
+        emit_cli_response "$RESPONSE_TEXT" "$CURSOR_SESSION_ID" "$RAW_OUTPUT" "" "" "$STDERR_TEXT"
+      fi
     else
       # No result field - try raw response as fallback
       emit_cli_error_response "No result in response from cursor-agent" "provider_error" "$CURSOR_SESSION_ID" 1
@@ -1603,6 +1837,7 @@ else
     "--print"
     "--output-format" "text"
     "--workspace" "$WORKSPACE_DIR"
+    "--trust"
   )
 
   if [[ "$YOLO_MODE" == "true" ]]; then

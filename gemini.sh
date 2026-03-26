@@ -5,6 +5,14 @@
 
 set -euo pipefail
 
+WRAPPER_REQ_ID="${AUTONOM8_REQUEST_ID:-${A8_REQUEST_ID:-}}"
+if [[ -n "${WRAPPER_REQ_ID}" ]]; then
+  exec 3>&2
+  exec 2> >(while IFS= read -r __a8_line; do
+    printf '[req=%s] %s\n' "${WRAPPER_REQ_ID}" "${__a8_line}" >&3
+  done)
+fi
+
 # Track child process PID for cleanup on script termination
 GEMINI_PID=""
 CLI_TIMEOUT=""  # Timeout in seconds, passed from Go worker
@@ -55,6 +63,11 @@ gemini() {
 run_with_timeout() {
   local timeout_secs="$1"
   shift
+
+  if [[ "${1:-}" == "gemini" && -n "${GEMINI_BIN:-}" ]]; then
+    shift
+    set -- "$GEMINI_BIN" "$@"
+  fi
 
   local timeout_cmd=""
   if command -v timeout &>/dev/null; then
@@ -127,7 +140,7 @@ emit_cli_response() {
   local extra_field_value="${5:-}"
   local stream_output="${6:-}"
 
-  local tokens_json='{"input_tokens":0,"output_tokens":0,"total_tokens":0,"cost_usd":0}'
+  local tokens_json='{"input_tokens":0,"output_tokens":0,"estimated_output_tokens":0,"total_tokens":0,"cost_usd":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}'
   local token_usage_available=false
   local reasoning_text=""
   local reasoning_available=false
@@ -169,7 +182,9 @@ emit_cli_response() {
     session_tokens="$(get_gemini_session_token_usage "$session_id" 2>/dev/null || true)"
     if [[ -n "$session_tokens" ]]; then
       tokens_json="$session_tokens"
-      token_usage_available=true
+      if [[ "$(printf "%s" "$tokens_json" | jq -r '((.input_tokens + .output_tokens + .total_tokens) > 0)' 2>/dev/null || echo false)" == "true" ]]; then
+        token_usage_available=true
+      fi
     fi
   fi
 
@@ -258,6 +273,17 @@ emit_cli_response() {
     reasoning_absent_reason="model_not_emitted"
   fi
 
+  local response_chars=${#response_text}
+  local estimated_output_tokens=$((response_chars / 4))
+  if [[ $response_chars -gt 0 && $estimated_output_tokens -le 0 ]]; then
+    estimated_output_tokens=1
+  fi
+  tokens_json="$(printf "%s" "$tokens_json" | jq -c --argjson estimated "$estimated_output_tokens" '
+    .estimated_output_tokens = $estimated
+    | if .cache_read_input_tokens == null then .cache_read_input_tokens = 0 else . end
+    | if .cache_creation_input_tokens == null then .cache_creation_input_tokens = 0 else . end
+  ' 2>/dev/null || echo "$tokens_json")"
+
   RESPONSE_EMITTED=true
 
   if [[ -n "$session_id" && -n "$extra_field_name" ]]; then
@@ -314,7 +340,9 @@ emit_cli_error_response() {
   local error_type="${2:-unknown}"
   local session_id="${3:-}"
   local exit_code="${4:-1}"
-  local tokens_json='{"input_tokens":0,"output_tokens":0,"total_tokens":0,"cost_usd":0}'
+  local extra_field_name="${5:-}"
+  local extra_field_value="${6:-}"
+  local tokens_json='{"input_tokens":0,"output_tokens":0,"estimated_output_tokens":0,"total_tokens":0,"cost_usd":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}'
   local token_usage_available=false
   local reasoning_text=""
   local reasoning_available=false
@@ -332,7 +360,9 @@ emit_cli_error_response() {
     session_tokens="$(get_gemini_session_token_usage "$session_id" 2>/dev/null || true)"
     if [[ -n "$session_tokens" ]]; then
       tokens_json="$session_tokens"
-      token_usage_available=true
+      if [[ "$(printf "%s" "$tokens_json" | jq -r '((.input_tokens + .output_tokens + .total_tokens) > 0)' 2>/dev/null || echo false)" == "true" ]]; then
+        token_usage_available=true
+      fi
     fi
 
     local session_reasoning=""
@@ -350,51 +380,105 @@ emit_cli_error_response() {
 
   RESPONSE_EMITTED=true
   if [[ -n "$session_id" ]]; then
-    jq -n \
-      --arg sid "$session_id" \
-      --arg err "$error_msg" \
-      --arg type "$error_type" \
-      --argjson code "$exit_code" \
-      --argjson recoverable "$recoverable" \
-      --arg reasoning "$reasoning_text" \
-      --argjson tokens "$tokens_json" \
-      --argjson available "$token_usage_available" \
-      --argjson reasoning_available "$reasoning_available" \
-      --arg reasoning_source "$reasoning_source" \
-      --arg reasoning_absent_reason "$reasoning_absent_reason" \
-      '{
-        response: "",
-        session_id: $sid,
-        reasoning: $reasoning,
-        tokens_used: $tokens,
-        metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason},
-        error: $err,
-        error_type: $type,
-        exit_code: $code,
-        recoverable: $recoverable
-      }'
+    if [[ -n "$extra_field_name" ]]; then
+      jq -n \
+        --arg sid "$session_id" \
+        --arg err "$error_msg" \
+        --arg type "$error_type" \
+        --argjson code "$exit_code" \
+        --argjson recoverable "$recoverable" \
+        --arg reasoning "$reasoning_text" \
+        --arg extra_name "$extra_field_name" \
+        --arg extra_val "$extra_field_value" \
+        --argjson tokens "$tokens_json" \
+        --argjson available "$token_usage_available" \
+        --argjson reasoning_available "$reasoning_available" \
+        --arg reasoning_source "$reasoning_source" \
+        --arg reasoning_absent_reason "$reasoning_absent_reason" \
+        '{
+          response: "",
+          session_id: $sid,
+          reasoning: $reasoning,
+          tokens_used: $tokens,
+          metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason},
+          error: $err,
+          error_type: $type,
+          exit_code: $code,
+          recoverable: $recoverable
+        } + {($extra_name): $extra_val}'
+    else
+      jq -n \
+        --arg sid "$session_id" \
+        --arg err "$error_msg" \
+        --arg type "$error_type" \
+        --argjson code "$exit_code" \
+        --argjson recoverable "$recoverable" \
+        --arg reasoning "$reasoning_text" \
+        --argjson tokens "$tokens_json" \
+        --argjson available "$token_usage_available" \
+        --argjson reasoning_available "$reasoning_available" \
+        --arg reasoning_source "$reasoning_source" \
+        --arg reasoning_absent_reason "$reasoning_absent_reason" \
+        '{
+          response: "",
+          session_id: $sid,
+          reasoning: $reasoning,
+          tokens_used: $tokens,
+          metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason},
+          error: $err,
+          error_type: $type,
+          exit_code: $code,
+          recoverable: $recoverable
+        }'
+    fi
   else
-    jq -n \
-      --arg err "$error_msg" \
-      --arg type "$error_type" \
-      --argjson code "$exit_code" \
-      --argjson recoverable "$recoverable" \
-      --arg reasoning "$reasoning_text" \
-      --argjson tokens "$tokens_json" \
-      --argjson available "$token_usage_available" \
-      --argjson reasoning_available "$reasoning_available" \
-      --arg reasoning_source "$reasoning_source" \
-      --arg reasoning_absent_reason "$reasoning_absent_reason" \
-      '{
-        response: "",
-        reasoning: $reasoning,
-        tokens_used: $tokens,
-        metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason},
-        error: $err,
-        error_type: $type,
-        exit_code: $code,
-        recoverable: $recoverable
-      }'
+    if [[ -n "$extra_field_name" ]]; then
+      jq -n \
+        --arg err "$error_msg" \
+        --arg type "$error_type" \
+        --argjson code "$exit_code" \
+        --argjson recoverable "$recoverable" \
+        --arg reasoning "$reasoning_text" \
+        --arg extra_name "$extra_field_name" \
+        --arg extra_val "$extra_field_value" \
+        --argjson tokens "$tokens_json" \
+        --argjson available "$token_usage_available" \
+        --argjson reasoning_available "$reasoning_available" \
+        --arg reasoning_source "$reasoning_source" \
+        --arg reasoning_absent_reason "$reasoning_absent_reason" \
+        '{
+          response: "",
+          reasoning: $reasoning,
+          tokens_used: $tokens,
+          metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason},
+          error: $err,
+          error_type: $type,
+          exit_code: $code,
+          recoverable: $recoverable
+        } + {($extra_name): $extra_val}'
+    else
+      jq -n \
+        --arg err "$error_msg" \
+        --arg type "$error_type" \
+        --argjson code "$exit_code" \
+        --argjson recoverable "$recoverable" \
+        --arg reasoning "$reasoning_text" \
+        --argjson tokens "$tokens_json" \
+        --argjson available "$token_usage_available" \
+        --argjson reasoning_available "$reasoning_available" \
+        --arg reasoning_source "$reasoning_source" \
+        --arg reasoning_absent_reason "$reasoning_absent_reason" \
+        '{
+          response: "",
+          reasoning: $reasoning,
+          tokens_used: $tokens,
+          metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason},
+          error: $err,
+          error_type: $type,
+          exit_code: $code,
+          recoverable: $recoverable
+        }'
+    fi
   fi
 }
 
@@ -460,8 +544,47 @@ filter_gemini_info_lines() {
     -e '^Connected\.$' \
     -e '^Session started' \
     -e '^Using model' \
-    -e '^Loading' \
-    -e '^OK$' || true
+    -e '^Loading' || true
+}
+
+strip_gemini_startup_stderr_lines() {
+  local input="$1"
+  echo "$input" | grep -v \
+    -e '^Loaded cached credentials' \
+    -e '^Registering notification handlers for server' \
+    -e "^Server '.*' has tools but did not declare 'listChanged' capability" \
+    -e "^Server '.*' supports tool updates" \
+    -e '^Scheduling MCP context refresh' \
+    -e '^Executing MCP context refresh' \
+    -e '^MCP context refresh complete' || true
+}
+
+is_gemini_startup_only_error() {
+  local input="$1"
+  local filtered=""
+  filtered="$(strip_gemini_startup_stderr_lines "$input" | tr -d '[:space:]')"
+  [[ -z "$filtered" ]]
+}
+
+build_gemini_no_response_error() {
+  local raw_response="${1:-}"
+  local stderr_text="${2:-}"
+  local response_after_filter="${3:-}"
+  local classified_type="provider_error"
+  local detail="Gemini returned no terminal response."
+
+  if [[ -n "$stderr_text" ]] && declare -F classify_error >/dev/null; then
+    classified_type="$(classify_error "$stderr_text")"
+    if [[ "$classified_type" != "unknown" && "$classified_type" != "provider_error" ]]; then
+      detail="Gemini returned no terminal response; stderr classified as ${classified_type}."
+    fi
+  fi
+
+  if [[ -z "$response_after_filter" && -n "$raw_response" ]]; then
+    detail="Gemini returned only wrapper-filtered informational stdout and no terminal response payload."
+  fi
+
+  printf "%s\t%s" "$classified_type" "$detail"
 }
 
 ensure_gemini_mcp_servers() {
@@ -574,6 +697,105 @@ save_debug_prompt() {
 if [[ -f "$SCRIPT_DIR/lib/error_utils.sh" ]]; then
     source "$SCRIPT_DIR/lib/error_utils.sh"
 fi
+if [[ -f "$SCRIPT_DIR/lib/model_utils.sh" ]]; then
+    source "$SCRIPT_DIR/lib/model_utils.sh"
+fi
+
+MODEL_REQUESTED_RAW=""
+MODEL_RESOLUTION_NOTE=""
+MODEL_PREPARED_VALUE=""
+GEMINI_CAPACITY_RETRIED=false
+
+prepare_requested_model_value() {
+  local provider="${1:-}"
+  local requested="${2:-}"
+  local resolved=""
+
+  if [[ -z "${requested:-}" ]]; then
+    MODEL_PREPARED_VALUE="$requested"
+    return 0
+  fi
+
+  if ! declare -F trim_model_string >/dev/null; then
+    MODEL_PREPARED_VALUE="$requested"
+    return 0
+  fi
+
+  MODEL_REQUESTED_RAW="$(trim_model_string "$requested")"
+  if [[ -z "$MODEL_REQUESTED_RAW" ]]; then
+    MODEL_PREPARED_VALUE=""
+    return 0
+  fi
+
+  resolved="$MODEL_REQUESTED_RAW"
+  if declare -F resolve_requested_model_for_provider >/dev/null; then
+    resolved="$(resolve_requested_model_for_provider "$provider" "$MODEL_REQUESTED_RAW" 2>/dev/null || printf "%s" "$MODEL_REQUESTED_RAW")"
+  fi
+
+  if [[ "$resolved" != "$MODEL_REQUESTED_RAW" ]] && declare -F build_model_resolution_summary >/dev/null; then
+    MODEL_RESOLUTION_NOTE="$(build_model_resolution_summary "$provider" "$MODEL_REQUESTED_RAW" "$resolved" "normalized")"
+  fi
+
+  MODEL_PREPARED_VALUE="$resolved"
+}
+
+retry_with_provider_default_model() {
+  local provider="${1:-}"
+  local current_model="${2:-}"
+  local fallback=""
+
+  [[ -n "$MODEL_REQUESTED_RAW" ]] || return 1
+  declare -F default_fallback_model_for_provider >/dev/null || return 1
+
+  fallback="$(default_fallback_model_for_provider "$provider" "$current_model" 2>/dev/null || true)"
+  [[ -n "$fallback" ]] || return 1
+
+  if declare -F is_provider_default_model >/dev/null && is_provider_default_model "$fallback"; then
+    MODEL_RESOLUTION_NOTE="$(build_model_resolution_summary "$provider" "$MODEL_REQUESTED_RAW" "provider-default" "fallback")"
+    printf "%s" ""
+    return 0
+  fi
+
+  if [[ "$fallback" == "$current_model" ]]; then
+    return 1
+  fi
+
+  if declare -F build_model_resolution_summary >/dev/null; then
+    MODEL_RESOLUTION_NOTE="$(build_model_resolution_summary "$provider" "$MODEL_REQUESTED_RAW" "$fallback" "fallback")"
+  fi
+  printf "%s" "$fallback"
+}
+
+append_model_resolution_note() {
+  local note="${1:-}"
+  [[ -n "$note" ]] || return 0
+  if [[ -n "$MODEL_RESOLUTION_NOTE" ]]; then
+    MODEL_RESOLUTION_NOTE="${MODEL_RESOLUTION_NOTE}; ${note}"
+  else
+    MODEL_RESOLUTION_NOTE="$note"
+  fi
+}
+
+is_gemini_capacity_error() {
+  local error_msg="${1:-}"
+  local error_lower=""
+  error_lower="$(printf "%s" "$error_msg" | tr '[:upper:]' '[:lower:]')"
+  printf "%s" "$error_lower" | grep -qiE 'model_capacity_exhausted|resource_exhausted|no capacity available for model|ratelimitexceeded'
+}
+
+retry_with_gemini_capacity_fallback() {
+  local current_model="${1:-}"
+  local fallback_model="gemini-2.5-flash"
+  local source_label="${current_model:-provider-default}"
+
+  [[ "$GEMINI_CAPACITY_RETRIED" != "true" ]] || return 1
+  [[ "$current_model" != "$fallback_model" ]] || return 1
+
+  GEMINI_CAPACITY_RETRIED=true
+  MODEL="$fallback_model"
+  append_model_resolution_note "gemini model '$source_label' -> '$fallback_model' (capacity_fallback)"
+  printf "%s" "$fallback_model"
+}
 
 # Agent invocation mode: wrapper expects agent .md file path + optional input data
 # We must extract a single persona block, not pass the whole file.
@@ -671,7 +893,7 @@ get_gemini_session_token_usage() {
     ([.messages[]? | select(.type == "gemini" and .tokens != null) | .tokens] | last) as $t
     | select($t != null)
     | {
-        input_tokens: (($t.input // $t.input_tokens // 0) | as_int),
+        input_tokens: ((($t.input // $t.input_tokens // 0) + ($t.cached // 0)) | as_int),
         output_tokens: ((($t.output // $t.output_tokens // 0) + ($t.thoughts // 0) + ($t.tool // 0)) | as_int),
         total_tokens: (($t.total // (($t.input // 0) + ($t.output // 0) + ($t.thoughts // 0) + ($t.tool // 0) + ($t.cached // 0))) | as_int),
         cost_usd: 0
@@ -872,6 +1094,14 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -n "$MODEL" ]]; then
+  prepare_requested_model_value "gemini" "$MODEL"
+  MODEL="$MODEL_PREPARED_VALUE"
+  if [[ -n "$MODEL_RESOLUTION_NOTE" ]]; then
+    log_info "Model resolution: $MODEL_RESOLUTION_NOTE"
+  fi
+fi
 
 # ===================
 # P6.4: Health Check Mode
@@ -1431,40 +1661,6 @@ $TOOL_RULES
     cd "$WORKSPACE_DIR"
   fi
 
-  # Note: Gemini CLI may not expose temperature directly via CLI args
-  # Temperature is accepted for API consistency but logged only
-  if [[ -n "$TEMPERATURE" ]]; then
-    # Gemini uses --temp notation
-    GEMINI_ARGS+=("--temp" "$TEMPERATURE")
-    log_verbose "Temperature specified: $TEMPERATURE (via --temp flag)"
-  fi
-  log_verbose "Invoking gemini CLI (Workspace: ${WORKSPACE_DIR:-none}, Tenant: ${TENANT_DIR:-none}, YOLO: $YOLO_MODE, Model: ${MODEL:-default})"
-
-  # Build gemini args
-  GEMINI_ARGS=()
-  if [[ -n "$WORKSPACE_DIR" ]]; then
-    GEMINI_ARGS+=("--include-directories" "$WORKSPACE_DIR")
-  fi
-  if [[ -n "$TENANT_DIR" && "$TENANT_DIR" != "$WORKSPACE_DIR" ]]; then
-    GEMINI_ARGS+=("--include-directories" "$TENANT_DIR")
-  fi
-  if [[ -n "$CORE_DIR" && "$CORE_DIR" != "$WORKSPACE_DIR" && "$CORE_DIR" != "$TENANT_DIR" ]]; then
-    GEMINI_ARGS+=("--include-directories" "$CORE_DIR")
-  fi
-
-  # Add model flag if specified
-  if [[ -n "$MODEL" ]]; then
-    GEMINI_ARGS+=("-m" "$MODEL")
-    log_verbose "Using model: $MODEL"
-  fi
-
-  if [[ "$YOLO_MODE" == "true" ]]; then
-    GEMINI_ARGS+=("--yolo")
-  fi
-  if [[ "$ALLOW_TOOLS" == "true" && ${#MCP_SERVER_NAMES[@]} -gt 0 ]]; then
-    GEMINI_ARGS+=("--allowed-mcp-server-names" "${MCP_SERVER_NAMES[@]}")
-  fi
-
   # Add session args for session persistence
   # --session-id: Resume existing session (Gemini uses index-based sessions)
   # --manage-session: Create new session (we'll get the actual index after running)
@@ -1495,6 +1691,34 @@ $TOOL_RULES
   # Check if gemini supports -o flag and schema (similar to claude/codex)
   # If not supported, we'll capture output differently
   # For now, assume gemini outputs to stdout
+  GEMINI_INVALID_MODEL_RETRIED=false
+  GEMINI_CAPACITY_RETRIED=false
+  while true; do
+  GEMINI_ARGS=()
+  if [[ -n "$WORKSPACE_DIR" ]]; then
+    GEMINI_ARGS+=("--include-directories" "$WORKSPACE_DIR")
+  fi
+  if [[ -n "$TENANT_DIR" && "$TENANT_DIR" != "$WORKSPACE_DIR" ]]; then
+    GEMINI_ARGS+=("--include-directories" "$TENANT_DIR")
+  fi
+  if [[ -n "$CORE_DIR" && "$CORE_DIR" != "$WORKSPACE_DIR" && "$CORE_DIR" != "$TENANT_DIR" ]]; then
+    GEMINI_ARGS+=("--include-directories" "$CORE_DIR")
+  fi
+  if [[ -n "$TEMPERATURE" ]]; then
+    GEMINI_ARGS+=("--temp" "$TEMPERATURE")
+    log_verbose "Temperature specified: $TEMPERATURE (via --temp flag)"
+  fi
+  if [[ -n "$MODEL" ]]; then
+    GEMINI_ARGS+=("-m" "$MODEL")
+    log_verbose "Using model: $MODEL"
+  fi
+  if [[ "$YOLO_MODE" == "true" ]]; then
+    GEMINI_ARGS+=("--yolo")
+  fi
+  if [[ "$ALLOW_TOOLS" == "true" && ${#MCP_SERVER_NAMES[@]} -gt 0 ]]; then
+    GEMINI_ARGS+=("--allowed-mcp-server-names" "${MCP_SERVER_NAMES[@]}")
+  fi
+  log_verbose "Invoking gemini CLI (Workspace: ${WORKSPACE_DIR:-none}, Tenant: ${TENANT_DIR:-none}, YOLO: $YOLO_MODE, Model: ${MODEL:-default})"
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
     log_verbose "Running gemini with timeout: ${CLI_TIMEOUT}s"
@@ -1524,8 +1748,6 @@ $TOOL_RULES
     wc -c < "$TMPFILE_OUTPUT" | xargs -I{} echo "{}" >> "$AGENT_LOG"
   fi
 
-  rm -f "$TMPFILE_PROMPT"
-
   # Capture session ID for fresh successful calls when no managed session ID
   # has already been assigned by caller context.
   if [[ -z "$GEMINI_SESSION_ID" && $GEMINI_EXIT -eq 0 ]]; then
@@ -1547,6 +1769,27 @@ $TOOL_RULES
     # Gemini failed - return error with stderr
     ERROR_MSG=$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' || echo "Unknown error")
     log_verbose "Gemini execution failed: $ERROR_MSG"
+
+    if [[ "$GEMINI_INVALID_MODEL_RETRIED" != "true" ]] && declare -F is_invalid_model_error >/dev/null && is_invalid_model_error "$ERROR_MSG"; then
+      REQUESTED_MODEL_LABEL="${MODEL_REQUESTED_RAW:-$MODEL}"
+      GEMINI_INVALID_MODEL_RETRIED=true
+      MODEL=""
+      MODEL_RESOLUTION_NOTE="gemini model '$REQUESTED_MODEL_LABEL' -> 'provider-default' (fallback)"
+      log_info "Invalid model '$REQUESTED_MODEL_LABEL' for gemini; retrying with provider default"
+      : > "$TMPFILE_OUTPUT"
+      : > "$TMPFILE_ERR"
+      continue
+    fi
+
+    if is_gemini_capacity_error "$ERROR_MSG"; then
+      CURRENT_MODEL_LABEL="${MODEL:-provider-default}"
+      if retry_with_gemini_capacity_fallback "$CURRENT_MODEL_LABEL" >/dev/null; then
+        log_info "Gemini model '$CURRENT_MODEL_LABEL' hit capacity; retrying with gemini-2.5-flash"
+        : > "$TMPFILE_OUTPUT"
+        : > "$TMPFILE_ERR"
+        continue
+      fi
+    fi
 
     # Check if this is an invalid session error - fail fast, don't retry
     if echo "$ERROR_MSG" | grep -qi "Invalid session identifier"; then
@@ -1586,27 +1829,46 @@ $TOOL_RULES
 
     rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
     ERROR_TYPE="provider_error"
+    CLASSIFIED_ERROR_TYPE=""
     if [[ -z "$GEMINI_SESSION_ID" ]]; then
       GEMINI_SESSION_ID="$(get_latest_gemini_session "$PWD" 2>/dev/null || true)"
     fi
-    if [[ "$GEMINI_EXIT" -eq 124 ]]; then
-      ERROR_TYPE="timeout"
-    elif declare -F classify_error >/dev/null; then
-      ERROR_TYPE="$(classify_error "$ERROR_MSG")"
+    if declare -F classify_error >/dev/null; then
+      CLASSIFIED_ERROR_TYPE="$(classify_error "$ERROR_MSG")"
     fi
-    emit_cli_error_response "$ERROR_MSG" "$ERROR_TYPE" "$GEMINI_SESSION_ID" "$GEMINI_EXIT"
+    if [[ "$GEMINI_EXIT" -eq 124 ]]; then
+      if [[ -n "$CLASSIFIED_ERROR_TYPE" && "$CLASSIFIED_ERROR_TYPE" != "unknown" && "$CLASSIFIED_ERROR_TYPE" != "timeout" ]]; then
+        ERROR_TYPE="$CLASSIFIED_ERROR_TYPE"
+      else
+      ERROR_TYPE="timeout"
+      fi
+    elif [[ -n "$CLASSIFIED_ERROR_TYPE" ]]; then
+      ERROR_TYPE="$CLASSIFIED_ERROR_TYPE"
+    fi
+    ERROR_EMIT_MSG="$ERROR_MSG"
+    if [[ "$ERROR_TYPE" == "timeout" ]] && is_gemini_startup_only_error "$ERROR_MSG"; then
+      ERROR_EMIT_MSG="Gemini timed out without terminal output after startup."
+    fi
+    if [[ -n "$MODEL_RESOLUTION_NOTE" ]]; then
+      emit_cli_error_response "$ERROR_EMIT_MSG" "$ERROR_TYPE" "$GEMINI_SESSION_ID" "$GEMINI_EXIT" "model_resolution" "$MODEL_RESOLUTION_NOTE"
+    else
+      emit_cli_error_response "$ERROR_EMIT_MSG" "$ERROR_TYPE" "$GEMINI_SESSION_ID" "$GEMINI_EXIT"
+    fi
     exit 1
   fi
+  break
+  done
+  rm -f "$TMPFILE_PROMPT"
 
   # Read the output which should contain the response
-  RESPONSE_TEXT="$(cat "$TMPFILE_OUTPUT" 2>/dev/null | tr -d '\0')"
+  RAW_RESPONSE_TEXT="$(cat "$TMPFILE_OUTPUT" 2>/dev/null | tr -d '\0')"
   STDERR_TEXT="$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' || true)"
 
   rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
 
   # Filter out Gemini CLI informational output before parsing
   # Gemini outputs "YOLO mode is enabled..." and similar to stdout
-  RESPONSE_TEXT="$(filter_gemini_info_lines "$RESPONSE_TEXT")"
+  RESPONSE_TEXT="$(filter_gemini_info_lines "$RAW_RESPONSE_TEXT")"
 
   if [[ -n "$RESPONSE_TEXT" && "$RESPONSE_TEXT" != "null" ]]; then
     # Try to extract JSON from the response (gemini may wrap it in markdown)
@@ -1635,20 +1897,43 @@ $TOOL_RULES
         # Include session_id if a session was used or created
         if [[ -n "$GEMINI_SESSION_ID" ]]; then
           # Session was resumed or created - use the actual session index
-          emit_cli_response "$FINAL_RESPONSE" "$GEMINI_SESSION_ID" "$RESPONSE_TEXT" "" "" "$STDERR_TEXT"
+          if [[ -n "$MODEL_RESOLUTION_NOTE" ]]; then
+            emit_cli_response "$FINAL_RESPONSE" "$GEMINI_SESSION_ID" "$RESPONSE_TEXT" "model_resolution" "$MODEL_RESOLUTION_NOTE" "$STDERR_TEXT"
+          else
+            emit_cli_response "$FINAL_RESPONSE" "$GEMINI_SESSION_ID" "$RESPONSE_TEXT" "" "" "$STDERR_TEXT"
+          fi
         else
-          emit_cli_response "$FINAL_RESPONSE" "" "$RESPONSE_TEXT" "" "" "$STDERR_TEXT"
+          if [[ -n "$MODEL_RESOLUTION_NOTE" ]]; then
+            emit_cli_response "$FINAL_RESPONSE" "" "$RESPONSE_TEXT" "model_resolution" "$MODEL_RESOLUTION_NOTE" "$STDERR_TEXT"
+          else
+            emit_cli_response "$FINAL_RESPONSE" "" "$RESPONSE_TEXT" "" "" "$STDERR_TEXT"
+          fi
         fi
     else
         # Not valid JSON - wrap raw text in response, include session_id if available
         if [[ -n "$GEMINI_SESSION_ID" ]]; then
-          emit_cli_response "$RESPONSE_TEXT" "$GEMINI_SESSION_ID" "$RESPONSE_TEXT" "" "" "$STDERR_TEXT"
+          if [[ -n "$MODEL_RESOLUTION_NOTE" ]]; then
+            emit_cli_response "$RESPONSE_TEXT" "$GEMINI_SESSION_ID" "$RESPONSE_TEXT" "model_resolution" "$MODEL_RESOLUTION_NOTE" "$STDERR_TEXT"
+          else
+            emit_cli_response "$RESPONSE_TEXT" "$GEMINI_SESSION_ID" "$RESPONSE_TEXT" "" "" "$STDERR_TEXT"
+          fi
         else
-          emit_cli_response "$RESPONSE_TEXT" "" "$RESPONSE_TEXT" "" "" "$STDERR_TEXT"
+          if [[ -n "$MODEL_RESOLUTION_NOTE" ]]; then
+            emit_cli_response "$RESPONSE_TEXT" "" "$RESPONSE_TEXT" "model_resolution" "$MODEL_RESOLUTION_NOTE" "$STDERR_TEXT"
+          else
+            emit_cli_response "$RESPONSE_TEXT" "" "$RESPONSE_TEXT" "" "" "$STDERR_TEXT"
+          fi
         fi
     fi
   else
-    emit_cli_error_response "No response from Gemini CLI" "provider_error" "$GEMINI_SESSION_ID" 1
+    NO_RESPONSE_INFO="$(build_gemini_no_response_error "$RAW_RESPONSE_TEXT" "$STDERR_TEXT" "$RESPONSE_TEXT")"
+    NO_RESPONSE_TYPE="${NO_RESPONSE_INFO%%$'\t'*}"
+    NO_RESPONSE_MSG="${NO_RESPONSE_INFO#*$'\t'}"
+    if [[ -n "$MODEL_RESOLUTION_NOTE" ]]; then
+      emit_cli_error_response "$NO_RESPONSE_MSG" "$NO_RESPONSE_TYPE" "$GEMINI_SESSION_ID" 1 "model_resolution" "$MODEL_RESOLUTION_NOTE"
+    else
+      emit_cli_error_response "$NO_RESPONSE_MSG" "$NO_RESPONSE_TYPE" "$GEMINI_SESSION_ID" 1
+    fi
   fi
 else
   # Direct invocation with text prompt

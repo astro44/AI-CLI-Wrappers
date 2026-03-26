@@ -5,6 +5,14 @@
 
 set -euo pipefail
 
+WRAPPER_REQ_ID="${AUTONOM8_REQUEST_ID:-${A8_REQUEST_ID:-}}"
+if [[ -n "${WRAPPER_REQ_ID}" ]]; then
+  exec 3>&2
+  exec 2> >(while IFS= read -r __a8_line; do
+    printf '[req=%s] %s\n' "${WRAPPER_REQ_ID}" "${__a8_line}" >&3
+  done)
+fi
+
 # Track child process PID for cleanup on script termination
 CLAUDE_PID=""
 CLI_TIMEOUT=""  # Timeout in seconds, passed from Go worker
@@ -103,7 +111,7 @@ emit_cli_response() {
   local extra_field_value="${5:-}"
   local stream_output="${6:-}"
 
-  local tokens_json='{"input_tokens":0,"output_tokens":0,"total_tokens":0,"cost_usd":0}'
+  local tokens_json='{"input_tokens":0,"output_tokens":0,"estimated_output_tokens":0,"total_tokens":0,"cost_usd":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}'
   local token_usage_available=false
   local reasoning_text=""
   local reasoning_available=false
@@ -121,11 +129,64 @@ emit_cli_response() {
         if type == "number" then .
         elif type == "string" then (tonumber? // 0)
         else 0 end;
+      def cache_read_tokens:
+        (
+          .usage.cache_read_input_tokens
+          // .usage.cacheReadInputTokens
+          // .usage.cached_input_tokens
+          // .usage.cachedInputTokens
+          // .usage.input_tokens_details.cache_read
+          // .usage.input_tokens_details.cache_read_tokens
+          // .usage.inputTokensDetails.cacheRead
+          // .usageMetadata.cachedContentTokenCount
+          // .usage_metadata.cached_content_token_count
+          // .cache_read_input_tokens
+          // .cacheReadInputTokens
+          // .cached_input_tokens
+          // .cachedInputTokens
+          // .token_usage.cache_read_input_tokens
+          // .token_usage.cached_input_tokens
+          // .tokenUsage.cacheReadInputTokens
+          // 0
+        ) | as_int;
+      def cache_creation_tokens:
+        (
+          .usage.cache_creation_input_tokens
+          // .usage.cacheCreationInputTokens
+          // .usage.cache_creation_tokens
+          // .usage.cacheCreationTokens
+          // .usage.input_tokens_details.cache_creation
+          // .usage.input_tokens_details.cache_creation_tokens
+          // .usage.inputTokensDetails.cacheCreation
+          // .cache_creation_input_tokens
+          // .cacheCreationInputTokens
+          // .cache_creation_tokens
+          // .cacheCreationTokens
+          // .token_usage.cache_creation_input_tokens
+          // .token_usage.cache_creation_tokens
+          // .tokenUsage.cacheCreationInputTokens
+          // 0
+        ) | as_int;
+      (cache_read_tokens) as $cache_read
+      | (cache_creation_tokens) as $cache_create
+      | (
+          .usage.input_tokens
+          // .usage.inputTokens
+          // .input_tokens
+          // .inputTokens
+          // .token_usage.input_tokens
+          // .token_usage.prompt_tokens
+          // .prompt_tokens
+          // 0
+        ) as $base_input_raw
+      | ($base_input_raw | as_int) as $base_input
       {
-        input_tokens: ((.usage.input_tokens // .usage.inputTokens // .input_tokens // .inputTokens // .token_usage.input_tokens // .token_usage.prompt_tokens // .prompt_tokens // 0) | as_int),
+        input_tokens: (($base_input + $cache_read + $cache_create) | as_int),
         output_tokens: ((.usage.output_tokens // .usage.outputTokens // .output_tokens // .outputTokens // .token_usage.output_tokens // .token_usage.completion_tokens // .completion_tokens // 0) | as_int),
         total_tokens: ((.usage.total_tokens // .usage.totalTokens // .total_tokens // .totalTokens // .token_usage.total_tokens // .token_usage.total // .total_tokens_used // 0) | as_int),
-        cost_usd: ((.usage.cost_usd // .usage.cost // .cost_usd // .token_usage.cost_usd // .cost // 0) | as_num)
+        cost_usd: ((.usage.cost_usd // .usage.cost // .cost_usd // .token_usage.cost_usd // .cost // 0) | as_num),
+        cache_read_input_tokens: $cache_read,
+        cache_creation_input_tokens: $cache_create
       }
       | if .total_tokens == 0 and ((.input_tokens + .output_tokens) > 0)
         then .total_tokens = (.input_tokens + .output_tokens)
@@ -149,12 +210,39 @@ emit_cli_response() {
     fi
   fi
 
-  if [[ "$token_usage_available" != "true" && -n "$session_id" ]]; then
+  if [[ -n "$session_id" ]]; then
     local session_tokens
     session_tokens="$(get_claude_session_token_usage "$session_id" 2>/dev/null || true)"
     if [[ -n "$session_tokens" ]]; then
-      tokens_json="$session_tokens"
-      token_usage_available=true
+      local merged_tokens
+      merged_tokens="$(jq -cn --argjson primary "$tokens_json" --argjson fallback "$session_tokens" '
+        def as_num(v):
+          if v == null then 0
+          elif (v | type) == "number" then v
+          elif (v | type) == "string" then (v | tonumber? // 0)
+          else 0
+          end;
+        {
+          input_tokens: ([as_num($primary.input_tokens), as_num($fallback.input_tokens)] | max | floor),
+          output_tokens: ([as_num($primary.output_tokens), as_num($fallback.output_tokens)] | max | floor),
+          total_tokens: ([as_num($primary.total_tokens), as_num($fallback.total_tokens)] | max | floor),
+          cost_usd: ([as_num($primary.cost_usd), as_num($fallback.cost_usd)] | max),
+          cache_read_input_tokens: ([as_num($primary.cache_read_input_tokens), as_num($fallback.cache_read_input_tokens)] | max | floor),
+          cache_creation_input_tokens: ([as_num($primary.cache_creation_input_tokens), as_num($fallback.cache_creation_input_tokens)] | max | floor)
+        }
+        | if .total_tokens < (.input_tokens + .output_tokens)
+          then .total_tokens = (.input_tokens + .output_tokens)
+          else .
+          end
+      ' 2>/dev/null || true)"
+      if [[ -n "$merged_tokens" && "$merged_tokens" != "null" ]]; then
+        tokens_json="$merged_tokens"
+      else
+        tokens_json="$session_tokens"
+      fi
+      if [[ "$(printf "%s" "$tokens_json" | jq -r '((.input_tokens + .output_tokens + .total_tokens) > 0)' 2>/dev/null || echo false)" == "true" ]]; then
+        token_usage_available=true
+      fi
     fi
   fi
 
@@ -234,6 +322,17 @@ emit_cli_response() {
     reasoning_absent_reason="model_not_emitted"
   fi
 
+  local response_chars=${#response_text}
+  local estimated_output_tokens=$((response_chars / 4))
+  if [[ $response_chars -gt 0 && $estimated_output_tokens -le 0 ]]; then
+    estimated_output_tokens=1
+  fi
+  tokens_json="$(printf "%s" "$tokens_json" | jq -c --argjson estimated "$estimated_output_tokens" '
+    .estimated_output_tokens = $estimated
+    | if .cache_read_input_tokens == null then .cache_read_input_tokens = 0 else . end
+    | if .cache_creation_input_tokens == null then .cache_creation_input_tokens = 0 else . end
+  ' 2>/dev/null || echo "$tokens_json")"
+
   RESPONSE_EMITTED=true
 
   if [[ -n "$session_id" && -n "$extra_field_name" ]]; then
@@ -290,7 +389,7 @@ emit_cli_error_response() {
   local error_type="${2:-unknown}"
   local session_id="${3:-}"
   local exit_code="${4:-1}"
-  local tokens_json='{"input_tokens":0,"output_tokens":0,"total_tokens":0,"cost_usd":0}'
+  local tokens_json='{"input_tokens":0,"output_tokens":0,"estimated_output_tokens":0,"total_tokens":0,"cost_usd":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}'
   local token_usage_available=false
   local reasoning_text=""
   local reasoning_available=false
@@ -308,7 +407,9 @@ emit_cli_error_response() {
     session_tokens="$(get_claude_session_token_usage "$session_id" 2>/dev/null || true)"
     if [[ -n "$session_tokens" ]]; then
       tokens_json="$session_tokens"
-      token_usage_available=true
+      if [[ "$(printf "%s" "$tokens_json" | jq -r '((.input_tokens + .output_tokens + .total_tokens) > 0)' 2>/dev/null || echo false)" == "true" ]]; then
+        token_usage_available=true
+      fi
     fi
 
     local session_reasoning=""
@@ -475,6 +576,73 @@ save_debug_prompt() {
 if [[ -f "$SCRIPT_DIR/lib/error_utils.sh" ]]; then
     source "$SCRIPT_DIR/lib/error_utils.sh"
 fi
+if [[ -f "$SCRIPT_DIR/lib/model_utils.sh" ]]; then
+    source "$SCRIPT_DIR/lib/model_utils.sh"
+fi
+
+MODEL_REQUESTED_RAW=""
+MODEL_RESOLUTION_NOTE=""
+MODEL_PREPARED_VALUE=""
+
+prepare_requested_model_value() {
+  local provider="${1:-}"
+  local requested="${2:-}"
+  local resolved=""
+
+  if [[ -z "${requested:-}" ]]; then
+    MODEL_PREPARED_VALUE="$requested"
+    return 0
+  fi
+
+  if ! declare -F trim_model_string >/dev/null; then
+    MODEL_PREPARED_VALUE="$requested"
+    return 0
+  fi
+
+  MODEL_REQUESTED_RAW="$(trim_model_string "$requested")"
+  if [[ -z "$MODEL_REQUESTED_RAW" ]]; then
+    MODEL_PREPARED_VALUE=""
+    return 0
+  fi
+
+  resolved="$MODEL_REQUESTED_RAW"
+  if declare -F resolve_requested_model_for_provider >/dev/null; then
+    resolved="$(resolve_requested_model_for_provider "$provider" "$MODEL_REQUESTED_RAW" 2>/dev/null || printf "%s" "$MODEL_REQUESTED_RAW")"
+  fi
+
+  if [[ "$resolved" != "$MODEL_REQUESTED_RAW" ]] && declare -F build_model_resolution_summary >/dev/null; then
+    MODEL_RESOLUTION_NOTE="$(build_model_resolution_summary "$provider" "$MODEL_REQUESTED_RAW" "$resolved" "normalized")"
+  fi
+
+  MODEL_PREPARED_VALUE="$resolved"
+}
+
+retry_with_provider_default_model() {
+  local provider="${1:-}"
+  local current_model="${2:-}"
+  local fallback=""
+
+  [[ -n "$MODEL_REQUESTED_RAW" ]] || return 1
+  declare -F default_fallback_model_for_provider >/dev/null || return 1
+
+  fallback="$(default_fallback_model_for_provider "$provider" "$current_model" 2>/dev/null || true)"
+  [[ -n "$fallback" ]] || return 1
+
+  if declare -F is_provider_default_model >/dev/null && is_provider_default_model "$fallback"; then
+    MODEL_RESOLUTION_NOTE="$(build_model_resolution_summary "$provider" "$MODEL_REQUESTED_RAW" "provider-default" "fallback")"
+    printf "%s" ""
+    return 0
+  fi
+
+  if [[ "$fallback" == "$current_model" ]]; then
+    return 1
+  fi
+
+  if declare -F build_model_resolution_summary >/dev/null; then
+    MODEL_RESOLUTION_NOTE="$(build_model_resolution_summary "$provider" "$MODEL_REQUESTED_RAW" "$fallback" "fallback")"
+  fi
+  printf "%s" "$fallback"
+}
 
 # Agent invocation mode: wrapper expects agent .md file path + optional input data
 # We must extract a single persona block, not pass the whole file.
@@ -567,20 +735,68 @@ get_claude_session_token_usage() {
   session_file="$(get_claude_session_file_by_id "$session_id" 2>/dev/null || true)"
   [[ -z "$session_file" || ! -f "$session_file" ]] && return 1
 
-  tail -n 1200 "$session_file" 2>/dev/null | jq -rc '
+  tail -n 1200 "$session_file" 2>/dev/null | jq -sc '
     def as_int:
       if type == "number" then floor
       elif type == "string" then (tonumber? // 0)
       else 0 end;
-    select(.type == "assistant" and .message.usage != null)
-    | .message.usage
-    | {
-        input_tokens: ((.input_tokens // 0) | as_int),
-        output_tokens: ((.output_tokens // 0) | as_int),
-        total_tokens: (((.input_tokens // 0) + (.output_tokens // 0)) | as_int),
-        cost_usd: 0
-      }
-  ' | tail -1
+    def usage_totals:
+      . as $u
+      | ((($u.input_tokens // $u.inputTokens // 0) | as_int)) as $input
+      | ((($u.cache_read_input_tokens // $u.cacheReadInputTokens // $u.cached_input_tokens // 0) | as_int)) as $cache_read
+      | ((($u.cache_creation_input_tokens // $u.cacheCreationInputTokens // 0) | as_int)) as $cache_create
+      | ((($u.output_tokens // $u.outputTokens // 0) | as_int)) as $output
+      | ((($u.reasoning_output_tokens // $u.reasoningOutputTokens // $u.output_reasoning_tokens // $u.outputReasoningTokens // $u.thinking_tokens // $u.thinkingTokens // 0) | as_int)) as $reasoning_output
+      | (($input + $cache_read + $cache_create) | as_int) as $input_total
+      | {
+          input_tokens: $input_total,
+          output_tokens: (($output + $reasoning_output) | as_int),
+          total_tokens: (($input_total + $output + $reasoning_output) | as_int),
+          cost_usd: 0,
+          cache_read_input_tokens: $cache_read,
+          cache_creation_input_tokens: $cache_create
+        };
+    . as $events
+    | (reduce range(0; ($events | length)) as $i (-1;
+        if (($events[$i].type // "") == "user") then $i else . end
+      )) as $last_user_idx
+    | ($events
+        | to_entries
+        | map(
+            select(
+              (.key > $last_user_idx)
+              and ((.value.type // "") == "assistant")
+              and (.value.message.usage != null)
+            )
+            | (.value.message.usage | usage_totals)
+          )
+      ) as $window
+    | if ($window | length) > 0 then
+        reduce $window[] as $u (
+          {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            cost_usd: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0
+          };
+          .input_tokens += ($u.input_tokens // 0)
+          | .output_tokens += ($u.output_tokens // 0)
+          | .total_tokens += ($u.total_tokens // 0)
+          | .cache_read_input_tokens += ($u.cache_read_input_tokens // 0)
+          | .cache_creation_input_tokens += ($u.cache_creation_input_tokens // 0)
+        )
+      else
+        ($events
+          | map(
+              select((.type // "") == "assistant" and .message.usage != null)
+              | (.message.usage | usage_totals)
+            )
+          | if length > 0 then last else empty end
+        )
+      end
+  '
 }
 
 compact_reasoning_text() {
@@ -807,6 +1023,14 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -n "$MODEL" ]]; then
+  prepare_requested_model_value "claude" "$MODEL"
+  MODEL="$MODEL_PREPARED_VALUE"
+  if [[ -n "$MODEL_RESOLUTION_NOTE" ]]; then
+    log_info "Model resolution: $MODEL_RESOLUTION_NOTE"
+  fi
+fi
 
 # ===================
 # Quota Status Mode
@@ -1435,21 +1659,12 @@ $TOOL_RULES
     log_verbose "Default session handling (will capture ID from response)"
   fi
 
-  # Build model argument if specified
-  MODEL_ARG=""
-  if [[ -n "$MODEL" ]]; then
-    MODEL_ARG="--model $MODEL"
-    log_verbose "Using model: $MODEL"
-  fi
-
   # Build permission mode argument if specified
   MODE_ARG=""
   if [[ -n "$PERMISSION_MODE" ]]; then
     MODE_ARG="--permission-mode $PERMISSION_MODE"
     log_verbose "Using permission mode: $PERMISSION_MODE"
   fi
-
-  log_verbose "Invoking claude CLI (WorkDir: ${WORK_DIR:-none}, Bypass: ${BYPASS_ARG:-none}, Session: ${SESSION_ARG:-none}, Model: ${MODEL_ARG:-default}, Mode: ${MODE_ARG:-default}, Format: $OUTPUT_FORMAT)"
 
   # O-6: Set up agent stream logging for per-ticket LLM output capture
   # A8_TICKET_ID and A8_WORKFLOW are set by Go CLIManager via environment variables
@@ -1465,58 +1680,93 @@ $TOOL_RULES
     log_verbose "O-6: Agent stream logging to $AGENT_LOG"
   fi
 
-  # Use --print mode for non-interactive operation
-  set +e
-  if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
-    log_verbose "Running claude with timeout: ${CLI_TIMEOUT}s"
-    if [[ -n "$WORK_DIR" ]]; then
-      if [[ -n "$AGENT_LOG" ]]; then
-        (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT")
-      else
-        (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT")
-      fi
-      CLAUDE_EXIT=$?
-    else
-      if [[ -n "$AGENT_LOG" ]]; then
-        echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
-      else
-        echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
-      fi
-      CLAUDE_EXIT=$?
+  CLAUDE_INVALID_MODEL_RETRIED=false
+  while true; do
+    MODEL_ARG=""
+    if [[ -n "$MODEL" ]]; then
+      MODEL_ARG="--model $MODEL"
+      log_verbose "Using model: $MODEL"
     fi
-  else
-    if [[ -n "$WORK_DIR" ]]; then
-      if [[ -n "$AGENT_LOG" ]]; then
-        (cd "$WORK_DIR" && echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT")
+
+    log_verbose "Invoking claude CLI (WorkDir: ${WORK_DIR:-none}, Bypass: ${BYPASS_ARG:-none}, Session: ${SESSION_ARG:-none}, Model: ${MODEL_ARG:-default}, Mode: ${MODE_ARG:-default}, Format: $OUTPUT_FORMAT)"
+
+    : > "$TMPFILE_OUTPUT"
+    : > "$TMPFILE_ERR"
+
+    # Use --print mode for non-interactive operation
+    set +e
+    if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
+      log_verbose "Running claude with timeout: ${CLI_TIMEOUT}s"
+      if [[ -n "$WORK_DIR" ]]; then
+        if [[ -n "$AGENT_LOG" ]]; then
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT")
+        else
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT")
+        fi
+        CLAUDE_EXIT=$?
       else
-        (cd "$WORK_DIR" && echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT")
+        if [[ -n "$AGENT_LOG" ]]; then
+          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
+        else
+          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+        fi
+        CLAUDE_EXIT=$?
       fi
-      CLAUDE_EXIT=$?
     else
-      if [[ -n "$AGENT_LOG" ]]; then
-        echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
+      if [[ -n "$WORK_DIR" ]]; then
+        if [[ -n "$AGENT_LOG" ]]; then
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT")
+        else
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT")
+        fi
+        CLAUDE_EXIT=$?
       else
-        echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+        if [[ -n "$AGENT_LOG" ]]; then
+          echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
+        else
+          echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+        fi
+        CLAUDE_EXIT=$?
       fi
-      CLAUDE_EXIT=$?
     fi
-  fi
-  set -e
+    set -e
 
-  # O-9: Append stdout response to agent log (stderr tee only captures progress/errors,
-  # claude --print sends the actual response to stdout which was missing from logs)
-  if [[ -n "$AGENT_LOG" && -f "$TMPFILE_OUTPUT" && -s "$TMPFILE_OUTPUT" ]]; then
-    echo "" >> "$AGENT_LOG"
-    cat "$TMPFILE_OUTPUT" >> "$AGENT_LOG" 2>/dev/null || true
-    echo "" >> "$AGENT_LOG"
-    echo "tokens used" >> "$AGENT_LOG"
-    wc -c < "$TMPFILE_OUTPUT" | xargs -I{} echo "{}" >> "$AGENT_LOG"
-  fi
+    # O-9: Append stdout response to agent log (stderr tee only captures progress/errors,
+    # claude --print sends the actual response to stdout which was missing from logs)
+    if [[ -n "$AGENT_LOG" && -f "$TMPFILE_OUTPUT" && -s "$TMPFILE_OUTPUT" ]]; then
+      echo "" >> "$AGENT_LOG"
+      cat "$TMPFILE_OUTPUT" >> "$AGENT_LOG" 2>/dev/null || true
+      echo "" >> "$AGENT_LOG"
+      echo "tokens used" >> "$AGENT_LOG"
+      wc -c < "$TMPFILE_OUTPUT" | xargs -I{} echo "{}" >> "$AGENT_LOG"
+    fi
 
-  if [[ $CLAUDE_EXIT -ne 0 ]]; then
-    # P6.1: Standardized error handling
-    ERROR_MSG=$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' || echo "Unknown error")
+    if [[ $CLAUDE_EXIT -eq 0 ]]; then
+      break
+    fi
+
+    ERROR_MSG=$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' || true)
+    if [[ -z "$ERROR_MSG" && -s "$TMPFILE_OUTPUT" ]]; then
+      ERROR_MSG="$(jq -r '
+        if .is_error == true
+        then (.result // (.errors | join(", ")) // empty)
+        else empty
+        end
+      ' "$TMPFILE_OUTPUT" 2>/dev/null || true)"
+    fi
+    if [[ -z "$ERROR_MSG" ]]; then
+      ERROR_MSG="Unknown error"
+    fi
     log_verbose "Claude execution failed: $ERROR_MSG"
+
+    if [[ "$CLAUDE_INVALID_MODEL_RETRIED" != "true" ]] && declare -F is_invalid_model_error >/dev/null && is_invalid_model_error "$ERROR_MSG"; then
+      REQUESTED_MODEL_LABEL="${MODEL_REQUESTED_RAW:-$MODEL}"
+      CLAUDE_INVALID_MODEL_RETRIED=true
+      MODEL=""
+      MODEL_RESOLUTION_NOTE="claude model '$REQUESTED_MODEL_LABEL' -> 'provider-default' (fallback)"
+      log_info "Invalid model '$REQUESTED_MODEL_LABEL' for claude; retrying with provider default"
+      continue
+    fi
 
     # Classify the error type
     ERROR_TYPE="unknown"
@@ -1533,7 +1783,6 @@ $TOOL_RULES
     if type create_system_message &>/dev/null; then
       create_system_message "claude" "$ERROR_TYPE" "$ERROR_MSG" "$CORE_DIR"
     elif [[ "$ERROR_TYPE" == "quota" ]]; then
-      # Fallback: create system message manually for quota errors
       RETRY_TIME=$(echo "$ERROR_MSG" | grep -oE "try again at [0-9]{1,2}:[0-9]{2} [AP]M" || echo "")
       SYSTEM_MSG_DIR="$CORE_DIR/context/system-messages/inbox"
       mkdir -p "$SYSTEM_MSG_DIR"
@@ -1556,11 +1805,9 @@ $TOOL_RULES
     fi
 
     rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
-
-    # Return structured error response with wrapper envelope.
     emit_cli_error_response "$ERROR_MSG" "$ERROR_TYPE" "${CLAUDE_SESSION_ID:-$SESSION_ID}" "$CLAUDE_EXIT"
     exit 1
-  fi
+  done
 
   # Read the output file which should contain the last message
   RAW_OUTPUT="$(cat "$TMPFILE_OUTPUT" 2>/dev/null)"
@@ -1606,7 +1853,11 @@ $TOOL_RULES
 
   # Wrap in CLIResponse format for Go worker
   # Include session_id if we have one (from resume or captured from new session)
-  emit_cli_response "$RESPONSE_TEXT" "$CLAUDE_SESSION_ID" "$RAW_OUTPUT" "" "" "$STDERR_TEXT"
+  if [[ -n "$MODEL_RESOLUTION_NOTE" ]]; then
+    emit_cli_response "$RESPONSE_TEXT" "$CLAUDE_SESSION_ID" "$RAW_OUTPUT" "model_resolution" "$MODEL_RESOLUTION_NOTE" "$STDERR_TEXT"
+  else
+    emit_cli_response "$RESPONSE_TEXT" "$CLAUDE_SESSION_ID" "$RAW_OUTPUT" "" "" "$STDERR_TEXT"
+  fi
 else
   # Direct invocation
   BYPASS_ARG=""

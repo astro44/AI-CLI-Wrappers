@@ -5,6 +5,14 @@
 
 set -euo pipefail
 
+WRAPPER_REQ_ID="${AUTONOM8_REQUEST_ID:-${A8_REQUEST_ID:-}}"
+if [[ -n "${WRAPPER_REQ_ID}" ]]; then
+  exec 3>&2
+  exec 2> >(while IFS= read -r __a8_line; do
+    printf '[req=%s] %s\n' "${WRAPPER_REQ_ID}" "${__a8_line}" >&3
+  done)
+fi
+
 # Track child process PID for cleanup on script termination
 CODEX_PID=""
 CLI_TIMEOUT=""  # Timeout in seconds, passed from Go worker
@@ -118,7 +126,7 @@ emit_cli_response() {
   local extra_field_value="${5:-}"
   local stream_output="${6:-}"
 
-  local tokens_json='{"input_tokens":0,"output_tokens":0,"total_tokens":0,"cost_usd":0}'
+  local tokens_json='{"input_tokens":0,"output_tokens":0,"estimated_output_tokens":0,"total_tokens":0,"cost_usd":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}'
   local token_usage_available=false
   local reasoning_text=""
   local reasoning_available=false
@@ -160,7 +168,9 @@ emit_cli_response() {
     session_tokens="$(get_codex_session_token_usage "$session_id" 2>/dev/null || true)"
     if [[ -n "$session_tokens" ]]; then
       tokens_json="$session_tokens"
-      token_usage_available=true
+      if [[ "$(printf "%s" "$tokens_json" | jq -r '((.input_tokens + .output_tokens + .total_tokens) > 0)' 2>/dev/null || echo false)" == "true" ]]; then
+        token_usage_available=true
+      fi
     fi
   fi
 
@@ -249,13 +259,35 @@ emit_cli_response() {
     reasoning_absent_reason="model_not_emitted"
   fi
 
-  RESPONSE_EMITTED=true
+  local response_chars=${#response_text}
+  local estimated_output_tokens=$((response_chars / 4))
+  if [[ $response_chars -gt 0 && $estimated_output_tokens -le 0 ]]; then
+    estimated_output_tokens=1
+  fi
+  tokens_json="$(printf "%s" "$tokens_json" | jq -c --argjson estimated "$estimated_output_tokens" '
+    .estimated_output_tokens = $estimated
+    | if .cache_read_input_tokens == null then .cache_read_input_tokens = 0 else . end
+    | if .cache_creation_input_tokens == null then .cache_creation_input_tokens = 0 else . end
+  ' 2>/dev/null || echo "$tokens_json")"
 
+  RESPONSE_EMITTED=true
+  local response_file=""
+  local reasoning_file=""
+  response_file="$(mktemp "${TMPDIR:-/tmp}/codex-response.XXXXXX")" || return 1
+  reasoning_file="$(mktemp "${TMPDIR:-/tmp}/codex-reasoning.XXXXXX")" || {
+    rm -f "$response_file"
+    return 1
+  }
+
+  printf "%s" "$response_text" > "$response_file"
+  printf "%s" "$reasoning_text" > "$reasoning_file"
+
+  local jq_status=0
   if [[ -n "$session_id" && -n "$extra_field_name" ]]; then
     jq -n \
-      --arg resp "$response_text" \
+      --rawfile resp "$response_file" \
       --arg sid "$session_id" \
-      --arg reasoning "$reasoning_text" \
+      --rawfile reasoning "$reasoning_file" \
       --arg extra_name "$extra_field_name" \
       --arg extra_val "$extra_field_value" \
       --argjson tokens "$tokens_json" \
@@ -264,21 +296,23 @@ emit_cli_response() {
       --arg reasoning_source "$reasoning_source" \
       --arg reasoning_absent_reason "$reasoning_absent_reason" \
       '{response: $resp, session_id: $sid, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}} + {($extra_name): $extra_val}'
+    jq_status=$?
   elif [[ -n "$session_id" ]]; then
     jq -n \
-      --arg resp "$response_text" \
+      --rawfile resp "$response_file" \
       --arg sid "$session_id" \
-      --arg reasoning "$reasoning_text" \
+      --rawfile reasoning "$reasoning_file" \
       --argjson tokens "$tokens_json" \
       --argjson available "$token_usage_available" \
       --argjson reasoning_available "$reasoning_available" \
       --arg reasoning_source "$reasoning_source" \
       --arg reasoning_absent_reason "$reasoning_absent_reason" \
       '{response: $resp, session_id: $sid, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}}'
+    jq_status=$?
   elif [[ -n "$extra_field_name" ]]; then
     jq -n \
-      --arg resp "$response_text" \
-      --arg reasoning "$reasoning_text" \
+      --rawfile resp "$response_file" \
+      --rawfile reasoning "$reasoning_file" \
       --arg extra_name "$extra_field_name" \
       --arg extra_val "$extra_field_value" \
       --argjson tokens "$tokens_json" \
@@ -287,17 +321,22 @@ emit_cli_response() {
       --arg reasoning_source "$reasoning_source" \
       --arg reasoning_absent_reason "$reasoning_absent_reason" \
       '{response: $resp, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}} + {($extra_name): $extra_val}'
+    jq_status=$?
   else
     jq -n \
-      --arg resp "$response_text" \
-      --arg reasoning "$reasoning_text" \
+      --rawfile resp "$response_file" \
+      --rawfile reasoning "$reasoning_file" \
       --argjson tokens "$tokens_json" \
       --argjson available "$token_usage_available" \
       --argjson reasoning_available "$reasoning_available" \
       --arg reasoning_source "$reasoning_source" \
       --arg reasoning_absent_reason "$reasoning_absent_reason" \
       '{response: $resp, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}}'
+    jq_status=$?
   fi
+
+  rm -f "$response_file" "$reasoning_file"
+  return $jq_status
 }
 
 emit_cli_error_response() {
@@ -305,7 +344,7 @@ emit_cli_error_response() {
   local error_type="${2:-unknown}"
   local session_id="${3:-}"
   local exit_code="${4:-1}"
-  local tokens_json='{"input_tokens":0,"output_tokens":0,"total_tokens":0,"cost_usd":0}'
+  local tokens_json='{"input_tokens":0,"output_tokens":0,"estimated_output_tokens":0,"total_tokens":0,"cost_usd":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}'
   local token_usage_available=false
   local reasoning_text=""
   local reasoning_available=false
@@ -323,7 +362,9 @@ emit_cli_error_response() {
     session_tokens="$(get_codex_session_token_usage "$session_id" 2>/dev/null || true)"
     if [[ -n "$session_tokens" ]]; then
       tokens_json="$session_tokens"
-      token_usage_available=true
+      if [[ "$(printf "%s" "$tokens_json" | jq -r '((.input_tokens + .output_tokens + .total_tokens) > 0)' 2>/dev/null || echo false)" == "true" ]]; then
+        token_usage_available=true
+      fi
     fi
 
     local session_reasoning=""
@@ -511,6 +552,73 @@ save_debug_prompt() {
 if [[ -f "$SCRIPT_DIR/lib/error_utils.sh" ]]; then
     source "$SCRIPT_DIR/lib/error_utils.sh"
 fi
+if [[ -f "$SCRIPT_DIR/lib/model_utils.sh" ]]; then
+    source "$SCRIPT_DIR/lib/model_utils.sh"
+fi
+
+MODEL_REQUESTED_RAW=""
+MODEL_RESOLUTION_NOTE=""
+MODEL_PREPARED_VALUE=""
+
+prepare_requested_model_value() {
+  local provider="${1:-}"
+  local requested="${2:-}"
+  local resolved=""
+
+  if [[ -z "${requested:-}" ]]; then
+    MODEL_PREPARED_VALUE="$requested"
+    return 0
+  fi
+
+  if ! declare -F trim_model_string >/dev/null; then
+    MODEL_PREPARED_VALUE="$requested"
+    return 0
+  fi
+
+  MODEL_REQUESTED_RAW="$(trim_model_string "$requested")"
+  if [[ -z "$MODEL_REQUESTED_RAW" ]]; then
+    MODEL_PREPARED_VALUE=""
+    return 0
+  fi
+
+  resolved="$MODEL_REQUESTED_RAW"
+  if declare -F resolve_requested_model_for_provider >/dev/null; then
+    resolved="$(resolve_requested_model_for_provider "$provider" "$MODEL_REQUESTED_RAW" 2>/dev/null || printf "%s" "$MODEL_REQUESTED_RAW")"
+  fi
+
+  if [[ "$resolved" != "$MODEL_REQUESTED_RAW" ]] && declare -F build_model_resolution_summary >/dev/null; then
+    MODEL_RESOLUTION_NOTE="$(build_model_resolution_summary "$provider" "$MODEL_REQUESTED_RAW" "$resolved" "normalized")"
+  fi
+
+  MODEL_PREPARED_VALUE="$resolved"
+}
+
+retry_with_provider_default_model() {
+  local provider="${1:-}"
+  local current_model="${2:-}"
+  local fallback=""
+
+  [[ -n "$MODEL_REQUESTED_RAW" ]] || return 1
+  declare -F default_fallback_model_for_provider >/dev/null || return 1
+
+  fallback="$(default_fallback_model_for_provider "$provider" "$current_model" 2>/dev/null || true)"
+  [[ -n "$fallback" ]] || return 1
+
+  if declare -F is_provider_default_model >/dev/null && is_provider_default_model "$fallback"; then
+    MODEL_RESOLUTION_NOTE="$(build_model_resolution_summary "$provider" "$MODEL_REQUESTED_RAW" "provider-default" "fallback")"
+    printf "%s" ""
+    return 0
+  fi
+
+  if [[ "$fallback" == "$current_model" ]]; then
+    return 1
+  fi
+
+  if declare -F build_model_resolution_summary >/dev/null; then
+    MODEL_RESOLUTION_NOTE="$(build_model_resolution_summary "$provider" "$MODEL_REQUESTED_RAW" "$fallback" "fallback")"
+  fi
+  printf "%s" "$fallback"
+}
 
 # Agent invocation mode: wrapper expects agent .md file path + optional input data
 # We must extract a single persona block, not pass the whole file.
@@ -587,7 +695,9 @@ get_codex_session_token_usage() {
   session_file="$(get_codex_session_file_by_id "$session_id" 2>/dev/null || true)"
   [[ -z "$session_file" || ! -f "$session_file" ]] && return 1
 
-  tail -n 4000 "$session_file" 2>/dev/null | jq -rc '
+  # Primary: extract from token_count events
+  local result=""
+  result="$(tail -n 4000 "$session_file" 2>/dev/null | jq -rc '
     def as_int:
       if type == "number" then floor
       elif type == "string" then (tonumber? // 0)
@@ -600,7 +710,36 @@ get_codex_session_token_usage() {
         total_tokens: ((.total_tokens // ((.input_tokens // 0) + (.output_tokens // 0) + (.reasoning_output_tokens // 0))) | as_int),
         cost_usd: 0
       }
-  ' | tail -1
+  ' | tail -1 2>/dev/null || true)"
+
+  if [[ -n "$result" ]]; then
+    printf "%s" "$result"
+    return 0
+  fi
+
+  # Fallback: extract usage from any event carrying .usage or .payload.usage fields
+  result="$(tail -n 4000 "$session_file" 2>/dev/null | jq -rc '
+    def as_int:
+      if type == "number" then floor
+      elif type == "string" then (tonumber? // 0)
+      else 0 end;
+    (.usage // .payload.usage // .payload.info.usage // .message.usage // empty) as $u
+    | select($u != null)
+    | select(($u.input_tokens // $u.prompt_tokens // 0) > 0 or ($u.output_tokens // $u.completion_tokens // 0) > 0)
+    | {
+        input_tokens: (($u.input_tokens // $u.prompt_tokens // 0) | as_int),
+        output_tokens: ((($u.output_tokens // $u.completion_tokens // 0) + ($u.reasoning_output_tokens // 0)) | as_int),
+        total_tokens: (($u.total_tokens // (($u.input_tokens // $u.prompt_tokens // 0) + ($u.output_tokens // $u.completion_tokens // 0) + ($u.reasoning_output_tokens // 0))) | as_int),
+        cost_usd: 0
+      }
+  ' | tail -1 2>/dev/null || true)"
+
+  if [[ -n "$result" ]]; then
+    printf "%s" "$result"
+    return 0
+  fi
+
+  return 1
 }
 
 get_codex_session_reasoning() {
@@ -741,6 +880,14 @@ done
 CODEX_CMD="${AUTONOM8_CODEX_CMD:-}"
 if [[ -z "$CODEX_CMD" ]]; then
   CODEX_CMD="$(resolve_codex_cmd || true)"
+fi
+
+if [[ -n "$MODEL" ]]; then
+  prepare_requested_model_value "codex" "$MODEL"
+  MODEL="$MODEL_PREPARED_VALUE"
+  if [[ -n "$MODEL_RESOLUTION_NOTE" ]]; then
+    log_info "Model resolution: $MODEL_RESOLUTION_NOTE"
+  fi
 fi
 
 # ===================
@@ -1464,15 +1611,6 @@ $TOOL_RULES
     log_verbose "Creating new session requested by caller: $MANAGE_SESSION"
   fi
 
-  # Build model argument if specified
-  MODEL_ARG=""
-  if [[ -n "$MODEL" ]]; then
-    MODEL_ARG="-m $MODEL"
-    log_verbose "Using model: $MODEL"
-  fi
-
-  log_verbose "Invoking codex CLI (WorkDir: ${WORK_DIR:-none}, Bypass: ${BYPASS_ARG:-none}, Temp: ${TEMPERATURE:-default}, Resume: ${RESUME_ARG:-none}, Model: ${MODEL_ARG:-default})"
-
   # Note: Removed --json flag because it causes streaming JSONL output which conflicts with -o flag
   # The -o flag already writes only the last message, and --output-schema enforces JSON structure
   # Redirect stdout to /dev/null to prevent duplicate output (codex writes to both file and stdout)
@@ -1499,6 +1637,15 @@ $TOOL_RULES
   # Helper: stderr redirect with optional tee for O-6 logging
   STDERR_REDIR="$TMPFILE_ERR"
 
+  CODEX_INVALID_MODEL_RETRIED=false
+  while true; do
+  MODEL_ARG=""
+  if [[ -n "$MODEL" ]]; then
+    MODEL_ARG="-m $MODEL"
+    log_verbose "Using model: $MODEL"
+  fi
+
+  log_verbose "Invoking codex CLI (WorkDir: ${WORK_DIR:-none}, Bypass: ${BYPASS_ARG:-none}, Temp: ${TEMPERATURE:-default}, Resume: ${RESUME_ARG:-none}, Model: ${MODEL_ARG:-default})"
   # Temporarily disable set -e to capture exit code properly
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
@@ -1604,6 +1751,17 @@ $TOOL_RULES
     fi
     log_verbose "Codex execution failed: $ERROR_MSG"
 
+    if [[ "$CODEX_INVALID_MODEL_RETRIED" != "true" ]] && declare -F is_invalid_model_error >/dev/null && is_invalid_model_error "$ERROR_MSG"; then
+      REQUESTED_MODEL_LABEL="${MODEL_REQUESTED_RAW:-$MODEL}"
+      CODEX_INVALID_MODEL_RETRIED=true
+      MODEL=""
+      MODEL_RESOLUTION_NOTE="codex model '$REQUESTED_MODEL_LABEL' -> 'provider-default' (fallback)"
+      log_info "Invalid model '$REQUESTED_MODEL_LABEL' for codex; retrying with provider default"
+      : > "$TMPFILE_OUTPUT"
+      : > "$TMPFILE_ERR"
+      continue
+    fi
+
     # Classify the error type
     ERROR_TYPE="unknown"
     if type classify_error &>/dev/null; then
@@ -1656,6 +1814,8 @@ $TOOL_RULES
     emit_cli_error_response "$(echo "$ERROR_MSG" | head -c 4000)" "$ERROR_TYPE" "${CODEX_SESSION_ID:-$SESSION_ID}" "$CODEX_EXIT"
     exit 1
   fi
+  break
+  done
 
   # Read the output file which should contain the last message
   RESPONSE_TEXT="$(cat "$TMPFILE_OUTPUT" 2>/dev/null | tr -d '\0')"
@@ -1671,7 +1831,11 @@ $TOOL_RULES
 
     # Wrap in CLIResponse format for Go worker
     # Include session_id if session was used or created
-    emit_cli_response "$RESPONSE_TEXT" "$CODEX_SESSION_ID" "$RESPONSE_TEXT" "" "" "$STDERR_TEXT"
+    if [[ -n "$MODEL_RESOLUTION_NOTE" ]]; then
+      emit_cli_response "$RESPONSE_TEXT" "$CODEX_SESSION_ID" "$RESPONSE_TEXT" "model_resolution" "$MODEL_RESOLUTION_NOTE" "$STDERR_TEXT"
+    else
+      emit_cli_response "$RESPONSE_TEXT" "$CODEX_SESSION_ID" "$RESPONSE_TEXT" "" "" "$STDERR_TEXT"
+    fi
   else
     # P31.5: Codex exits 0 but output is empty when API returns errors (HTTP 400/401/403).
     # Scan stderr for the actual error detail so Go code gets a meaningful message.
@@ -1693,11 +1857,15 @@ else
   # Direct invocation with text prompt
   BYPASS_ARG=""
   SANDBOX_ARG=""
+  MODEL_ARG=""
   if [[ "$YOLO_MODE" == "true" ]]; then
     BYPASS_ARG="--dangerously-bypass-approvals-and-sandbox"
     SANDBOX_ARG="--sandbox danger-full-access"
   fi
+  if [[ -n "$MODEL" ]]; then
+    MODEL_ARG="-m $MODEL"
+  fi
 
-  log_verbose "Running in direct invocation mode"
-  "$CODEX_CMD" exec $SANDBOX_ARG $BYPASS_ARG "$@"
+  log_verbose "Running in direct invocation mode (Model: ${MODEL:-default})"
+  "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG "$@"
 fi

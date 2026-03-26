@@ -5,6 +5,14 @@
 
 set -euo pipefail
 
+WRAPPER_REQ_ID="${AUTONOM8_REQUEST_ID:-${A8_REQUEST_ID:-}}"
+if [[ -n "${WRAPPER_REQ_ID}" ]]; then
+  exec 3>&2
+  exec 2> >(while IFS= read -r __a8_line; do
+    printf '[req=%s] %s\n' "${WRAPPER_REQ_ID}" "${__a8_line}" >&3
+  done)
+fi
+
 # Track child process PID for cleanup on script termination
 OPENCODE_PID=""
 TMPFILE_OUTPUT=""
@@ -142,7 +150,7 @@ emit_cli_response() {
   local extra_field_value="${5:-}"
   local stream_output="${6:-}"
 
-  local tokens_json='{"input_tokens":0,"output_tokens":0,"total_tokens":0,"cost_usd":0}'
+  local tokens_json='{"input_tokens":0,"output_tokens":0,"estimated_output_tokens":0,"total_tokens":0,"cost_usd":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}'
   local token_usage_available=false
   local reasoning_text=""
   local reasoning_available=false
@@ -184,7 +192,9 @@ emit_cli_response() {
     session_tokens="$(get_opencode_session_token_usage "$session_id" 2>/dev/null || true)"
     if [[ -n "$session_tokens" ]]; then
       tokens_json="$session_tokens"
-      token_usage_available=true
+      if [[ "$(printf "%s" "$tokens_json" | jq -r '((.input_tokens + .output_tokens + .total_tokens) > 0)' 2>/dev/null || echo false)" == "true" ]]; then
+        token_usage_available=true
+      fi
     fi
   fi
 
@@ -258,6 +268,17 @@ emit_cli_response() {
     reasoning_absent_reason="model_not_emitted"
   fi
 
+  local response_chars=${#response_text}
+  local estimated_output_tokens=$((response_chars / 4))
+  if [[ $response_chars -gt 0 && $estimated_output_tokens -le 0 ]]; then
+    estimated_output_tokens=1
+  fi
+  tokens_json="$(printf "%s" "$tokens_json" | jq -c --argjson estimated "$estimated_output_tokens" '
+    .estimated_output_tokens = $estimated
+    | if .cache_read_input_tokens == null then .cache_read_input_tokens = 0 else . end
+    | if .cache_creation_input_tokens == null then .cache_creation_input_tokens = 0 else . end
+  ' 2>/dev/null || echo "$tokens_json")"
+
   RESPONSE_EMITTED=true
 
   if [[ -n "$session_id" && -n "$extra_field_name" ]]; then
@@ -314,7 +335,7 @@ emit_cli_error_response() {
   local error_type="${2:-unknown}"
   local session_id="${3:-}"
   local exit_code="${4:-1}"
-  local tokens_json='{"input_tokens":0,"output_tokens":0,"total_tokens":0,"cost_usd":0}'
+  local tokens_json='{"input_tokens":0,"output_tokens":0,"estimated_output_tokens":0,"total_tokens":0,"cost_usd":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}'
   local token_usage_available=false
   local reasoning_text=""
   local reasoning_available=false
@@ -332,7 +353,9 @@ emit_cli_error_response() {
     session_tokens="$(get_opencode_session_token_usage "$session_id" 2>/dev/null || true)"
     if [[ -n "$session_tokens" ]]; then
       tokens_json="$session_tokens"
-      token_usage_available=true
+      if [[ "$(printf "%s" "$tokens_json" | jq -r '((.input_tokens + .output_tokens + .total_tokens) > 0)' 2>/dev/null || echo false)" == "true" ]]; then
+        token_usage_available=true
+      fi
     fi
 
     local session_reasoning=""
@@ -591,6 +614,83 @@ save_debug_prompt() {
 if [[ -f "$SCRIPT_DIR/lib/error_utils.sh" ]]; then
     source "$SCRIPT_DIR/lib/error_utils.sh"
 fi
+if [[ -f "$SCRIPT_DIR/lib/model_utils.sh" ]]; then
+    source "$SCRIPT_DIR/lib/model_utils.sh"
+fi
+
+MODEL_REQUESTED_RAW=""
+MODEL_RESOLUTION_NOTE=""
+MODEL_PREPARED_VALUE=""
+
+prepare_requested_model_value() {
+  local provider="${1:-}"
+  local requested="${2:-}"
+  local resolved=""
+
+  if [[ -z "${requested:-}" ]]; then
+    MODEL_PREPARED_VALUE="$requested"
+    return 0
+  fi
+
+  if ! declare -F trim_model_string >/dev/null; then
+    MODEL_PREPARED_VALUE="$requested"
+    return 0
+  fi
+
+  MODEL_REQUESTED_RAW="$(trim_model_string "$requested")"
+  if [[ -z "$MODEL_REQUESTED_RAW" ]]; then
+    MODEL_PREPARED_VALUE=""
+    return 0
+  fi
+
+  resolved="$MODEL_REQUESTED_RAW"
+  if [[ "$provider" == "opencode" ]]; then
+    if declare -F resolve_model_from_opencode_catalog >/dev/null; then
+      resolved="$(resolve_model_from_opencode_catalog "$MODEL_REQUESTED_RAW" 2>/dev/null || true)"
+    fi
+    if [[ -z "$resolved" ]]; then
+      resolved="$(default_fallback_model_for_provider "$provider" "" 2>/dev/null || true)"
+      if [[ -n "$resolved" ]] && declare -F build_model_resolution_summary >/dev/null; then
+        MODEL_RESOLUTION_NOTE="$(build_model_resolution_summary "$provider" "$MODEL_REQUESTED_RAW" "$resolved" "fallback")"
+      fi
+    fi
+  elif declare -F resolve_requested_model_for_provider >/dev/null; then
+    resolved="$(resolve_requested_model_for_provider "$provider" "$MODEL_REQUESTED_RAW" 2>/dev/null || printf "%s" "$MODEL_REQUESTED_RAW")"
+  fi
+
+  if [[ -z "$MODEL_RESOLUTION_NOTE" && "$resolved" != "$MODEL_REQUESTED_RAW" ]] && declare -F build_model_resolution_summary >/dev/null; then
+    MODEL_RESOLUTION_NOTE="$(build_model_resolution_summary "$provider" "$MODEL_REQUESTED_RAW" "$resolved" "normalized")"
+  fi
+
+  MODEL_PREPARED_VALUE="$resolved"
+}
+
+retry_with_provider_default_model() {
+  local provider="${1:-}"
+  local current_model="${2:-}"
+  local fallback=""
+
+  [[ -n "$MODEL_REQUESTED_RAW" ]] || return 1
+  declare -F default_fallback_model_for_provider >/dev/null || return 1
+
+  fallback="$(default_fallback_model_for_provider "$provider" "$current_model" 2>/dev/null || true)"
+  [[ -n "$fallback" ]] || return 1
+
+  if declare -F is_provider_default_model >/dev/null && is_provider_default_model "$fallback"; then
+    MODEL_RESOLUTION_NOTE="$(build_model_resolution_summary "$provider" "$MODEL_REQUESTED_RAW" "provider-default" "fallback")"
+    printf "%s" ""
+    return 0
+  fi
+
+  if [[ "$fallback" == "$current_model" ]]; then
+    return 1
+  fi
+
+  if declare -F build_model_resolution_summary >/dev/null; then
+    MODEL_RESOLUTION_NOTE="$(build_model_resolution_summary "$provider" "$MODEL_REQUESTED_RAW" "$fallback" "fallback")"
+  fi
+  printf "%s" "$fallback"
+}
 
 # Agent invocation mode: wrapper expects agent .md file path + optional input data
 # We must extract a single persona block, not pass the whole file.
@@ -730,8 +830,13 @@ done
 
 # Override OPENCODE_MODEL if MODEL flag was provided
 if [[ -n "$MODEL" ]]; then
+  prepare_requested_model_value "opencode" "$MODEL"
+  MODEL="$MODEL_PREPARED_VALUE"
   OPENCODE_MODEL="$MODEL"
   log_verbose "Model overridden via --model flag: $OPENCODE_MODEL"
+  if [[ -n "$MODEL_RESOLUTION_NOTE" ]]; then
+    log_info "Model resolution: $MODEL_RESOLUTION_NOTE"
+  fi
 fi
 
 # ===================
@@ -1239,7 +1344,11 @@ $TOOL_RULES
     fi
 
     # Wrap in CLIResponse format for Go worker (include session_id)
-    emit_cli_response "$RESPONSE_TEXT" "$OPENCODE_SESSION_ID" "$RESPONSE_TEXT" "" "" "$STDERR_TEXT"
+    if [[ -n "$MODEL_RESOLUTION_NOTE" ]]; then
+      emit_cli_response "$RESPONSE_TEXT" "$OPENCODE_SESSION_ID" "$RESPONSE_TEXT" "model_resolution" "$MODEL_RESOLUTION_NOTE" "$STDERR_TEXT"
+    else
+      emit_cli_response "$RESPONSE_TEXT" "$OPENCODE_SESSION_ID" "$RESPONSE_TEXT" "" "" "$STDERR_TEXT"
+    fi
   else
     emit_cli_error_response "No response from OpenCode CLI" "provider_error" "$OPENCODE_SESSION_ID" 1
   fi

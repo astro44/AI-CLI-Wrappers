@@ -20,7 +20,7 @@ The wrappers standardize the execution of AI agents by handling:
 | `claude.sh` | Anthropic Claude | Project-based sessions (`~/.claude/projects/`), cold start handling. |
 | `gemini.sh` | Google Gemini | Native skills registry, MCP server support, index-based sessions. |
 | `codex.sh` | OpenAI/Codex | Sandbox configuration (`danger-full-access`), playright browser support. |
-| `opencode.sh` | OpenCode | Uses `grok-code` model, optimized for fast code generation. |
+| `opencode.sh` | OpenCode | Catalog-backed model normalization/fallback, optimized for fast code generation. |
 | `cursor.sh` | Cursor Agent | Workspace-aware, beta skills support, auto-approval for MCPs. |
 
 ## Unified Interface
@@ -97,17 +97,25 @@ The wrappers print JSON to **stdout** via `emit_cli_response`. All wrappers shar
   "tokens_used": {
     "input_tokens": 1200,
     "output_tokens": 450,
+    "estimated_output_tokens": 425,
     "total_tokens": 1650,
-    "cost_usd": 0.012
+    "cost_usd": 0.012,
+    "cache_read_input_tokens": 800,
+    "cache_creation_input_tokens": 0
   },
   "metadata": {
     "token_usage_available": true,
     "reasoning_available": true,
     "reasoning_source": "session_assistant",
     "reasoning_absent_reason": "available"
-  }
+  },
+  "model_resolution": "provider model 'requested' -> 'effective' (fallback)"
 }
 ```
+
+Optional fields:
+- `"model_resolution"` when the wrapper normalized or fell back from the requested model.
+- `"skill"` for skill-oriented wrapper paths.
 
 Skill invocations include an extra `"skill": "<name>"` field. Markdown code fences are stripped automatically.
 
@@ -123,8 +131,11 @@ Returned via `emit_cli_error_response` when a provider call fails:
   "tokens_used": {
     "input_tokens": 0,
     "output_tokens": 0,
+    "estimated_output_tokens": 0,
     "total_tokens": 0,
-    "cost_usd": 0
+    "cost_usd": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0
   },
   "metadata": {
     "token_usage_available": false,
@@ -139,7 +150,26 @@ Returned via `emit_cli_error_response` when a provider call fails:
 }
 ```
 
-**Error types**: `timeout`, `quota`, `rate_limit`, `invalid_session`, `invalid_input`, `provider_error`, `unknown`. Errors marked `recoverable: true` (quota, rate_limit, timeout, invalid_session) signal to the caller that a retry or fallback is appropriate.
+**Error types**: `timeout`, `quota`, `rate_limit`, `invalid_model`, `invalid_session`, `invalid_input`, `provider_error`, `unknown`. Errors marked `recoverable: true` signal to the caller that a retry or fallback is appropriate.
+
+## Model Selection and Fallback
+
+Wrappers now harden invalid model handling locally instead of always failing the call on first contact.
+
+Behavior by provider:
+1. `cursor.sh`
+   - validates requested models against `cursor-agent models`
+   - falls back to the current/default provider model when the requested model does not exist
+2. `opencode.sh`
+   - validates requested models against `opencode models`
+   - resolves common tail aliases like `gpt-5.1` to full IDs like `openai/gpt-5.1`
+   - falls back to the provider default when needed
+3. `claude.sh`, `codex.sh`, `gemini.sh`
+   - attempt the requested model first
+   - if the provider returns an invalid-model class error, retry once with provider default
+   - `gemini.sh` additionally retries `gemini-2.5-flash` when provider-default routing hits Gemini capacity exhaustion
+
+When fallback or normalization occurs, wrappers emit `model_resolution` in the response JSON so callers can see the effective model used.
 
 ### Health Check Response
 

@@ -9,6 +9,7 @@ ERROR_AUTH="auth"
 ERROR_NETWORK="network"
 ERROR_QUOTA="quota"
 ERROR_INVALID_INPUT="invalid_input"
+ERROR_INVALID_MODEL="invalid_model"
 ERROR_PROVIDER="provider_error"
 ERROR_UNKNOWN="unknown"
 
@@ -30,6 +31,11 @@ RATE_LIMIT_PATTERNS=(
     "throttl"
     "429"
     "slow down"
+    "resource exhausted"
+    "resource_exhausted"
+    "model_capacity_exhausted"
+    "no capacity available for model"
+    "ratelimitexceeded"
 )
 
 # Auth patterns
@@ -67,6 +73,19 @@ NETWORK_PATTERNS=(
     "certificate"
 )
 
+# Invalid model patterns
+INVALID_MODEL_PATTERNS=(
+    "cannot use this model"
+    "invalid model"
+    "unknown model"
+    "model.*not found"
+    "unsupported model"
+    "no such model"
+    "unrecognized model"
+    "issue with the selected model"
+    "pick a different model"
+)
+
 # Classify an error message
 # Args: error_message
 # Returns: error classification string
@@ -102,6 +121,14 @@ classify_error() {
     for pattern in "${QUOTA_PATTERNS[@]}"; do
         if echo "$error_lower" | grep -qiE "$pattern"; then
             echo "$ERROR_QUOTA"
+            return 0
+        fi
+    done
+
+    # Check invalid model patterns
+    for pattern in "${INVALID_MODEL_PATTERNS[@]}"; do
+        if echo "$error_lower" | grep -qiE "$pattern"; then
+            echo "$ERROR_INVALID_MODEL"
             return 0
         fi
     done
