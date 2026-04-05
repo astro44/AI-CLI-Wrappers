@@ -31,6 +31,7 @@ echo "What is the current BTC price?" | ~/repos/AI-CLI-Wrappers/claude.sh \
 | `--timeout <secs>` | Max execution time |
 | `--allow-tools` | Enable web search, file ops, bash execution |
 | `--yolo` | Non-interactive mode, auto-approve all tool calls |
+| `--model <name>` | Model selection (e.g., opus, sonnet, haiku, or full model name). |
 
 **Response format** (JSON on stdout):
 ```json
@@ -66,6 +67,8 @@ echo "Generate a social media post about..." | ~/repos/AI-CLI-Wrappers/codex.sh 
 | `--yolo` | Non-interactive mode |
 | `--full-auto` | Auto-approve all actions (codex equivalent of --yolo) |
 | `--context-dir <dir>` | Workspace directory |
+| `--model <name>` | Model selection (e.g., opus, sonnet, haiku, or full model name). |
+
 
 Note: codex.sh does **not** support `--timeout` — the proxy-wrapper handles timeout enforcement externally via process group kill.
 
@@ -98,9 +101,9 @@ echo "Hello" | ~/repos/AI-CLI-Wrappers/claude.sh --yolo --timeout 30
 echo "Hello" | ~/repos/AI-CLI-Wrappers/codex.sh --yolo
 ```
 
-## Models
+## Models (*args allowed --model <Name>*)
 
 | Wrapper | Model | Subscription |
 |---------|-------|-------------|
-| claude.sh | Claude Sonnet 4.5 (`claude-sonnet-4-5-20250929`) | Anthropic Max |
+| claude.sh | Claude OPUS 4.6 (`claude-opus-4-6-20250929`) | Anthropic Max |
 | codex.sh | GPT-5.4 | ChatGPT Pro |
