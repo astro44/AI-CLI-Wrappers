@@ -105,5 +105,5 @@ echo "Hello" | ~/repos/AI-CLI-Wrappers/codex.sh --yolo
 
 | Wrapper | Model | Subscription |
 |---------|-------|-------------|
-| claude.sh | Claude OPUS 4.6 (`claude-opus-4-6-20250929`) | Anthropic Max |
+| claude.sh | Claude OPUS 4.6 (`claude-opus-4-5-20251101`) | Anthropic Max |
 | codex.sh | GPT-5.4 | ChatGPT Pro |
