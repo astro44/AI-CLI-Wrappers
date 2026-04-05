@@ -17,6 +17,7 @@ fi
 CURSOR_PID=""
 CLI_TIMEOUT=""  # Timeout in seconds, passed from Go worker
 RESPONSE_EMITTED=false
+CURSOR_INVALID_MODEL_RETRIED=false
 
 # Cleanup function to kill child processes on script termination
 cleanup() {
@@ -1314,6 +1315,14 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
     elif declare -F classify_error >/dev/null; then
       ERROR_TYPE="$(classify_error "$ERROR_MSG")"
     fi
+    if [[ "$CURSOR_INVALID_MODEL_RETRIED" != "true" ]] && [[ "$ERROR_TYPE" == "invalid_model" ]]; then
+      REQUESTED_MODEL_LABEL="${MODEL_REQUESTED_RAW:-$MODEL}"
+      CURSOR_INVALID_MODEL_RETRIED=true
+      MODEL=""
+      MODEL_RESOLUTION_NOTE="cursor model '$REQUESTED_MODEL_LABEL' -> 'provider-default' (fallback)"
+      log_info "Invalid model '$REQUESTED_MODEL_LABEL' for cursor; retrying with provider default"
+      continue
+    fi
     emit_cli_error_response "$ERROR_MSG" "$ERROR_TYPE" "" "$CURSOR_EXIT"
     exit 1
   fi
@@ -1728,6 +1737,17 @@ $TOOL_RULES
     # Cursor failed - return error with stderr
     ERROR_MSG=$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' || echo "Unknown error")
     log_verbose "Cursor execution failed: $ERROR_MSG"
+
+    if [[ "$CURSOR_INVALID_MODEL_RETRIED" != "true" ]] && declare -F is_invalid_model_error >/dev/null && is_invalid_model_error "$ERROR_MSG"; then
+      REQUESTED_MODEL_LABEL="${MODEL_REQUESTED_RAW:-$MODEL}"
+      CURSOR_INVALID_MODEL_RETRIED=true
+      MODEL=""
+      MODEL_RESOLUTION_NOTE="cursor model '$REQUESTED_MODEL_LABEL' -> 'provider-default' (fallback)"
+      log_info "Invalid model '$REQUESTED_MODEL_LABEL' for cursor; retrying with provider default"
+      : > "$TMPFILE_OUTPUT"
+      : > "$TMPFILE_ERR"
+      continue
+    fi
 
     # Check if this is an invalid session error - fail fast, don't retry
     if echo "$ERROR_MSG" | grep -qi "Invalid session identifier\|session.*not found\|session.*expired"; then

@@ -17,6 +17,14 @@ fi
 GEMINI_PID=""
 CLI_TIMEOUT=""  # Timeout in seconds, passed from Go worker
 RESPONSE_EMITTED=false
+GEMINI_SANITIZED_SETTINGS_PATHS=()
+GEMINI_SANITIZED_SETTINGS_BACKUPS=()
+GEMINI_SANITIZED_SETTINGS_MARKERS=()
+GEMINI_NODE_MAX_OLD_SPACE_SIZE_MB="${AUTONOM8_GEMINI_NODE_MAX_OLD_SPACE_SIZE_MB:-8192}"
+
+if [[ "${NODE_OPTIONS:-}" != *"max-old-space-size"* ]]; then
+  export NODE_OPTIONS="--max-old-space-size=${GEMINI_NODE_MAX_OLD_SPACE_SIZE_MB}${NODE_OPTIONS:+ ${NODE_OPTIONS}}"
+fi
 
 # Cleanup function to kill child processes on script termination
 cleanup() {
@@ -28,6 +36,7 @@ cleanup() {
   fi
   # Also kill any orphaned child processes
   pkill -P $$ 2>/dev/null || true
+  restore_gemini_workspace_settings
 }
 trap cleanup EXIT TERM INT
 
@@ -536,7 +545,8 @@ reload_gemini_skills() {
 # - "Tool xyz executed successfully" (tool confirmation messages)
 filter_gemini_info_lines() {
   local input="$1"
-  echo "$input" | grep -v \
+  echo "$input" | sed \
+    -e 's/^MCP issues detected\. Run \/mcp list for status\.//' | grep -v \
     -e '^YOLO mode is enabled' \
     -e '^Loaded cached credentials' \
     -e '^Tool .* executed' \
@@ -607,10 +617,129 @@ ensure_gemini_mcp_servers() {
         continue
       fi
       mapfile -t args < <(jq -r ".mcpServers.\"$server_name\".args[]?" "$config_path" 2>/dev/null || true)
-      gemini mcp add "$server_name" "$command" "${args[@]}" >/dev/null 2>&1 || true
+      local resolved_args=()
+      local arg=""
+      for arg in "${args[@]}"; do
+        if [[ -n "$arg" && "$arg" != /* && "$arg" != http://* && "$arg" != https://* && "$arg" != -* ]]; then
+          if [[ -e "$CORE_DIR/$arg" ]]; then
+            resolved_args+=("$CORE_DIR/$arg")
+          else
+            resolved_args+=("$arg")
+          fi
+        else
+          resolved_args+=("$arg")
+        fi
+      done
+      gemini mcp add --scope user "$server_name" "$command" "${resolved_args[@]}" >/dev/null 2>&1 || true
       log_verbose "Registered MCP server for gemini: $server_name"
     fi
   done <<< "$server_names"
+}
+
+normalize_gemini_settings_file_if_needed() {
+  local settings_path="${1:-}"
+  [[ -f "$settings_path" ]] || return 0
+
+  local browser_verify_entry
+  browser_verify_entry="$(jq -r '.mcpServers["browser-verify"].args[0] // empty' "$settings_path" 2>/dev/null || true)"
+  if [[ -z "$browser_verify_entry" || "$browser_verify_entry" == /* ]]; then
+    return 0
+  fi
+
+  local resolved_browser_verify="$CORE_DIR/$browser_verify_entry"
+  if [[ ! -e "$resolved_browser_verify" ]]; then
+    return 0
+  fi
+
+  local temp_path=""
+  temp_path="$(mktemp "${settings_path}.autonom8.normalize.XXXXXX.tmp")"
+  if ! jq --arg resolved "$resolved_browser_verify" '
+      if (.mcpServers["browser-verify"].args[0] // empty) != "" then
+        .mcpServers["browser-verify"].args[0] = $resolved
+      else
+        .
+      end
+    ' "$settings_path" > "$temp_path" 2>/dev/null; then
+    rm -f "$temp_path"
+    return 0
+  fi
+
+  if ! cmp -s "$settings_path" "$temp_path"; then
+    mv "$temp_path" "$settings_path"
+    log_verbose "Normalized Gemini browser-verify MCP path in settings: $settings_path"
+  else
+    rm -f "$temp_path"
+  fi
+}
+
+sanitize_gemini_settings_file_if_needed() {
+  local settings_path="${1:-}"
+  [[ -f "$settings_path" ]] || return 0
+
+  local marker_path="${settings_path}.autonom8.mcp_isolated"
+  if [[ -f "$marker_path" ]]; then
+    log_verbose "Gemini settings already sanitized by another invocation: $settings_path"
+    return 0
+  fi
+
+  local backup_path=""
+  local temp_path=""
+  backup_path="$(mktemp "${settings_path}.autonom8.XXXXXX.bak")"
+  temp_path="$(mktemp "${settings_path}.autonom8.XXXXXX.tmp")"
+
+  cp "$settings_path" "$backup_path"
+  if ! jq 'del(.mcpServers)' "$settings_path" > "$temp_path" 2>/dev/null; then
+    rm -f "$backup_path" "$temp_path"
+    log_verbose "Failed to sanitize Gemini settings, leaving original in place: $settings_path"
+    return 0
+  fi
+
+  mv "$temp_path" "$settings_path"
+  printf '%s\n' "$backup_path" > "$marker_path"
+
+  GEMINI_SANITIZED_SETTINGS_PATHS+=("$settings_path")
+  GEMINI_SANITIZED_SETTINGS_BACKUPS+=("$backup_path")
+  GEMINI_SANITIZED_SETTINGS_MARKERS+=("$marker_path")
+  log_verbose "Sanitized Gemini settings for non-tools invocation: $settings_path"
+}
+
+quarantine_gemini_workspace_settings_if_needed() {
+  local workspace_dir="${1:-}"
+  local allow_tools="${2:-false}"
+
+  if [[ -n "$workspace_dir" ]]; then
+    normalize_gemini_settings_file_if_needed "$workspace_dir/.gemini/settings.json"
+  fi
+  if [[ -n "${HOME:-}" ]]; then
+    normalize_gemini_settings_file_if_needed "$HOME/.gemini/settings.json"
+  fi
+
+  [[ "$allow_tools" == "true" ]] && return 0
+
+  if [[ -n "$workspace_dir" ]]; then
+    sanitize_gemini_settings_file_if_needed "$workspace_dir/.gemini/settings.json"
+  fi
+  if [[ -n "${HOME:-}" ]]; then
+    sanitize_gemini_settings_file_if_needed "$HOME/.gemini/settings.json"
+  fi
+}
+
+restore_gemini_workspace_settings() {
+  local idx
+  for (( idx=${#GEMINI_SANITIZED_SETTINGS_PATHS[@]}-1; idx>=0; idx-- )); do
+    local settings_path="${GEMINI_SANITIZED_SETTINGS_PATHS[$idx]}"
+    local backup_path="${GEMINI_SANITIZED_SETTINGS_BACKUPS[$idx]}"
+    local marker_path="${GEMINI_SANITIZED_SETTINGS_MARKERS[$idx]}"
+    if [[ -f "$backup_path" ]]; then
+      mkdir -p "$(dirname "$settings_path")" 2>/dev/null || true
+      mv -f "$backup_path" "$settings_path" 2>/dev/null || true
+      log_verbose "Restored Gemini settings: $settings_path"
+    fi
+    rm -f "$marker_path" 2>/dev/null || true
+  done
+  GEMINI_SANITIZED_SETTINGS_PATHS=()
+  GEMINI_SANITIZED_SETTINGS_BACKUPS=()
+  GEMINI_SANITIZED_SETTINGS_MARKERS=()
 }
 
 # Determine core directory based on script location
@@ -1293,6 +1422,7 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
     GEMINI_ARGS+=("--yolo")
   fi
 
+  quarantine_gemini_workspace_settings_if_needed "$PWD" "$ALLOW_TOOLS"
   log_verbose "Invoking gemini CLI for skill (Tenant: ${TENANT_DIR:-none}, Model: ${MODEL:-default})"
 
   set +e
@@ -1658,6 +1788,7 @@ $TOOL_RULES
 
   # Ensure agent-mode execution occurs from resolved workspace root.
   if [[ -n "$WORKSPACE_DIR" && -d "$WORKSPACE_DIR" ]]; then
+    quarantine_gemini_workspace_settings_if_needed "$WORKSPACE_DIR" "$ALLOW_TOOLS"
     cd "$WORKSPACE_DIR"
   fi
 
@@ -1705,8 +1836,7 @@ $TOOL_RULES
     GEMINI_ARGS+=("--include-directories" "$CORE_DIR")
   fi
   if [[ -n "$TEMPERATURE" ]]; then
-    GEMINI_ARGS+=("--temp" "$TEMPERATURE")
-    log_verbose "Temperature specified: $TEMPERATURE (via --temp flag)"
+    log_verbose "Temperature specified: $TEMPERATURE (Gemini CLI currently has no temperature flag; skipping pass-through)"
   fi
   if [[ -n "$MODEL" ]]; then
     GEMINI_ARGS+=("-m" "$MODEL")

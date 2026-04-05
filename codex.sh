@@ -1117,13 +1117,18 @@ if [[ "$DRY_RUN" == "true" ]]; then
   # Session handling for skills (same as agent mode)
   # SESSION_ID comes from --resume flag if resuming previous session
   RESUME_ARG=""
+  CODEX_SESSION_ID=""
   if [[ -n "$SESSION_ID" ]]; then
     if validate_codex_session "$SESSION_ID"; then
       RESUME_ARG="resume $SESSION_ID"
+      CODEX_SESSION_ID="$SESSION_ID"
       log_verbose "Skill resuming session: $SESSION_ID"
     else
       log_verbose "Skill session $SESSION_ID not found, starting fresh"
     fi
+  elif [[ -n "$MANAGE_SESSION" ]]; then
+    CODEX_SESSION_ID="$MANAGE_SESSION"
+    log_verbose "Skill creating new managed session requested by caller: $MANAGE_SESSION"
   fi
 
   # Build model argument if specified
@@ -1174,9 +1179,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
   CODEX_EXIT=$?
   set -e
 
-  # Capture session ID created by codex (for session continuity)
-  CODEX_SESSION_ID=""
-  if [[ $CODEX_EXIT -eq 0 ]]; then
+  if [[ $CODEX_EXIT -eq 0 && -z "$CODEX_SESSION_ID" ]]; then
     CODEX_SESSION_ID="$(get_latest_codex_session)"
     if [[ -n "$CODEX_SESSION_ID" ]]; then
       log_verbose "Skill session created: $CODEX_SESSION_ID"
@@ -1726,13 +1729,8 @@ $TOOL_RULES
     wc -c < "$TMPFILE_OUTPUT" | xargs -I{} echo "{}" >> "$AGENT_LOG"
   fi
 
-  # Capture session ID if new session was created (always capture for fresh calls)
-  if [[ -z "$CODEX_SESSION_ID" && $CODEX_EXIT -eq 0 ]]; then
-    CODEX_SESSION_ID="$(get_latest_codex_session)"
-    if [[ -n "$CODEX_SESSION_ID" ]]; then
-      log_verbose "New session created: $CODEX_SESSION_ID"
-    fi
-  fi
+  # Only emit a session ID when the caller explicitly opted into session management.
+  # Fresh unmanaged calls must not inherit the latest global Codex session ID.
 
   if [[ $CODEX_EXIT -ne 0 ]]; then
     # P6.1: Standardized error handling
