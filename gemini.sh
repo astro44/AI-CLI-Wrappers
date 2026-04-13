@@ -1330,16 +1330,17 @@ if [[ -n "$SKILL_NAME" ]]; then
   # Gather input data from remaining args or stdin
   SKILL_INPUT="$(parse_arg_json_or_stdin "$@")"
 
-  # Resolve skill file path - check multiple locations
-  # Skills use Agent Skills Standard format: skills/skill-name/SKILL.md
-  # Priority: .gemini/skills (project) > modules/Autonom8-Agents (canonical) > other providers
+  # Resolve skill file path using a shared lookup order.
+  # Shared canonical skills stay first; provider-local copies are fallbacks.
   SKILL_FILE=""
   SKILL_LOCATIONS=(
-    "$CORE_DIR/.gemini/skills/${SKILL_NAME}/SKILL.md"
     "$CORE_DIR/modules/Autonom8-Agents/skills/${SKILL_NAME}/SKILL.md"
     "$CORE_DIR/.claude/skills/${SKILL_NAME}/SKILL.md"
     "$CORE_DIR/.codex/skills/${SKILL_NAME}/SKILL.md"
     "$CORE_DIR/.cursor/skills/${SKILL_NAME}/SKILL.md"
+    "$CORE_DIR/.gemini/skills/${SKILL_NAME}/SKILL.md"
+    "$CORE_DIR/modules/Autonom8-Agents/.opencode/skills/${SKILL_NAME}/SKILL.md"
+    "$CORE_DIR/.claude/commands/${SKILL_NAME}.md"
   )
 
   for loc in "${SKILL_LOCATIONS[@]}"; do
@@ -1795,6 +1796,7 @@ $TOOL_RULES
   # Add session args for session persistence
   # --session-id: Resume existing session (Gemini uses index-based sessions)
   # --manage-session: Create new session (we'll get the actual index after running)
+  GEMINI_SESSION_ARGS=()
   GEMINI_SESSION_ID=""
   CREATING_NEW_SESSION=false
 
@@ -1802,7 +1804,7 @@ $TOOL_RULES
     # Validate session exists before attempting to resume
     # Gemini sessions are scoped to working directory
     if validate_gemini_session "$SESSION_ID" "$PWD"; then
-      GEMINI_ARGS+=("--resume" "$SESSION_ID")
+      GEMINI_SESSION_ARGS+=("--resume" "$SESSION_ID")
       GEMINI_SESSION_ID="$SESSION_ID"
       log_verbose "Resuming session: $SESSION_ID"
     else
@@ -1812,11 +1814,10 @@ $TOOL_RULES
     fi
   elif [[ -n "$MANAGE_SESSION" ]]; then
     # For new sessions, Gemini auto-creates when we don't use --resume.
-    # Track the caller-provided managed session ID deterministically so
-    # parallel lanes don't race on "latest session" lookup.
+    # Discover the provider-real Gemini session after a successful run instead
+    # of persisting the caller-managed logical ID as if it were provider-native.
     CREATING_NEW_SESSION=true
-    GEMINI_SESSION_ID="$MANAGE_SESSION"
-    log_verbose "Creating new managed session (tracking ID: $GEMINI_SESSION_ID)"
+    log_verbose "Creating new managed session requested by caller: $MANAGE_SESSION (discovering provider-real Gemini session after successful run)"
   fi
 
   # Check if gemini supports -o flag and schema (similar to claude/codex)
@@ -1853,16 +1854,16 @@ $TOOL_RULES
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
     log_verbose "Running gemini with timeout: ${CLI_TIMEOUT}s"
     if [[ -n "$AGENT_LOG" ]]; then
-      cat "$TMPFILE_PROMPT" | run_with_timeout "$CLI_TIMEOUT" gemini "${GEMINI_ARGS[@]}" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
+      cat "$TMPFILE_PROMPT" | run_with_timeout "$CLI_TIMEOUT" gemini "${GEMINI_SESSION_ARGS[@]}" "${GEMINI_ARGS[@]}" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
     else
-      cat "$TMPFILE_PROMPT" | run_with_timeout "$CLI_TIMEOUT" gemini "${GEMINI_ARGS[@]}" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+      cat "$TMPFILE_PROMPT" | run_with_timeout "$CLI_TIMEOUT" gemini "${GEMINI_SESSION_ARGS[@]}" "${GEMINI_ARGS[@]}" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
     fi
     GEMINI_EXIT=$?
   else
     if [[ -n "$AGENT_LOG" ]]; then
-      cat "$TMPFILE_PROMPT" | gemini "${GEMINI_ARGS[@]}" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
+      cat "$TMPFILE_PROMPT" | gemini "${GEMINI_SESSION_ARGS[@]}" "${GEMINI_ARGS[@]}" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
     else
-      cat "$TMPFILE_PROMPT" | gemini "${GEMINI_ARGS[@]}" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+      cat "$TMPFILE_PROMPT" | gemini "${GEMINI_SESSION_ARGS[@]}" "${GEMINI_ARGS[@]}" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
     fi
     GEMINI_EXIT=$?
   fi

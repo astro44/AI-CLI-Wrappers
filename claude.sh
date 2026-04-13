@@ -47,18 +47,6 @@ resolve_claude_cmd() {
     return 0
   done < <(which -a claude 2>/dev/null | awk '!seen[$0]++')
 
-  # Static fallback for environments without full PATH (e.g. OpenClaw exec)
-  for fallback in /opt/homebrew/bin/claude /usr/local/bin/claude; do
-    if [[ -x "$fallback" ]]; then
-      local fb_resolved=""
-      fb_resolved="$(cd "$(dirname "$fallback")" 2>/dev/null && pwd -P)/$(basename "$fallback")"
-      if [[ "$fb_resolved" != "$wrapper_path" ]]; then
-        echo "$fallback"
-        return 0
-      fi
-    fi
-  done
-
   return 1
 }
 
@@ -1188,13 +1176,16 @@ if [[ -n "$SKILL_NAME" ]]; then
   # Gather input data from remaining args or stdin
   SKILL_INPUT="$(parse_arg_json_or_stdin "$@")"
 
-  # Resolve skill file path - check multiple locations
-  # Skills use Agent Skills Standard format: skills/skill-name/SKILL.md
+  # Resolve skill file path using a shared lookup order.
+  # Shared canonical skills stay first; provider-local copies are fallbacks.
   SKILL_FILE=""
   SKILL_LOCATIONS=(
     "$CORE_DIR/modules/Autonom8-Agents/skills/${SKILL_NAME}/SKILL.md"
     "$CORE_DIR/.claude/skills/${SKILL_NAME}/SKILL.md"
     "$CORE_DIR/.codex/skills/${SKILL_NAME}/SKILL.md"
+    "$CORE_DIR/.cursor/skills/${SKILL_NAME}/SKILL.md"
+    "$CORE_DIR/.gemini/skills/${SKILL_NAME}/SKILL.md"
+    "$CORE_DIR/modules/Autonom8-Agents/.opencode/skills/${SKILL_NAME}/SKILL.md"
     "$CORE_DIR/.claude/commands/${SKILL_NAME}.md"
   )
 

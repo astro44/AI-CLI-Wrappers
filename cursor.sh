@@ -1190,22 +1190,24 @@ fi
 # ===================
 # Skill Execution Mode
 # ===================
-# Cursor supports Agent Skills Standard via .cursor/skills/ directory
-# Skills are also discoverable from .claude/skills/ and .codex/skills/ (cross-provider compatibility)
+# Cursor supports shared canonical skills plus provider-local synced copies.
 if [[ -n "$SKILL_NAME" ]]; then
   log_verbose "Skill mode: invoking /$SKILL_NAME"
 
   # Gather input data from remaining args or stdin
   SKILL_INPUT="$(parse_arg_json_or_stdin "$@")"
 
-  # Resolve skill file path - check multiple locations (Agent Skills Standard)
-  # Priority: .cursor/skills > canonical source > cross-provider compatibility
+  # Resolve skill file path using a shared lookup order.
+  # Shared canonical skills stay first; provider-local copies are fallbacks.
   SKILL_FILE=""
   SKILL_LOCATIONS=(
-    "$CORE_DIR/.cursor/skills/${SKILL_NAME}/SKILL.md"
     "$CORE_DIR/modules/Autonom8-Agents/skills/${SKILL_NAME}/SKILL.md"
     "$CORE_DIR/.claude/skills/${SKILL_NAME}/SKILL.md"
     "$CORE_DIR/.codex/skills/${SKILL_NAME}/SKILL.md"
+    "$CORE_DIR/.cursor/skills/${SKILL_NAME}/SKILL.md"
+    "$CORE_DIR/.gemini/skills/${SKILL_NAME}/SKILL.md"
+    "$CORE_DIR/modules/Autonom8-Agents/.opencode/skills/${SKILL_NAME}/SKILL.md"
+    "$CORE_DIR/.claude/commands/${SKILL_NAME}.md"
     "$HOME/.cursor/skills/${SKILL_NAME}/SKILL.md"
   )
 

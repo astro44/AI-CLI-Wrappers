@@ -47,18 +47,6 @@ resolve_codex_cmd() {
     return 0
   done < <(which -a codex 2>/dev/null | awk '!seen[$0]++')
 
-  # Static fallback for environments without full PATH (e.g. OpenClaw exec)
-  for fallback in /opt/homebrew/bin/codex /usr/local/bin/codex; do
-    if [[ -x "$fallback" ]]; then
-      local fb_resolved=""
-      fb_resolved="$(cd "$(dirname "$fallback")" 2>/dev/null && pwd -P)/$(basename "$fallback")"
-      if [[ "$fb_resolved" != "$wrapper_path" ]]; then
-        echo "$fallback"
-        return 0
-      fi
-    fi
-  done
-
   return 1
 }
 
@@ -774,8 +762,18 @@ get_latest_codex_session() {
   # Session ID is the UUID at the end of the filename (36 chars: 8-4-4-4-12)
   if [[ -d "$HOME/.codex/sessions" ]]; then
     local latest_file
-    latest_file=$(find "$HOME/.codex/sessions" -name "rollout-*.jsonl" -type f -print0 2>/dev/null | \
-      xargs -0 ls -t 2>/dev/null | head -1)
+    latest_file="$(
+      find "$HOME/.codex/sessions" -name "rollout-*.jsonl" -type f -print0 2>/dev/null | \
+      while IFS= read -r -d '' file; do
+        local mtime=""
+        if mtime="$(stat -f '%m' "$file" 2>/dev/null)"; then
+          :
+        else
+          mtime="$(stat -c '%Y' "$file" 2>/dev/null || true)"
+        fi
+        [[ -n "$mtime" ]] && printf '%s\t%s\n' "$mtime" "$file"
+      done | sort -nr | head -1 | cut -f2-
+    )"
     if [[ -n "$latest_file" ]]; then
       # Extract session ID (last 36 chars before .jsonl)
       local basename="${latest_file##*/}"
@@ -1046,13 +1044,16 @@ if [[ -n "$SKILL_NAME" ]]; then
   # Gather input data from remaining args or stdin
   SKILL_INPUT="$(parse_arg_json_or_stdin "$@")"
 
-  # Resolve skill file path - check multiple locations
-  # Skills use Agent Skills Standard format: skills/skill-name/SKILL.md
+  # Resolve skill file path using a shared lookup order.
+  # Shared canonical skills stay first; provider-local copies are fallbacks.
   SKILL_FILE=""
   SKILL_LOCATIONS=(
     "$CORE_DIR/modules/Autonom8-Agents/skills/${SKILL_NAME}/SKILL.md"
-    "$CORE_DIR/.codex/skills/${SKILL_NAME}/SKILL.md"
     "$CORE_DIR/.claude/skills/${SKILL_NAME}/SKILL.md"
+    "$CORE_DIR/.codex/skills/${SKILL_NAME}/SKILL.md"
+    "$CORE_DIR/.cursor/skills/${SKILL_NAME}/SKILL.md"
+    "$CORE_DIR/.gemini/skills/${SKILL_NAME}/SKILL.md"
+    "$CORE_DIR/modules/Autonom8-Agents/.opencode/skills/${SKILL_NAME}/SKILL.md"
     "$CORE_DIR/.claude/commands/${SKILL_NAME}.md"
   )
 
@@ -1128,19 +1129,26 @@ if [[ "$DRY_RUN" == "true" ]]; then
 
   # Session handling for skills (same as agent mode)
   # SESSION_ID comes from --resume flag if resuming previous session
-  RESUME_ARG=""
+  RESUME_SESSION_ID=""
   CODEX_SESSION_ID=""
+  EPHEMERAL_ARG=""
+  ALLOW_SESSION_DISCOVERY="true"
   if [[ -n "$SESSION_ID" ]]; then
     if validate_codex_session "$SESSION_ID"; then
-      RESUME_ARG="resume $SESSION_ID"
+      RESUME_SESSION_ID="$SESSION_ID"
       CODEX_SESSION_ID="$SESSION_ID"
       log_verbose "Skill resuming session: $SESSION_ID"
     else
       log_verbose "Skill session $SESSION_ID not found, starting fresh"
     fi
   elif [[ -n "$MANAGE_SESSION" ]]; then
-    CODEX_SESSION_ID="$MANAGE_SESSION"
-    log_verbose "Skill creating new managed session requested by caller: $MANAGE_SESSION"
+    # codex exec does not accept a caller-supplied session UUID for fresh skill
+    # runs. When a managed fresh session is requested, force an ephemeral exec so
+    # the wrapper cannot silently reattach ambient global state or claim a
+    # provider-backed session ID it cannot prove.
+    EPHEMERAL_ARG="--ephemeral"
+    ALLOW_SESSION_DISCOVERY="false"
+    log_verbose "Skill creating managed logical session requested by caller: $MANAGE_SESSION (running codex exec ephemerally)"
   fi
 
   # Build model argument if specified
@@ -1150,7 +1158,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
     log_verbose "Using model: $MODEL"
   fi
 
-  log_verbose "Invoking codex CLI for skill (WorkDir: ${WORK_DIR:-none}, Resume: ${RESUME_ARG:-none}, Model: ${MODEL_ARG:-default})"
+  log_verbose "Invoking codex CLI for skill (WorkDir: ${WORK_DIR:-none}, Resume: ${RESUME_SESSION_ID:-none}, Model: ${MODEL_ARG:-default})"
 
   # Export CODEX_SANDBOX so Playwright skips WebKit and Firefox (crashes in sandbox)
   export CODEX_SANDBOX=1
@@ -1160,38 +1168,38 @@ if [[ "$DRY_RUN" == "true" ]]; then
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
     if [[ -n "$WORK_DIR" ]]; then
-      if [[ -n "$RESUME_ARG" ]]; then
+      if [[ -n "$RESUME_SESSION_ID" ]]; then
         # Resume mode: --sandbox/-o not supported, capture stdout directly with '-' for stdin prompt
-        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR")
+        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR")
       else
-        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null)
+        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $EPHEMERAL_ARG $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null)
       fi
     else
-      if [[ -n "$RESUME_ARG" ]]; then
-        echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR"
+      if [[ -n "$RESUME_SESSION_ID" ]]; then
+        echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR"
       else
-        echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null
+        echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $EPHEMERAL_ARG $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null
       fi
     fi
   else
     if [[ -n "$WORK_DIR" ]]; then
-      if [[ -n "$RESUME_ARG" ]]; then
-        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR")
+      if [[ -n "$RESUME_SESSION_ID" ]]; then
+        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR")
       else
-        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null)
+        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $EPHEMERAL_ARG $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null)
       fi
     else
-      if [[ -n "$RESUME_ARG" ]]; then
-        echo "$SKILL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR"
+      if [[ -n "$RESUME_SESSION_ID" ]]; then
+        echo "$SKILL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR"
       else
-        echo "$SKILL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null
+        echo "$SKILL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $EPHEMERAL_ARG $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null
       fi
     fi
   fi
   CODEX_EXIT=$?
   set -e
 
-  if [[ $CODEX_EXIT -eq 0 && -z "$CODEX_SESSION_ID" ]]; then
+  if [[ $CODEX_EXIT -eq 0 && -z "$CODEX_SESSION_ID" && "$ALLOW_SESSION_DISCOVERY" == "true" ]]; then
     CODEX_SESSION_ID="$(get_latest_codex_session)"
     if [[ -n "$CODEX_SESSION_ID" ]]; then
       log_verbose "Skill session created: $CODEX_SESSION_ID"
@@ -1608,22 +1616,26 @@ $TOOL_RULES
   # Session handling for Codex
   # Sessions stored in ~/.codex/sessions/<session_id>/
   # Resume with: "$CODEX_CMD" exec resume "$SESSION_ID" or codex resume "$SESSION_ID"
-  RESUME_ARG=""
+  RESUME_SESSION_ID=""
   CODEX_SESSION_ID=""
+  DISCOVER_MANAGED_CODEX_SESSION=false
+  PREEXEC_CODEX_SESSION_ID=""
 
   if [[ -n "$SESSION_ID" ]]; then
     # Validate session exists
     if validate_codex_session "$SESSION_ID"; then
-      RESUME_ARG="resume $SESSION_ID"
+      RESUME_SESSION_ID="$SESSION_ID"
       CODEX_SESSION_ID="$SESSION_ID"
       log_verbose "Resuming session: $SESSION_ID"
     else
       log_verbose "Session $SESSION_ID not found in ~/.codex/sessions/, starting fresh"
     fi
   elif [[ -n "$MANAGE_SESSION" ]]; then
-    # New session requested by caller; retain explicit request ID for error/cancel attribution.
-    CODEX_SESSION_ID="$MANAGE_SESSION"
-    log_verbose "Creating new session requested by caller: $MANAGE_SESSION"
+    # New session requested by caller. Discover the provider-real rollout session
+    # after a successful run instead of persisting the caller-managed logical ID.
+    DISCOVER_MANAGED_CODEX_SESSION=true
+    PREEXEC_CODEX_SESSION_ID="$(get_latest_codex_session 2>/dev/null || true)"
+    log_verbose "Creating new session requested by caller: $MANAGE_SESSION (discovering provider-real Codex session after successful run)"
   fi
 
   # Note: Removed --json flag because it causes streaming JSONL output which conflicts with -o flag
@@ -1660,17 +1672,17 @@ $TOOL_RULES
     log_verbose "Using model: $MODEL"
   fi
 
-  log_verbose "Invoking codex CLI (WorkDir: ${WORK_DIR:-none}, Bypass: ${BYPASS_ARG:-none}, Temp: ${TEMPERATURE:-default}, Resume: ${RESUME_ARG:-none}, Model: ${MODEL_ARG:-default})"
+  log_verbose "Invoking codex CLI (WorkDir: ${WORK_DIR:-none}, Bypass: ${BYPASS_ARG:-none}, Temp: ${TEMPERATURE:-default}, Resume: ${RESUME_SESSION_ID:-none}, Model: ${MODEL_ARG:-default})"
   # Temporarily disable set -e to capture exit code properly
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
     log_verbose "Running codex with timeout: ${CLI_TIMEOUT}s"
     if [[ -n "$WORK_DIR" ]]; then
-      if [[ -n "$RESUME_ARG" ]]; then
+      if [[ -n "$RESUME_SESSION_ID" ]]; then
         if [[ -n "$AGENT_LOG" ]]; then
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR"))
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR"))
         else
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR")
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR")
         fi
       else
         if [[ -n "$AGENT_LOG" ]]; then
@@ -1681,11 +1693,11 @@ $TOOL_RULES
       fi
       CODEX_EXIT=$?
     else
-      if [[ -n "$RESUME_ARG" ]]; then
+      if [[ -n "$RESUME_SESSION_ID" ]]; then
         if [[ -n "$AGENT_LOG" ]]; then
-          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR")
+          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR")
         else
-          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR"
+          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR"
         fi
       else
         if [[ -n "$AGENT_LOG" ]]; then
@@ -1698,11 +1710,11 @@ $TOOL_RULES
     fi
   else
     if [[ -n "$WORK_DIR" ]]; then
-      if [[ -n "$RESUME_ARG" ]]; then
+      if [[ -n "$RESUME_SESSION_ID" ]]; then
         if [[ -n "$AGENT_LOG" ]]; then
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR"))
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR"))
         else
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR")
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR")
         fi
       else
         if [[ -n "$AGENT_LOG" ]]; then
@@ -1713,11 +1725,11 @@ $TOOL_RULES
       fi
       CODEX_EXIT=$?
     else
-      if [[ -n "$RESUME_ARG" ]]; then
+      if [[ -n "$RESUME_SESSION_ID" ]]; then
         if [[ -n "$AGENT_LOG" ]]; then
-          echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR")
+          echo "$FULL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR")
         else
-          echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $RESUME_ARG $BYPASS_ARG - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR"
+          echo "$FULL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR"
         fi
       else
         if [[ -n "$AGENT_LOG" ]]; then
@@ -1743,6 +1755,15 @@ $TOOL_RULES
 
   # Only emit a session ID when the caller explicitly opted into session management.
   # Fresh unmanaged calls must not inherit the latest global Codex session ID.
+  if [[ $CODEX_EXIT -eq 0 && -z "$CODEX_SESSION_ID" && "$DISCOVER_MANAGED_CODEX_SESSION" == "true" ]]; then
+    DISCOVERED_CODEX_SESSION_ID="$(get_latest_codex_session 2>/dev/null || true)"
+    if [[ -n "$DISCOVERED_CODEX_SESSION_ID" && ( -z "$PREEXEC_CODEX_SESSION_ID" || "$DISCOVERED_CODEX_SESSION_ID" != "$PREEXEC_CODEX_SESSION_ID" ) ]]; then
+      CODEX_SESSION_ID="$DISCOVERED_CODEX_SESSION_ID"
+      log_verbose "Discovered provider-real Codex session: $CODEX_SESSION_ID"
+    else
+      log_verbose "Could not determine new provider-real Codex session id after successful fresh run"
+    fi
+  fi
 
   if [[ $CODEX_EXIT -ne 0 ]]; then
     # P6.1: Standardized error handling
