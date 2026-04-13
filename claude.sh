@@ -47,6 +47,18 @@ resolve_claude_cmd() {
     return 0
   done < <(which -a claude 2>/dev/null | awk '!seen[$0]++')
 
+  # Static fallback for environments without full PATH (e.g. OpenClaw exec)
+  for fallback in /opt/homebrew/bin/claude /usr/local/bin/claude; do
+    if [[ -x "$fallback" ]]; then
+      local fb_resolved=""
+      fb_resolved="$(cd "$(dirname "$fallback")" 2>/dev/null && pwd -P)/$(basename "$fallback")"
+      if [[ "$fb_resolved" != "$wrapper_path" ]]; then
+        echo "$fallback"
+        return 0
+      fi
+    fi
+  done
+
   return 1
 }
 
