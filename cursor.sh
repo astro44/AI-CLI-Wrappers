@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # Cursor CLI wrapper for Autonom8
-# Configures workspace and invokes cursor-agent CLI with proper context and permissions
+# Configures workspace and invokes the Cursor Agent CLI with proper context and permissions.
+# Resolves, in order:
+#   1. AUTONOM8_CURSOR_AGENT or CURSOR_AGENT_BIN_OVERRIDE — full path to the real binary (optional)
+#   2. cursor-agent — legacy / alternate install name on PATH
+#   3. agent — official Cursor CLI (https://cursor.com/docs/cli/overview), verified not to be another tool named agent
 # Updated to support --dry-run and --verbose (v2.1)
 
 set -euo pipefail
 
 WRAPPER_REQ_ID="${AUTONOM8_REQUEST_ID:-${A8_REQUEST_ID:-}}"
+exec 3>&2
 if [[ -n "${WRAPPER_REQ_ID}" ]]; then
-  exec 3>&2
   exec 2> >(while IFS= read -r __a8_line; do
     printf '[req=%s] %s\n' "${WRAPPER_REQ_ID}" "${__a8_line}" >&3
   done)
@@ -32,14 +36,38 @@ cleanup() {
 }
 trap cleanup EXIT TERM INT
 
+# True if this executable is Cursor's agent CLI (avoids picking an unrelated "agent" on PATH).
+is_cursor_agent_executable() {
+  local bin="$1"
+  [[ -n "$bin" && -x "$bin" ]] || return 1
+  case "$(basename "$bin")" in
+    cursor-agent) return 0 ;;
+  esac
+  if "$bin" --version 2>&1 | grep -qiE 'cursor'; then
+    return 0
+  fi
+  if "$bin" about 2>&1 | grep -qiE 'cursor'; then
+    return 0
+  fi
+  return 1
+}
+
 resolve_cursor_agent_cmd() {
   local wrapper_path=""
   wrapper_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
 
+  local override=""
+  for override in "${AUTONOM8_CURSOR_AGENT:-}" "${CURSOR_AGENT_BIN_OVERRIDE:-}"; do
+    if [[ -n "$override" && -x "$override" ]]; then
+      echo "$override"
+      return 0
+    fi
+  done
+
   local candidate=""
+  local resolved=""
   while IFS= read -r candidate; do
     [[ -z "$candidate" ]] && continue
-    local resolved=""
     resolved="$(cd "$(dirname "$candidate")" 2>/dev/null && pwd -P)/$(basename "$candidate")"
     if [[ "$resolved" == "$wrapper_path" ]]; then
       continue
@@ -47,6 +75,31 @@ resolve_cursor_agent_cmd() {
     echo "$candidate"
     return 0
   done < <(which -a cursor-agent 2>/dev/null | awk '!seen[$0]++')
+
+  while IFS= read -r candidate; do
+    [[ -z "$candidate" ]] && continue
+    resolved="$(cd "$(dirname "$candidate")" 2>/dev/null && pwd -P)/$(basename "$candidate")"
+    if [[ "$resolved" == "$wrapper_path" ]]; then
+      continue
+    fi
+    if is_cursor_agent_executable "$resolved"; then
+      echo "$candidate"
+      return 0
+    fi
+  done < <(which -a agent 2>/dev/null | awk '!seen[$0]++')
+
+  # Official installer often places the binary here before ~/.local/bin is on PATH
+  for candidate in "${HOME}/.local/bin/cursor-agent" "${HOME}/.local/bin/agent"; do
+    [[ -z "${HOME:-}" || ! -x "$candidate" ]] && continue
+    resolved="$(cd "$(dirname "$candidate")" && pwd -P)/$(basename "$candidate")"
+    if [[ "$resolved" == "$wrapper_path" ]]; then
+      continue
+    fi
+    if is_cursor_agent_executable "$resolved" || [[ "$(basename "$candidate")" == "cursor-agent" ]] || [[ "$candidate" == *"/.local/bin/agent" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
 
   return 1
 }
@@ -1117,13 +1170,13 @@ if [[ "$HEALTH_CHECK" == "true" ]]; then
 
   START_TIME=$(date +%s%N 2>/dev/null || date +%s)
 
-  # Check if cursor-agent CLI is available
+  # Check if Cursor CLI is available (cursor-agent or verified `agent` from Cursor install)
   if [[ -z "$CURSOR_AGENT_BIN" ]]; then
     jq -n --arg provider "cursor" '{
       provider: $provider,
       status: "unavailable",
       cli_available: false,
-      error: "cursor-agent CLI not found in PATH (non-wrapper binary resolution failed)",
+      error: "Cursor CLI not found: install from https://cursor.com/docs/cli/overview (PATH: cursor-agent or agent), or set AUTONOM8_CURSOR_AGENT to the binary path",
       session_support: true
     }'
     exit 1
@@ -1299,9 +1352,9 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
 
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
-    run_with_timeout "$CLI_TIMEOUT" "$CURSOR_AGENT_BIN" "${CURSOR_ARGS[@]}" "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+    run_with_timeout "$CLI_TIMEOUT" "$CURSOR_AGENT_BIN" "${CURSOR_ARGS[@]}" "$SKILL_PROMPT" 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
   else
-    cursor_agent_cli "${CURSOR_ARGS[@]}" "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+    cursor_agent_cli "${CURSOR_ARGS[@]}" "$SKILL_PROMPT" 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
   fi
   CURSOR_EXIT=$?
   set -e
@@ -1708,16 +1761,16 @@ $TOOL_RULES
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
     log_verbose "Running cursor-agent with timeout: ${CLI_TIMEOUT}s"
     if [[ -n "$AGENT_LOG" ]]; then
-      run_with_timeout "$CLI_TIMEOUT" "$CURSOR_AGENT_BIN" "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
+      run_with_timeout "$CLI_TIMEOUT" "$CURSOR_AGENT_BIN" "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
     else
-      run_with_timeout "$CLI_TIMEOUT" "$CURSOR_AGENT_BIN" "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+      run_with_timeout "$CLI_TIMEOUT" "$CURSOR_AGENT_BIN" "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
     fi
     CURSOR_EXIT=$?
   else
     if [[ -n "$AGENT_LOG" ]]; then
-      cursor_agent_cli "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
+      cursor_agent_cli "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
     else
-      cursor_agent_cli "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+      cursor_agent_cli "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
     fi
     CURSOR_EXIT=$?
   fi

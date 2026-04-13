@@ -6,8 +6,8 @@
 set -euo pipefail
 
 WRAPPER_REQ_ID="${AUTONOM8_REQUEST_ID:-${A8_REQUEST_ID:-}}"
+exec 3>&2
 if [[ -n "${WRAPPER_REQ_ID}" ]]; then
-  exec 3>&2
   exec 2> >(while IFS= read -r __a8_line; do
     printf '[req=%s] %s\n' "${WRAPPER_REQ_ID}" "${__a8_line}" >&3
   done)
@@ -1271,15 +1271,15 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
     if [[ -n "$WORK_DIR" ]]; then
-      (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format text $BYPASS_ARG $MODEL_ARG $MODE_ARG 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT")
+      (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format text $BYPASS_ARG $MODEL_ARG $MODE_ARG 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT")
     else
-      echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format text $BYPASS_ARG $MODEL_ARG $MODE_ARG 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+      echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format text $BYPASS_ARG $MODEL_ARG $MODE_ARG 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
     fi
   else
     if [[ -n "$WORK_DIR" ]]; then
-      (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | claude --print --output-format text $BYPASS_ARG $MODEL_ARG $MODE_ARG 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT")
+      (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | claude --print --output-format text $BYPASS_ARG $MODEL_ARG $MODE_ARG 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT")
     else
-      echo "$SKILL_PROMPT" | claude --print --output-format text $BYPASS_ARG $MODEL_ARG $MODE_ARG 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+      echo "$SKILL_PROMPT" | claude --print --output-format text $BYPASS_ARG $MODEL_ARG $MODE_ARG 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
     fi
   fi
   CLAUDE_EXIT=$?
@@ -1702,32 +1702,32 @@ $TOOL_RULES
       log_verbose "Running claude with timeout: ${CLI_TIMEOUT}s"
       if [[ -n "$WORK_DIR" ]]; then
         if [[ -n "$AGENT_LOG" ]]; then
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT")
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT")
         else
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT")
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT")
         fi
         CLAUDE_EXIT=$?
       else
         if [[ -n "$AGENT_LOG" ]]; then
-          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
+          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
         else
-          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
         fi
         CLAUDE_EXIT=$?
       fi
     else
       if [[ -n "$WORK_DIR" ]]; then
         if [[ -n "$AGENT_LOG" ]]; then
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT")
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT")
         else
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT")
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT")
         fi
         CLAUDE_EXIT=$?
       else
         if [[ -n "$AGENT_LOG" ]]; then
-          echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
+          echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
         else
-          echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+          echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
         fi
         CLAUDE_EXIT=$?
       fi

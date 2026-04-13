@@ -6,8 +6,8 @@
 set -euo pipefail
 
 WRAPPER_REQ_ID="${AUTONOM8_REQUEST_ID:-${A8_REQUEST_ID:-}}"
+exec 3>&2
 if [[ -n "${WRAPPER_REQ_ID}" ]]; then
-  exec 3>&2
   exec 2> >(while IFS= read -r __a8_line; do
     printf '[req=%s] %s\n' "${WRAPPER_REQ_ID}" "${__a8_line}" >&3
   done)
@@ -1170,29 +1170,29 @@ if [[ "$DRY_RUN" == "true" ]]; then
     if [[ -n "$WORK_DIR" ]]; then
       if [[ -n "$RESUME_SESSION_ID" ]]; then
         # Resume mode: --sandbox/-o not supported, capture stdout directly with '-' for stdin prompt
-        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR")
+        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3))
       else
-        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $EPHEMERAL_ARG $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null)
+        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $EPHEMERAL_ARG $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null)
       fi
     else
       if [[ -n "$RESUME_SESSION_ID" ]]; then
-        echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR"
+        echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3)
       else
-        echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $EPHEMERAL_ARG $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null
+        echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $EPHEMERAL_ARG $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null
       fi
     fi
   else
     if [[ -n "$WORK_DIR" ]]; then
       if [[ -n "$RESUME_SESSION_ID" ]]; then
-        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR")
+        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3))
       else
-        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $EPHEMERAL_ARG $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null)
+        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $EPHEMERAL_ARG $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null)
       fi
     else
       if [[ -n "$RESUME_SESSION_ID" ]]; then
-        echo "$SKILL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR"
+        echo "$SKILL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3)
       else
-        echo "$SKILL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $EPHEMERAL_ARG $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null
+        echo "$SKILL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $EPHEMERAL_ARG $SANDBOX_ARG $BYPASS_ARG -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null
       fi
     fi
   fi
@@ -1680,30 +1680,30 @@ $TOOL_RULES
     if [[ -n "$WORK_DIR" ]]; then
       if [[ -n "$RESUME_SESSION_ID" ]]; then
         if [[ -n "$AGENT_LOG" ]]; then
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR"))
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3))
         else
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR")
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3))
         fi
       else
         if [[ -n "$AGENT_LOG" ]]; then
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > /dev/null)
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > /dev/null)
         else
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null)
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null)
         fi
       fi
       CODEX_EXIT=$?
     else
       if [[ -n "$RESUME_SESSION_ID" ]]; then
         if [[ -n "$AGENT_LOG" ]]; then
-          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR")
+          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3)
         else
-          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR"
+          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3)
         fi
       else
         if [[ -n "$AGENT_LOG" ]]; then
-          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > /dev/null
+          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > /dev/null
         else
-          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null
+          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null
         fi
       fi
       CODEX_EXIT=$?
@@ -1712,30 +1712,30 @@ $TOOL_RULES
     if [[ -n "$WORK_DIR" ]]; then
       if [[ -n "$RESUME_SESSION_ID" ]]; then
         if [[ -n "$AGENT_LOG" ]]; then
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR"))
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3))
         else
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR")
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3))
         fi
       else
         if [[ -n "$AGENT_LOG" ]]; then
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > /dev/null)
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > /dev/null)
         else
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null)
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null)
         fi
       fi
       CODEX_EXIT=$?
     else
       if [[ -n "$RESUME_SESSION_ID" ]]; then
         if [[ -n "$AGENT_LOG" ]]; then
-          echo "$FULL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR")
+          echo "$FULL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3)
         else
-          echo "$FULL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR"
+          echo "$FULL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3)
         fi
       else
         if [[ -n "$AGENT_LOG" ]]; then
-          echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > /dev/null
+          echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > /dev/null
         else
-          echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> "$TMPFILE_ERR" > /dev/null
+          echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null
         fi
       fi
       CODEX_EXIT=$?
@@ -1885,10 +1885,15 @@ $TOOL_RULES
   # Cleanup temp files (moved after response check so stderr is available for error capture)
   rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
 else
-  # Direct invocation with text prompt
+  # Direct prompt mode without an agent file.
+  # This path is used by OpenClaw/go_op_supervisor and still needs to honor
+  # session reuse, context dir, timeout, and wrapper JSON/error envelopes.
+  INPUT_DATA="$(parse_arg_json_or_stdin "$@")"
+
   BYPASS_ARG=""
   SANDBOX_ARG=""
   MODEL_ARG=""
+  TEMP_ARG=""
   if [[ "$YOLO_MODE" == "true" ]]; then
     BYPASS_ARG="--dangerously-bypass-approvals-and-sandbox"
     SANDBOX_ARG="--sandbox danger-full-access"
@@ -1896,7 +1901,117 @@ else
   if [[ -n "$MODEL" ]]; then
     MODEL_ARG="-m $MODEL"
   fi
+  if [[ -n "$TEMPERATURE" ]]; then
+    TEMP_ARG="-c temperature=$TEMPERATURE"
+  fi
 
-  log_verbose "Running in direct invocation mode (Model: ${MODEL:-default})"
-  "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG "$@"
+  if [[ -z "$INPUT_DATA" ]]; then
+    log_verbose "Running in direct invocation mode (Model: ${MODEL:-default})"
+    "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG "$@"
+    exit $?
+  fi
+
+  FULL_PROMPT="$INPUT_DATA"
+  WORK_DIR=""
+  if [[ -n "$CONTEXT_DIR" && -d "$CONTEXT_DIR" ]]; then
+    WORK_DIR="$CONTEXT_DIR"
+    log_verbose "Using CONTEXT_DIR as working directory: $WORK_DIR"
+  fi
+
+  RESUME_SESSION_ID=""
+  CODEX_SESSION_ID=""
+  DISCOVER_MANAGED_CODEX_SESSION=false
+  PREEXEC_CODEX_SESSION_ID=""
+
+  if [[ -n "$SESSION_ID" ]]; then
+    if validate_codex_session "$SESSION_ID"; then
+      RESUME_SESSION_ID="$SESSION_ID"
+      CODEX_SESSION_ID="$SESSION_ID"
+      log_verbose "Resuming session in direct prompt mode: $SESSION_ID"
+    else
+      log_verbose "Session $SESSION_ID not found in ~/.codex/sessions/, starting fresh"
+    fi
+  elif [[ -n "$MANAGE_SESSION" ]]; then
+    DISCOVER_MANAGED_CODEX_SESSION=true
+    PREEXEC_CODEX_SESSION_ID="$(get_latest_codex_session 2>/dev/null || true)"
+    log_verbose "Creating new managed session in direct prompt mode: $MANAGE_SESSION"
+  fi
+
+  TMPFILE_OUTPUT="$(mktemp)"
+  TMPFILE_ERR="$(mktemp)"
+
+  log_verbose "Running in direct prompt mode (WorkDir: ${WORK_DIR:-none}, Resume: ${RESUME_SESSION_ID:-none}, Model: ${MODEL_ARG:-default})"
+
+  set +e
+  if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
+    if [[ -n "$WORK_DIR" ]]; then
+      if [[ -n "$RESUME_SESSION_ID" ]]; then
+        (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG $TEMP_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3))
+      else
+        (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null)
+      fi
+    else
+      if [[ -n "$RESUME_SESSION_ID" ]]; then
+        echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG $TEMP_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3)
+      else
+        echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null
+      fi
+    fi
+  else
+    if [[ -n "$WORK_DIR" ]]; then
+      if [[ -n "$RESUME_SESSION_ID" ]]; then
+        (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG $TEMP_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3))
+      else
+        (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null)
+      fi
+    else
+      if [[ -n "$RESUME_SESSION_ID" ]]; then
+        echo "$FULL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG $TEMP_ARG "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3)
+      else
+        echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $TEMP_ARG -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null
+      fi
+    fi
+  fi
+  CODEX_EXIT=$?
+  set -e
+
+  STDERR_TEXT="$(cat "$TMPFILE_ERR" 2>/dev/null || true)"
+
+  if [[ $CODEX_EXIT -eq 0 && -z "$CODEX_SESSION_ID" && "$DISCOVER_MANAGED_CODEX_SESSION" == "true" ]]; then
+    DISCOVERED_CODEX_SESSION_ID="$(get_latest_codex_session 2>/dev/null || true)"
+    if [[ -n "$DISCOVERED_CODEX_SESSION_ID" && ( -z "$PREEXEC_CODEX_SESSION_ID" || "$DISCOVERED_CODEX_SESSION_ID" != "$PREEXEC_CODEX_SESSION_ID" ) ]]; then
+      CODEX_SESSION_ID="$DISCOVERED_CODEX_SESSION_ID"
+      log_verbose "Discovered provider-real Codex session in direct prompt mode: $CODEX_SESSION_ID"
+    fi
+  fi
+
+  if [[ -z "$CODEX_SESSION_ID" ]]; then
+    CODEX_SESSION_ID="$(printf '%s\n' "$STDERR_TEXT" | sed -n 's/^[Ss]ession [Ii][Dd]:[[:space:]]*//p' | head -1)"
+  fi
+
+  if [[ $CODEX_EXIT -ne 0 ]]; then
+    ERROR_MSG="$(printf '%s\n' "$STDERR_TEXT" | tr -d '\0' | \
+      grep -v '^Reading prompt' | \
+      grep -v '^OpenAI Codex' | \
+      grep -v '^--------' | \
+      grep -v '^workdir:' | \
+      grep -v '^model:' | \
+      grep -v '^provider:' | \
+      grep -v '^approval:' | \
+      grep -v '^sandbox:' | \
+      grep -v '^reasoning effort:' | \
+      grep -v '^reasoning summaries:' | \
+      grep -v '^session id:' | \
+      grep -v '^$' || true)"
+    if [[ -z "$ERROR_MSG" ]]; then
+      ERROR_MSG="Codex exited with status $CODEX_EXIT (no error details captured)"
+    fi
+    rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
+    emit_cli_error_response "$(echo "$ERROR_MSG" | head -c 4000)" "provider_error" "${CODEX_SESSION_ID:-$SESSION_ID}" "$CODEX_EXIT"
+    exit 1
+  fi
+
+  RESPONSE_TEXT="$(cat "$TMPFILE_OUTPUT" 2>/dev/null || true)"
+  rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
+  emit_cli_response "$RESPONSE_TEXT" "$CODEX_SESSION_ID" "$RESPONSE_TEXT" "" "" "$STDERR_TEXT"
 fi
