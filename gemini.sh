@@ -117,6 +117,17 @@ run_with_timeout() {
   fi
 }
 
+stream_stdout_to_files() {
+  local output_file="$1"
+  local stream_log="${2:-}"
+
+  if [[ -n "$stream_log" ]]; then
+    tee -a "$stream_log" "$output_file" >&3
+  else
+    tee "$output_file" >&3
+  fi
+}
+
 compact_reasoning_text() {
   local text="${1:-}"
   printf "%s" "$text" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' | sed 's/^ //;s/ $//'
@@ -597,6 +608,25 @@ build_gemini_no_response_error() {
   printf "%s\t%s" "$classified_type" "$detail"
 }
 
+resolve_autonom8_repo_root() {
+  local start_path="${1:-}"
+  [[ -z "$start_path" ]] && return 1
+
+  local candidate="$start_path"
+  if [[ -f "$candidate" ]]; then
+    candidate="$(dirname "$candidate")"
+  fi
+
+  while [[ -n "$candidate" && "$candidate" != "/" && "$candidate" != "." ]]; do
+    if [[ -d "$candidate/go-autonom8" && -d "$candidate/tenants" ]]; then
+      printf "%s\n" "$candidate"
+      return 0
+    fi
+    candidate="$(dirname "$candidate")"
+  done
+  return 1
+}
+
 ensure_gemini_mcp_servers() {
   local config_path="$1"
   local server_names
@@ -612,13 +642,19 @@ ensure_gemini_mcp_servers() {
     [[ -z "$server_name" ]] && continue
     if ! echo "$current_list" | grep -q "^${server_name}[[:space:]]"; then
       local command
+      local args=()
+      local args_count=0
+      local arg=""
       command=$(jq -r ".mcpServers.\"$server_name\".command" "$config_path" 2>/dev/null || true)
       if [[ -z "$command" || "$command" == "null" ]]; then
         continue
       fi
-      mapfile -t args < <(jq -r ".mcpServers.\"$server_name\".args[]?" "$config_path" 2>/dev/null || true)
       local resolved_args=()
-      local arg=""
+      while IFS= read -r arg; do
+        [[ -z "$arg" ]] && continue
+        args+=("$arg")
+        args_count=$((args_count + 1))
+      done < <(jq -r ".mcpServers.\"$server_name\".args[]?" "$config_path" 2>/dev/null || true)
       for arg in "${args[@]}"; do
         if [[ -n "$arg" && "$arg" != /* && "$arg" != http://* && "$arg" != https://* && "$arg" != -* ]]; then
           if [[ -e "$CORE_DIR/$arg" ]]; then
@@ -1146,6 +1182,7 @@ CONTEXT_MAX=51200  # 50KB default max context size
 SKIP_CONTEXT_FILE=false
 ALLOW_TOOLS=false  # Gemini handles tool access internally
 MCP_SERVER_NAMES=()
+MCP_SERVER_NAMES_COUNT=0
 SESSION_ID=""        # Existing session index to resume
 MANAGE_SESSION=""    # Placeholder for new session (Gemini returns actual index)
 SKILL_NAME=""        # Skill to invoke - Gemini now supports native skills (Jan 2026)
@@ -1588,7 +1625,14 @@ if [[ -f "${1-}" && "$1" == *.md ]]; then
     MCP_CONFIG_PATH="$(get_gemini_mcp_config || true)"
     if [[ -n "$MCP_CONFIG_PATH" ]]; then
       ensure_gemini_mcp_servers "$MCP_CONFIG_PATH"
-      mapfile -t MCP_SERVER_NAMES < <(jq -r '.mcpServers | keys[]' "$MCP_CONFIG_PATH" 2>/dev/null || true)
+      MCP_SERVER_NAMES=()
+      MCP_SERVER_NAMES_COUNT=0
+      local mcp_server_name=""
+      while IFS= read -r mcp_server_name; do
+        [[ -z "$mcp_server_name" ]] && continue
+        MCP_SERVER_NAMES+=("$mcp_server_name")
+        MCP_SERVER_NAMES_COUNT=$((MCP_SERVER_NAMES_COUNT + 1))
+      done < <(jq -r '.mcpServers | keys[]' "$MCP_CONFIG_PATH" 2>/dev/null || true)
     fi
   else
     TOOL_RULES="- Do NOT use any tools or commands
@@ -1757,6 +1801,20 @@ $TOOL_RULES
   fi
   log_verbose "Resolved workspace: ${WORKSPACE_DIR} (source: ${WORKSPACE_SOURCE})"
 
+  PROJECT_ROOT_DIR=""
+  if [[ -n "$CONTEXT_DIR" ]]; then
+    PROJECT_ROOT_DIR="$(resolve_autonom8_repo_root "$CONTEXT_DIR" 2>/dev/null || true)"
+  fi
+  if [[ -z "$PROJECT_ROOT_DIR" && -n "$TENANT_DIR" ]]; then
+    PROJECT_ROOT_DIR="$(resolve_autonom8_repo_root "$TENANT_DIR" 2>/dev/null || true)"
+  fi
+  if [[ -z "$PROJECT_ROOT_DIR" ]]; then
+    PROJECT_ROOT_DIR="$(resolve_autonom8_repo_root "$PWD" 2>/dev/null || true)"
+  fi
+  if [[ -n "$PROJECT_ROOT_DIR" ]]; then
+    log_verbose "Resolved project root: ${PROJECT_ROOT_DIR}"
+  fi
+
   # O-6: Set up agent stream logging for per-ticket LLM output capture
   AGENT_LOG=""
   if [[ -n "${A8_TICKET_ID:-}" && -n "${WORKSPACE_DIR:-}" ]]; then
@@ -1796,7 +1854,6 @@ $TOOL_RULES
   # Add session args for session persistence
   # --session-id: Resume existing session (Gemini uses index-based sessions)
   # --manage-session: Create new session (we'll get the actual index after running)
-  GEMINI_SESSION_ARGS=()
   GEMINI_SESSION_ID=""
   CREATING_NEW_SESSION=false
 
@@ -1804,7 +1861,6 @@ $TOOL_RULES
     # Validate session exists before attempting to resume
     # Gemini sessions are scoped to working directory
     if validate_gemini_session "$SESSION_ID" "$PWD"; then
-      GEMINI_SESSION_ARGS+=("--resume" "$SESSION_ID")
       GEMINI_SESSION_ID="$SESSION_ID"
       log_verbose "Resuming session: $SESSION_ID"
     else
@@ -1836,6 +1892,9 @@ $TOOL_RULES
   if [[ -n "$CORE_DIR" && "$CORE_DIR" != "$WORKSPACE_DIR" && "$CORE_DIR" != "$TENANT_DIR" ]]; then
     GEMINI_ARGS+=("--include-directories" "$CORE_DIR")
   fi
+  if [[ -n "$PROJECT_ROOT_DIR" && "$PROJECT_ROOT_DIR" != "$WORKSPACE_DIR" && "$PROJECT_ROOT_DIR" != "$TENANT_DIR" && "$PROJECT_ROOT_DIR" != "$CORE_DIR" ]]; then
+    GEMINI_ARGS+=("--include-directories" "$PROJECT_ROOT_DIR")
+  fi
   if [[ -n "$TEMPERATURE" ]]; then
     log_verbose "Temperature specified: $TEMPERATURE (Gemini CLI currently has no temperature flag; skipping pass-through)"
   fi
@@ -1846,34 +1905,38 @@ $TOOL_RULES
   if [[ "$YOLO_MODE" == "true" ]]; then
     GEMINI_ARGS+=("--yolo")
   fi
-  if [[ "$ALLOW_TOOLS" == "true" && ${#MCP_SERVER_NAMES[@]} -gt 0 ]]; then
+  if [[ "$ALLOW_TOOLS" == "true" && "$MCP_SERVER_NAMES_COUNT" -gt 0 ]]; then
     GEMINI_ARGS+=("--allowed-mcp-server-names" "${MCP_SERVER_NAMES[@]}")
+  fi
+  GEMINI_CMD=(gemini)
+  if [[ -n "$GEMINI_SESSION_ID" ]]; then
+    GEMINI_CMD+=("--resume" "$GEMINI_SESSION_ID")
+  fi
+  if [[ ${#GEMINI_ARGS[@]} -gt 0 ]]; then
+    GEMINI_CMD+=("${GEMINI_ARGS[@]}")
   fi
   log_verbose "Invoking gemini CLI (Workspace: ${WORKSPACE_DIR:-none}, Tenant: ${TENANT_DIR:-none}, YOLO: $YOLO_MODE, Model: ${MODEL:-default})"
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
     log_verbose "Running gemini with timeout: ${CLI_TIMEOUT}s"
     if [[ -n "$AGENT_LOG" ]]; then
-      cat "$TMPFILE_PROMPT" | run_with_timeout "$CLI_TIMEOUT" gemini "${GEMINI_SESSION_ARGS[@]}" "${GEMINI_ARGS[@]}" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
+      cat "$TMPFILE_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "${GEMINI_CMD[@]}" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT" "$AGENT_LOG")
     else
-      cat "$TMPFILE_PROMPT" | run_with_timeout "$CLI_TIMEOUT" gemini "${GEMINI_SESSION_ARGS[@]}" "${GEMINI_ARGS[@]}" 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
+      cat "$TMPFILE_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "${GEMINI_CMD[@]}" 2> >(tee "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT")
     fi
     GEMINI_EXIT=$?
   else
     if [[ -n "$AGENT_LOG" ]]; then
-      cat "$TMPFILE_PROMPT" | gemini "${GEMINI_SESSION_ARGS[@]}" "${GEMINI_ARGS[@]}" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
+      cat "$TMPFILE_PROMPT" | "${GEMINI_CMD[@]}" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT" "$AGENT_LOG")
     else
-      cat "$TMPFILE_PROMPT" | gemini "${GEMINI_SESSION_ARGS[@]}" "${GEMINI_ARGS[@]}" 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
+      cat "$TMPFILE_PROMPT" | "${GEMINI_CMD[@]}" 2> >(tee "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT")
     fi
     GEMINI_EXIT=$?
   fi
   set -e
 
-  # O-9: Append stdout response to agent log (stderr tee only captures progress/errors,
-  # gemini sends the actual response to stdout which may be missing from logs)
+  # O-9: stdout is streamed live above; append only a footer with the captured byte count.
   if [[ -n "$AGENT_LOG" && -f "$TMPFILE_OUTPUT" && -s "$TMPFILE_OUTPUT" ]]; then
-    echo "" >> "$AGENT_LOG"
-    cat "$TMPFILE_OUTPUT" >> "$AGENT_LOG" 2>/dev/null || true
     echo "" >> "$AGENT_LOG"
     echo "tokens used" >> "$AGENT_LOG"
     wc -c < "$TMPFILE_OUTPUT" | xargs -I{} echo "{}" >> "$AGENT_LOG"
@@ -2067,37 +2130,189 @@ $TOOL_RULES
     fi
   fi
 else
-  # Direct invocation with text prompt
+  # Direct prompt mode without an agent file.
+  # This path is used by go_op_supervisor and must preserve session reuse,
+  # wrapper JSON envelopes, and a repo-aware workspace scope.
+  INPUT_DATA="$(parse_arg_json_or_stdin "$@")"
 
-  # Determine tenant directory for direct invocation
   TENANT_DIR=""
-  if [[ "$PWD" =~ .*/tenants/([^/]+)$ ]]; then
-    TENANT_DIR="$PWD"
+  if [[ -n "$CONTEXT_DIR" && "$CONTEXT_DIR" =~ ^(.*/tenants/[^/]+)($|/) ]]; then
+    TENANT_DIR="${BASH_REMATCH[1]}"
+  elif [[ "$PWD" =~ ^(.*/tenants/[^/]+)($|/) ]]; then
+    TENANT_DIR="${BASH_REMATCH[1]}"
+  elif [[ -d "$CORE_DIR/tenants/oxygen" ]]; then
+    TENANT_DIR="$CORE_DIR/tenants/oxygen"
   elif [[ -d "$CORE_DIR/tenants" ]]; then
-    if [[ -d "$CORE_DIR/tenants/oxygen" ]]; then
-      TENANT_DIR="$CORE_DIR/tenants/oxygen"
-    else
-      TENANT_DIR=$(find "$CORE_DIR/tenants" -maxdepth 1 -type d ! -name tenants | head -1)
+    TENANT_DIR="$(find "$CORE_DIR/tenants" -maxdepth 1 -type d ! -name tenants | head -1)"
+  fi
+
+  WORKSPACE_DIR="$CORE_DIR"
+  WORKSPACE_SOURCE="core_fallback"
+  if [[ -n "$CONTEXT_DIR" && -d "$CONTEXT_DIR" ]]; then
+    WORKSPACE_DIR="$CONTEXT_DIR"
+    WORKSPACE_SOURCE="context_dir"
+  elif [[ -n "$TENANT_DIR" && -d "$TENANT_DIR" ]]; then
+    WORKSPACE_DIR="$TENANT_DIR"
+    WORKSPACE_SOURCE="tenant_dir"
+  fi
+
+  PROJECT_ROOT_DIR=""
+  if [[ -n "$CONTEXT_DIR" ]]; then
+    PROJECT_ROOT_DIR="$(resolve_autonom8_repo_root "$CONTEXT_DIR" 2>/dev/null || true)"
+  fi
+  if [[ -z "$PROJECT_ROOT_DIR" && -n "$TENANT_DIR" ]]; then
+    PROJECT_ROOT_DIR="$(resolve_autonom8_repo_root "$TENANT_DIR" 2>/dev/null || true)"
+  fi
+  if [[ -z "$PROJECT_ROOT_DIR" ]]; then
+    PROJECT_ROOT_DIR="$(resolve_autonom8_repo_root "$PWD" 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$INPUT_DATA" ]]; then
+    GEMINI_ARGS=()
+    if [[ -n "$WORKSPACE_DIR" ]]; then
+      GEMINI_ARGS+=("--include-directories" "$WORKSPACE_DIR")
     fi
+    if [[ -n "$TENANT_DIR" && "$TENANT_DIR" != "$WORKSPACE_DIR" ]]; then
+      GEMINI_ARGS+=("--include-directories" "$TENANT_DIR")
+    fi
+    if [[ -n "$CORE_DIR" && "$CORE_DIR" != "$WORKSPACE_DIR" && "$CORE_DIR" != "$TENANT_DIR" ]]; then
+      GEMINI_ARGS+=("--include-directories" "$CORE_DIR")
+    fi
+    if [[ -n "$PROJECT_ROOT_DIR" && "$PROJECT_ROOT_DIR" != "$WORKSPACE_DIR" && "$PROJECT_ROOT_DIR" != "$TENANT_DIR" && "$PROJECT_ROOT_DIR" != "$CORE_DIR" ]]; then
+      GEMINI_ARGS+=("--include-directories" "$PROJECT_ROOT_DIR")
+    fi
+    if [[ -n "$MODEL" ]]; then
+      GEMINI_ARGS+=("-m" "$MODEL")
+      log_verbose "Using model: $MODEL"
+    fi
+    if [[ "$YOLO_MODE" == "true" ]]; then
+      GEMINI_ARGS+=("--yolo")
+    fi
+    log_verbose "Running in direct invocation mode (Model: ${MODEL:-default})"
+    gemini "${GEMINI_ARGS[@]}" "$@"
+    exit $?
   fi
 
-  # Build gemini args
-  GEMINI_ARGS=()
-  if [[ -n "$TENANT_DIR" ]]; then
-    GEMINI_ARGS+=("--include-directories" "$TENANT_DIR")
-  fi
-  GEMINI_ARGS+=("--include-directories" "$CORE_DIR")
-
-  # Add model flag if specified
-  if [[ -n "$MODEL" ]]; then
-    GEMINI_ARGS+=("-m" "$MODEL")
-    log_verbose "Using model: $MODEL"
+  if [[ -n "$WORKSPACE_DIR" && -d "$WORKSPACE_DIR" ]]; then
+    quarantine_gemini_workspace_settings_if_needed "$WORKSPACE_DIR" "$ALLOW_TOOLS"
+    cd "$WORKSPACE_DIR"
   fi
 
-  if [[ "$YOLO_MODE" == "true" ]]; then
-    GEMINI_ARGS+=("--yolo")
+  TMPFILE_PROMPT="$(mktemp)"
+  TMPFILE_OUTPUT="$(mktemp)"
+  TMPFILE_ERR="$(mktemp)"
+  echo "$INPUT_DATA" > "$TMPFILE_PROMPT"
+
+  GEMINI_SESSION_ARG=""
+  GEMINI_SESSION_ID=""
+  if [[ -n "$SESSION_ID" ]]; then
+    if validate_gemini_session "$SESSION_ID" "$PWD"; then
+      GEMINI_SESSION_ARG="--resume $SESSION_ID"
+      GEMINI_SESSION_ID="$SESSION_ID"
+      log_verbose "Resuming session in direct prompt mode: $SESSION_ID"
+    else
+      log_verbose "Session $SESSION_ID not found, starting fresh session"
+    fi
+  elif [[ -n "${MANAGE_SESSION:-}" ]]; then
+    log_verbose "Creating new managed session in direct prompt mode: $MANAGE_SESSION"
   fi
 
-  log_verbose "Running in direct invocation mode (Model: ${MODEL:-default})"
-  gemini "${GEMINI_ARGS[@]}" "$@"
+  GEMINI_INVALID_MODEL_RETRIED=false
+  GEMINI_CAPACITY_RETRIED=false
+  while true; do
+    GEMINI_ARGS=()
+    if [[ -n "$WORKSPACE_DIR" ]]; then
+      GEMINI_ARGS+=("--include-directories" "$WORKSPACE_DIR")
+    fi
+    if [[ -n "$TENANT_DIR" && "$TENANT_DIR" != "$WORKSPACE_DIR" ]]; then
+      GEMINI_ARGS+=("--include-directories" "$TENANT_DIR")
+    fi
+    if [[ -n "$CORE_DIR" && "$CORE_DIR" != "$WORKSPACE_DIR" && "$CORE_DIR" != "$TENANT_DIR" ]]; then
+      GEMINI_ARGS+=("--include-directories" "$CORE_DIR")
+    fi
+    if [[ -n "$PROJECT_ROOT_DIR" && "$PROJECT_ROOT_DIR" != "$WORKSPACE_DIR" && "$PROJECT_ROOT_DIR" != "$TENANT_DIR" && "$PROJECT_ROOT_DIR" != "$CORE_DIR" ]]; then
+      GEMINI_ARGS+=("--include-directories" "$PROJECT_ROOT_DIR")
+    fi
+    if [[ -n "$MODEL" ]]; then
+      GEMINI_ARGS+=("-m" "$MODEL")
+      log_verbose "Using model: $MODEL"
+    fi
+    if [[ "$YOLO_MODE" == "true" ]]; then
+      GEMINI_ARGS+=("--yolo")
+    fi
+
+    log_verbose "Running in direct prompt mode (Workspace: ${WORKSPACE_DIR:-none}, ProjectRoot: ${PROJECT_ROOT_DIR:-none}, Resume: ${GEMINI_SESSION_ID:-none}, Model: ${MODEL:-default})"
+
+    set +e
+    if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
+      cat "$TMPFILE_PROMPT" | run_with_timeout "$CLI_TIMEOUT" gemini $GEMINI_SESSION_ARG "${GEMINI_ARGS[@]}" 2> >(tee "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT")
+      GEMINI_EXIT=$?
+    else
+      cat "$TMPFILE_PROMPT" | gemini $GEMINI_SESSION_ARG "${GEMINI_ARGS[@]}" 2> >(tee "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT")
+      GEMINI_EXIT=$?
+    fi
+    set -e
+
+    if [[ -z "$GEMINI_SESSION_ID" && $GEMINI_EXIT -eq 0 ]]; then
+      GEMINI_SESSION_ID="$(get_latest_gemini_session "$PWD" || true)"
+      if [[ -n "$GEMINI_SESSION_ID" ]]; then
+        log_verbose "Direct prompt session created: $GEMINI_SESSION_ID"
+      fi
+    fi
+
+    if [[ $GEMINI_EXIT -ne 0 ]]; then
+      ERROR_MSG=$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' || echo "Unknown error")
+      if [[ "$GEMINI_INVALID_MODEL_RETRIED" != "true" ]] && declare -F is_invalid_model_error >/dev/null && is_invalid_model_error "$ERROR_MSG"; then
+        REQUESTED_MODEL_LABEL="${MODEL_REQUESTED_RAW:-$MODEL}"
+        GEMINI_INVALID_MODEL_RETRIED=true
+        MODEL=""
+        MODEL_RESOLUTION_NOTE="gemini model '$REQUESTED_MODEL_LABEL' -> 'provider-default' (fallback)"
+        : > "$TMPFILE_OUTPUT"
+        : > "$TMPFILE_ERR"
+        continue
+      fi
+      if is_gemini_capacity_error "$ERROR_MSG"; then
+        CURRENT_MODEL_LABEL="${MODEL:-provider-default}"
+        if retry_with_gemini_capacity_fallback "$CURRENT_MODEL_LABEL" >/dev/null; then
+          : > "$TMPFILE_OUTPUT"
+          : > "$TMPFILE_ERR"
+          GEMINI_CAPACITY_RETRIED=true
+          continue
+        fi
+      fi
+      rm -f "$TMPFILE_PROMPT" "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
+      emit_cli_error_response "$ERROR_MSG" "provider_error" "$GEMINI_SESSION_ID" "$GEMINI_EXIT"
+      exit 1
+    fi
+    break
+  done
+
+  RAW_RESPONSE_TEXT="$(cat "$TMPFILE_OUTPUT" 2>/dev/null | tr -d '\0')"
+  STDERR_TEXT="$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' || true)"
+  rm -f "$TMPFILE_PROMPT" "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
+
+  RESPONSE_TEXT="$(filter_gemini_info_lines "$RAW_RESPONSE_TEXT")"
+  if [[ -n "$RESPONSE_TEXT" && "$RESPONSE_TEXT" != "null" ]]; then
+    JSON_BLOCK=$(echo "$RESPONSE_TEXT" | sed -n '/^```json/,/^```/p' | sed '1d;$d' 2>/dev/null || echo "")
+    FINAL_RESPONSE=""
+    if [[ -n "$JSON_BLOCK" ]] && echo "$JSON_BLOCK" | jq empty 2>/dev/null; then
+      FINAL_RESPONSE="$JSON_BLOCK"
+    fi
+    if [[ -z "$FINAL_RESPONSE" ]]; then
+      CLEAN_TEXT=$(echo "$RESPONSE_TEXT" | sed -e 's/^```json//' -e 's/^```//' -e 's/```$//')
+      if echo "$CLEAN_TEXT" | jq empty 2>/dev/null; then
+        FINAL_RESPONSE="$CLEAN_TEXT"
+      fi
+    fi
+    if [[ -n "$FINAL_RESPONSE" ]]; then
+      emit_cli_response "$FINAL_RESPONSE" "$GEMINI_SESSION_ID" "$RESPONSE_TEXT" "" "" "$STDERR_TEXT"
+    else
+      emit_cli_response "$RESPONSE_TEXT" "$GEMINI_SESSION_ID" "$RESPONSE_TEXT" "" "" "$STDERR_TEXT"
+    fi
+  else
+    NO_RESPONSE_INFO="$(build_gemini_no_response_error "$RAW_RESPONSE_TEXT" "$STDERR_TEXT" "$RESPONSE_TEXT")"
+    NO_RESPONSE_TYPE="${NO_RESPONSE_INFO%%$'\t'*}"
+    NO_RESPONSE_MSG="${NO_RESPONSE_INFO#*$'\t'}"
+    emit_cli_error_response "$NO_RESPONSE_MSG" "$NO_RESPONSE_TYPE" "$GEMINI_SESSION_ID" 1
+  fi
 fi

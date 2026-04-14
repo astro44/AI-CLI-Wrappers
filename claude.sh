@@ -103,6 +103,36 @@ run_with_timeout() {
   fi
 }
 
+resolve_autonom8_repo_root() {
+  local start_path="${1:-}"
+  [[ -z "$start_path" ]] && return 1
+
+  local candidate="$start_path"
+  if [[ -f "$candidate" ]]; then
+    candidate="$(dirname "$candidate")"
+  fi
+
+  while [[ -n "$candidate" && "$candidate" != "/" && "$candidate" != "." ]]; do
+    if [[ -d "$candidate/go-autonom8" && -d "$candidate/tenants" ]]; then
+      printf "%s\n" "$candidate"
+      return 0
+    fi
+    candidate="$(dirname "$candidate")"
+  done
+  return 1
+}
+
+stream_stdout_to_files() {
+  local output_file="$1"
+  local stream_log="${2:-}"
+
+  if [[ -n "$stream_log" ]]; then
+    tee -a "$stream_log" "$output_file" >&3
+  else
+    tee "$output_file" >&3
+  fi
+}
+
 emit_cli_response() {
   local response_text="$1"
   local session_id="${2:-}"
@@ -1638,6 +1668,24 @@ $TOOL_RULES
     log_verbose "Using TENANT_DIR as working directory: $WORK_DIR"
   fi
 
+  PROJECT_ROOT_DIR=""
+  if [[ -n "$CONTEXT_DIR" ]]; then
+    PROJECT_ROOT_DIR="$(resolve_autonom8_repo_root "$CONTEXT_DIR" 2>/dev/null || true)"
+  fi
+  if [[ -z "$PROJECT_ROOT_DIR" && -n "$TENANT_DIR" ]]; then
+    PROJECT_ROOT_DIR="$(resolve_autonom8_repo_root "$TENANT_DIR" 2>/dev/null || true)"
+  fi
+  if [[ -z "$PROJECT_ROOT_DIR" ]]; then
+    PROJECT_ROOT_DIR="$(resolve_autonom8_repo_root "$PWD" 2>/dev/null || true)"
+  fi
+  if [[ -n "$PROJECT_ROOT_DIR" ]]; then
+    log_verbose "Resolved project root: $PROJECT_ROOT_DIR"
+  fi
+  PROJECT_PARENT_DIR=""
+  if [[ -n "$PROJECT_ROOT_DIR" ]]; then
+    PROJECT_PARENT_DIR="$(dirname "$PROJECT_ROOT_DIR")"
+  fi
+
   # Build session args for session persistence
   # SIMPLIFIED APPROACH (like codex.sh):
   # - For new sessions: No --session-id flag, use --output-format json to capture session_id
@@ -1667,6 +1715,16 @@ $TOOL_RULES
   if [[ -n "$PERMISSION_MODE" ]]; then
     MODE_ARG="--permission-mode $PERMISSION_MODE"
     log_verbose "Using permission mode: $PERMISSION_MODE"
+  fi
+
+  ADD_DIR_ARGS=""
+  if [[ -n "$PROJECT_ROOT_DIR" && "$PROJECT_ROOT_DIR" != "$WORK_DIR" ]]; then
+    ADD_DIR_ARGS="--add-dir $PROJECT_ROOT_DIR"
+    log_verbose "Adding Claude read scope: $PROJECT_ROOT_DIR"
+  fi
+  if [[ -n "$PROJECT_PARENT_DIR" && "$PROJECT_PARENT_DIR" != "$WORK_DIR" && "$PROJECT_PARENT_DIR" != "$PROJECT_ROOT_DIR" ]]; then
+    ADD_DIR_ARGS="$ADD_DIR_ARGS --add-dir $PROJECT_PARENT_DIR"
+    log_verbose "Adding Claude parent read scope: $PROJECT_PARENT_DIR"
   fi
 
   # O-6: Set up agent stream logging for per-ticket LLM output capture
@@ -1702,43 +1760,40 @@ $TOOL_RULES
       log_verbose "Running claude with timeout: ${CLI_TIMEOUT}s"
       if [[ -n "$WORK_DIR" ]]; then
         if [[ -n "$AGENT_LOG" ]]; then
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT")
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG $ADD_DIR_ARGS 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT" "$AGENT_LOG"))
         else
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT")
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG $ADD_DIR_ARGS 2> >(tee "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT"))
         fi
         CLAUDE_EXIT=$?
       else
         if [[ -n "$AGENT_LOG" ]]; then
-          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
+          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG $ADD_DIR_ARGS 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT" "$AGENT_LOG")
         else
-          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
+          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG $ADD_DIR_ARGS 2> >(tee "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT")
         fi
         CLAUDE_EXIT=$?
       fi
     else
       if [[ -n "$WORK_DIR" ]]; then
         if [[ -n "$AGENT_LOG" ]]; then
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT")
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG $ADD_DIR_ARGS 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT" "$AGENT_LOG"))
         else
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT")
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG $ADD_DIR_ARGS 2> >(tee "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT"))
         fi
         CLAUDE_EXIT=$?
       else
         if [[ -n "$AGENT_LOG" ]]; then
-          echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
+          echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG $ADD_DIR_ARGS 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT" "$AGENT_LOG")
         else
-          echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
+          echo "$FULL_PROMPT" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG $ADD_DIR_ARGS 2> >(tee "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT")
         fi
         CLAUDE_EXIT=$?
       fi
     fi
     set -e
 
-    # O-9: Append stdout response to agent log (stderr tee only captures progress/errors,
-    # claude --print sends the actual response to stdout which was missing from logs)
+    # O-9: stdout is streamed live above; append only a footer with the captured byte count.
     if [[ -n "$AGENT_LOG" && -f "$TMPFILE_OUTPUT" && -s "$TMPFILE_OUTPUT" ]]; then
-      echo "" >> "$AGENT_LOG"
-      cat "$TMPFILE_OUTPUT" >> "$AGENT_LOG" 2>/dev/null || true
       echo "" >> "$AGENT_LOG"
       echo "tokens used" >> "$AGENT_LOG"
       wc -c < "$TMPFILE_OUTPUT" | xargs -I{} echo "{}" >> "$AGENT_LOG"
@@ -1862,12 +1917,140 @@ $TOOL_RULES
     emit_cli_response "$RESPONSE_TEXT" "$CLAUDE_SESSION_ID" "$RAW_OUTPUT" "" "" "$STDERR_TEXT"
   fi
 else
-  # Direct invocation
+  # Direct prompt mode without an agent file.
+  # This path is used by go_op_supervisor and still needs wrapper JSON,
+  # session reuse, and streamed provider output.
+  INPUT_DATA="$(parse_arg_json_or_stdin "$@")"
+
   BYPASS_ARG=""
   if [[ "$YOLO_MODE" == "true" ]]; then
     BYPASS_ARG="--dangerously-skip-permissions"
   fi
 
-  log_verbose "Running in direct invocation mode"
-  claude --print --output-format text $BYPASS_ARG "$@"
+  if [[ -z "$INPUT_DATA" ]]; then
+    log_verbose "Running in direct invocation mode"
+    claude --print --output-format text $BYPASS_ARG "$@"
+    exit $?
+  fi
+
+  WORK_DIR=""
+  if [[ -n "$CONTEXT_DIR" && -d "$CONTEXT_DIR" ]]; then
+    WORK_DIR="$CONTEXT_DIR"
+    log_verbose "Using CONTEXT_DIR as working directory: $WORK_DIR"
+  fi
+
+  PROJECT_ROOT_DIR=""
+  if [[ -n "$CONTEXT_DIR" ]]; then
+    PROJECT_ROOT_DIR="$(resolve_autonom8_repo_root "$CONTEXT_DIR" 2>/dev/null || true)"
+  fi
+  if [[ -z "$PROJECT_ROOT_DIR" ]]; then
+    PROJECT_ROOT_DIR="$(resolve_autonom8_repo_root "$PWD" 2>/dev/null || true)"
+  fi
+  if [[ -n "$PROJECT_ROOT_DIR" ]]; then
+    log_verbose "Resolved project root in direct prompt mode: $PROJECT_ROOT_DIR"
+  fi
+  PROJECT_PARENT_DIR=""
+  if [[ -n "$PROJECT_ROOT_DIR" ]]; then
+    PROJECT_PARENT_DIR="$(dirname "$PROJECT_ROOT_DIR")"
+  fi
+
+  MODEL_ARG=""
+  if [[ -n "$MODEL" ]]; then
+    MODEL_ARG="--model $MODEL"
+    log_verbose "Using model: $MODEL"
+  fi
+
+  SESSION_ARG=""
+  OUTPUT_FORMAT="json"
+  CLAUDE_SESSION_ID=""
+
+  if [[ -n "$SESSION_ID" ]]; then
+    SESSION_ARG="--resume $SESSION_ID"
+    CLAUDE_SESSION_ID="$SESSION_ID"
+    log_verbose "Resuming session in direct prompt mode: $SESSION_ID"
+  elif [[ -n "${MANAGE_SESSION:-}" || "${NEW_SESSION:-false}" == "true" ]]; then
+    log_verbose "Creating new session in direct prompt mode"
+  fi
+
+  MODE_ARG=""
+  if [[ -n "$PERMISSION_MODE" ]]; then
+    MODE_ARG="--permission-mode $PERMISSION_MODE"
+    log_verbose "Using permission mode: $PERMISSION_MODE"
+  fi
+
+  ADD_DIR_ARGS=""
+  if [[ -n "$PROJECT_ROOT_DIR" && "$PROJECT_ROOT_DIR" != "$WORK_DIR" ]]; then
+    ADD_DIR_ARGS="--add-dir $PROJECT_ROOT_DIR"
+    log_verbose "Adding Claude read scope in direct prompt mode: $PROJECT_ROOT_DIR"
+  fi
+  if [[ -n "$PROJECT_PARENT_DIR" && "$PROJECT_PARENT_DIR" != "$WORK_DIR" && "$PROJECT_PARENT_DIR" != "$PROJECT_ROOT_DIR" ]]; then
+    ADD_DIR_ARGS="$ADD_DIR_ARGS --add-dir $PROJECT_PARENT_DIR"
+    log_verbose "Adding Claude parent read scope in direct prompt mode: $PROJECT_PARENT_DIR"
+  fi
+
+  TMPFILE_OUTPUT="$(mktemp)"
+  TMPFILE_ERR="$(mktemp)"
+
+  log_verbose "Running in direct prompt mode (WorkDir: ${WORK_DIR:-none}, Session: ${SESSION_ARG:-none}, Model: ${MODEL:-default})"
+
+  set +e
+    if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
+    if [[ -n "$WORK_DIR" ]]; then
+      (cd "$WORK_DIR" && echo "$INPUT_DATA" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG $ADD_DIR_ARGS 2> >(tee "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT"))
+      CLAUDE_EXIT=$?
+    else
+      echo "$INPUT_DATA" | run_with_timeout "$CLI_TIMEOUT" claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG $ADD_DIR_ARGS 2> >(tee "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT")
+      CLAUDE_EXIT=$?
+    fi
+  else
+    if [[ -n "$WORK_DIR" ]]; then
+      (cd "$WORK_DIR" && echo "$INPUT_DATA" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG $ADD_DIR_ARGS 2> >(tee "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT"))
+      CLAUDE_EXIT=$?
+    else
+      echo "$INPUT_DATA" | claude --print --output-format "$OUTPUT_FORMAT" $BYPASS_ARG $SESSION_ARG $MODEL_ARG $MODE_ARG $ADD_DIR_ARGS 2> >(tee "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT")
+      CLAUDE_EXIT=$?
+    fi
+  fi
+  set -e
+
+  RAW_OUTPUT="$(cat "$TMPFILE_OUTPUT" 2>/dev/null)"
+  STDERR_TEXT="$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' || true)"
+  rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
+
+  if [[ $CLAUDE_EXIT -ne 0 ]]; then
+    ERROR_MSG="$STDERR_TEXT"
+    if [[ -z "$ERROR_MSG" && -n "$RAW_OUTPUT" ]]; then
+      ERROR_MSG="$RAW_OUTPUT"
+    fi
+    if [[ -z "$ERROR_MSG" ]]; then
+      ERROR_MSG="Unknown error"
+    fi
+    emit_cli_error_response "$ERROR_MSG" "provider_error" "${CLAUDE_SESSION_ID:-$SESSION_ID}" "$CLAUDE_EXIT"
+    exit 1
+  fi
+
+  if [[ -z "$RAW_OUTPUT" || "$RAW_OUTPUT" == "null" ]]; then
+    emit_cli_error_response "No response from Claude CLI" "provider_error" "${CLAUDE_SESSION_ID:-$SESSION_ID}" 0
+    exit 0
+  fi
+
+  CLAUDE_SESSION_ID="$(echo "$RAW_OUTPUT" | jq -r '.session_id // empty' 2>/dev/null || true)"
+  RESPONSE_TEXT="$(echo "$RAW_OUTPUT" | jq -r '.result // empty' 2>/dev/null || true)"
+  if [[ -z "$RESPONSE_TEXT" ]]; then
+    IS_ERROR="$(echo "$RAW_OUTPUT" | jq -r '.is_error // false' 2>/dev/null || true)"
+    if [[ "$IS_ERROR" == "true" ]]; then
+      ERROR_MSGS="$(echo "$RAW_OUTPUT" | jq -r '.errors | join(", ")' 2>/dev/null || true)"
+      emit_cli_error_response "${ERROR_MSGS:-Unknown error}" "provider_error" "${CLAUDE_SESSION_ID:-$SESSION_ID}" 1
+      exit 1
+    fi
+    RESPONSE_TEXT="$RAW_OUTPUT"
+  fi
+
+  if [[ "$RESPONSE_TEXT" =~ ^\`\`\`json[[:space:]]* ]]; then
+    RESPONSE_TEXT="$(echo "$RESPONSE_TEXT" | sed -e 's/^```json[[:space:]]*//' -e 's/```[[:space:]]*$//')"
+  elif [[ "$RESPONSE_TEXT" =~ ^\`\`\`[[:space:]]* ]]; then
+    RESPONSE_TEXT="$(echo "$RESPONSE_TEXT" | sed -e 's/^```[[:space:]]*//' -e 's/```[[:space:]]*$//')"
+  fi
+
+  emit_cli_response "$RESPONSE_TEXT" "$CLAUDE_SESSION_ID" "$RAW_OUTPUT" "" "" "$STDERR_TEXT"
 fi

@@ -458,12 +458,23 @@ ensure_codex_mcp_servers() {
     [[ -z "$server_name" ]] && continue
     if ! "$CODEX_CMD" mcp get "$server_name" --json >/dev/null 2>&1; then
       local command
+      local args=()
+      local args_count=0
+      local arg=""
       command=$(jq -r ".mcpServers.\"$server_name\".command" "$config_path" 2>/dev/null || true)
       if [[ -z "$command" || "$command" == "null" ]]; then
         continue
       fi
-      mapfile -t args < <(jq -r ".mcpServers.\"$server_name\".args[]?" "$config_path" 2>/dev/null || true)
-      "$CODEX_CMD" mcp add "$server_name" "$command" "${args[@]}" >/dev/null 2>&1 || true
+      while IFS= read -r arg; do
+        [[ -z "$arg" ]] && continue
+        args+=("$arg")
+        args_count=$((args_count + 1))
+      done < <(jq -r ".mcpServers.\"$server_name\".args[]?" "$config_path" 2>/dev/null || true)
+      if (( args_count > 0 )); then
+        "$CODEX_CMD" mcp add "$server_name" "$command" "${args[@]}" >/dev/null 2>&1 || true
+      else
+        "$CODEX_CMD" mcp add "$server_name" "$command" >/dev/null 2>&1 || true
+      fi
       log_verbose "Registered MCP server for codex: $server_name"
     fi
   done <<< "$server_names"
