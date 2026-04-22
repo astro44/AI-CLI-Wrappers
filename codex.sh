@@ -5,6 +5,8 @@
 
 set -euo pipefail
 
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+
 WRAPPER_REQ_ID="${AUTONOM8_REQUEST_ID:-${A8_REQUEST_ID:-}}"
 exec 3>&2
 if [[ -n "${WRAPPER_REQ_ID}" ]]; then
@@ -68,8 +70,18 @@ run_with_timeout() {
     "$timeout_cmd" --foreground --signal=TERM --kill-after=5 "$timeout_secs" "$@"
     return $?
   else
-    # Fallback: run in background with manual timeout (stdin may not work)
-    "$@" &
+    # Fallback: preserve piped stdin by buffering it before backgrounding the command.
+    local stdin_tmp=""
+    if [[ ! -t 0 ]]; then
+      stdin_tmp="$(mktemp)"
+      cat > "$stdin_tmp"
+    fi
+
+    if [[ -n "$stdin_tmp" ]]; then
+      "$@" < "$stdin_tmp" &
+    else
+      "$@" &
+    fi
     local pid=$!
     CODEX_PID=$pid
 

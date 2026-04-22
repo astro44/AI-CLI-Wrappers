@@ -5,13 +5,16 @@
 #   1. AUTONOM8_CURSOR_AGENT or CURSOR_AGENT_BIN_OVERRIDE — full path to the real binary (optional)
 #   2. cursor-agent — legacy / alternate install name on PATH
 #   3. agent — official Cursor CLI (https://cursor.com/docs/cli/overview), verified not to be another tool named agent
-# Updated to support --dry-run and --verbose (v2.1)
+# Updated to support --dry-run, --verbose, macOS keychain refresh, and
+# non-interactive MCP startup approval (v2.3)
 
 set -euo pipefail
 
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+
 WRAPPER_REQ_ID="${AUTONOM8_REQUEST_ID:-${A8_REQUEST_ID:-}}"
-exec 3>&2
 if [[ -n "${WRAPPER_REQ_ID}" ]]; then
+  exec 3>&2
   exec 2> >(while IFS= read -r __a8_line; do
     printf '[req=%s] %s\n' "${WRAPPER_REQ_ID}" "${__a8_line}" >&3
   done)
@@ -35,6 +38,34 @@ cleanup() {
   pkill -P $$ 2>/dev/null || true
 }
 trap cleanup EXIT TERM INT
+
+cursor_login_home() {
+  local current_home="${HOME:-}"
+  if [[ -n "$current_home" ]] && { [[ -f "$current_home/.env" ]] || [[ -f "$current_home/Library/Keychains/login.keychain-db" ]]; }; then
+    printf "%s" "$current_home"
+    return 0
+  fi
+
+  local user="${USER:-}"
+  if [[ -z "$user" ]]; then
+    user="$(id -un 2>/dev/null || true)"
+  fi
+
+  local resolved_home=""
+  if [[ -n "$user" ]] && command -v dscl >/dev/null 2>&1; then
+    resolved_home="$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | awk '{print $2; exit}')"
+  fi
+  if [[ -z "$resolved_home" && -n "$user" ]]; then
+    resolved_home="$(eval "printf '%s' ~$user" 2>/dev/null || true)"
+  fi
+
+  if [[ -n "$resolved_home" && "$resolved_home" != "~"* && -d "$resolved_home" ]]; then
+    printf "%s" "$resolved_home"
+    return 0
+  fi
+
+  printf "%s" "$current_home"
+}
 
 # True if this executable is Cursor's agent CLI (avoids picking an unrelated "agent" on PATH).
 is_cursor_agent_executable() {
@@ -88,9 +119,13 @@ resolve_cursor_agent_cmd() {
     fi
   done < <(which -a agent 2>/dev/null | awk '!seen[$0]++')
 
-  # Official installer often places the binary here before ~/.local/bin is on PATH
-  for candidate in "${HOME}/.local/bin/cursor-agent" "${HOME}/.local/bin/agent"; do
-    [[ -z "${HOME:-}" || ! -x "$candidate" ]] && continue
+  # Official installer often places the binary here before ~/.local/bin is on PATH.
+  # Use the login home, not necessarily process HOME, because Go/SSH workers may
+  # sanitize HOME while Cursor is still installed under the login user's home.
+  local login_home=""
+  login_home="$(cursor_login_home)"
+  for candidate in "${login_home}/.local/bin/cursor-agent" "${login_home}/.local/bin/agent"; do
+    [[ -z "$login_home" || ! -x "$candidate" ]] && continue
     resolved="$(cd "$(dirname "$candidate")" && pwd -P)/$(basename "$candidate")"
     if [[ "$resolved" == "$wrapper_path" ]]; then
       continue
@@ -106,10 +141,172 @@ resolve_cursor_agent_cmd() {
 
 CURSOR_AGENT_BIN="$(resolve_cursor_agent_cmd || true)"
 
+# macOS keychain bootstrap
+#
+# Cursor stores CLI credentials in the macOS login keychain. Workers launched
+# over SSH do not reliably inherit an unlocked GUI keychain, and new Cursor
+# sessions can fail immediately with "Your macOS login keychain is locked" even
+# when the long-running worker was started after a manual unlock.
+#
+# This wrapper refreshes keychain access immediately before each Cursor CLI
+# process. It is intentionally narrow:
+#   - Darwin only; Linux and CI paths are no-ops.
+#   - No secret is logged.
+#   - Existing Cursor auth is still required; this does not log in to Cursor.
+#   - Set AUTONOM8_CURSOR_UNLOCK_KEYCHAIN=0 to disable.
+#
+# Configuration:
+#   AUTONOM8_KEYCHAIN_PASSWORD                 explicit password value
+#   AUTONOM8_KEYCHAIN_PASSWORD_ENV=mini        env var name to read from env/.env
+#   AUTONOM8_KEYCHAIN_ENV_FILE=<login-home>/.env
+#   AUTONOM8_KEYCHAIN_PATH=<login-home>/Library/Keychains/login.keychain-db
+#   AUTONOM8_KEYCHAIN_UNLOCK_TIMEOUT_SECONDS   keychain auto-lock timeout
+#   AUTONOM8_KEYCHAIN_SET_TIMEOUT=0            skip timeout refresh
+#   AUTONOM8_CURSOR_NORMALIZE_HOME=0           keep process HOME unchanged
+
+cursor_default_keychain_env_file() {
+  local home=""
+  home="$(cursor_login_home)"
+  [[ -n "$home" ]] && printf "%s/.env" "$home"
+}
+
+cursor_default_login_keychain() {
+  local home=""
+  home="$(cursor_login_home)"
+  [[ -n "$home" ]] && printf "%s/Library/Keychains/login.keychain-db" "$home"
+}
+
+read_cursor_keychain_password_from_env_file() {
+  local default_env_file=""
+  default_env_file="$(cursor_default_keychain_env_file)"
+  local env_file="${AUTONOM8_KEYCHAIN_ENV_FILE:-$default_env_file}"
+  local env_name="${AUTONOM8_KEYCHAIN_PASSWORD_ENV:-mini}"
+  [[ -n "$env_name" ]] || return 0
+
+  local value=""
+  if [[ "$env_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    value="${!env_name:-}"
+    if [[ -n "$value" ]]; then
+      printf "%s" "$value"
+      return 0
+    fi
+  fi
+
+  [[ -n "$env_file" && -f "$env_file" ]] || return 0
+
+  # Prefer shell-compatible .env loading so quoted or escaped passwords match
+  # the operator's manual `set -a; . "$HOME/.env"` unlock command exactly.
+  if [[ "$env_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    value="$(AUTONOM8_KEYCHAIN_ENV_FILE="$env_file" AUTONOM8_KEYCHAIN_PASSWORD_ENV="$env_name" bash -c '
+      set -a
+      # shellcheck disable=SC1090
+      . "$AUTONOM8_KEYCHAIN_ENV_FILE" >/dev/null 2>&1 || exit 0
+      key="$AUTONOM8_KEYCHAIN_PASSWORD_ENV"
+      printf "%s" "${!key-}"
+    ' 2>/dev/null || true)"
+    if [[ -n "$value" ]]; then
+      printf "%s" "$value"
+      return 0
+    fi
+  fi
+
+  # Fallback parser for simple KEY=value files when sourcing is not viable.
+  value="$(awk -v key="$env_name" '
+    {
+      line=$0
+      sub(/^[ \t]*export[ \t]+/, "", line)
+      eq=index(line, "=")
+      if (eq <= 0) next
+      k=substr(line, 1, eq-1)
+      gsub(/^[ \t]+|[ \t]+$/, "", k)
+      if (k == key) {
+        print substr(line, eq+1)
+      }
+    }
+  ' "$env_file" 2>/dev/null | tail -n 1)"
+  value="${value%$'\r'}"
+  value="${value#\"}"
+  value="${value%\"}"
+  value="${value#\'}"
+  value="${value%\'}"
+  printf "%s" "$value"
+}
+
+refresh_cursor_keychain_search_list() {
+  local keychain="${1:-}"
+  [[ -n "$keychain" && -f "$keychain" ]] || return 0
+  command -v security >/dev/null 2>&1 || return 0
+
+  # SSH-launched workers can unlock the keychain file yet still leave Cursor's
+  # child process with an incomplete user keychain search context. Make the
+  # login keychain explicit for this user session without logging secrets.
+  security default-keychain -d user -s "$keychain" >/dev/null 2>&1 || true
+
+  local existing=()
+  local item=""
+  while IFS= read -r item; do
+    item="${item#\"}"
+    item="${item%\"}"
+    [[ -z "$item" || "$item" == "$keychain" ]] && continue
+    existing+=("$item")
+  done < <(security list-keychains -d user 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+  if [[ ${#existing[@]} -gt 0 ]]; then
+    security list-keychains -d user -s "$keychain" "${existing[@]}" >/dev/null 2>&1 || true
+  else
+    security list-keychains -d user -s "$keychain" >/dev/null 2>&1 || true
+  fi
+}
+
+ensure_cursor_keychain_ready() {
+  [[ "$(uname -s 2>/dev/null || true)" == "Darwin" ]] || return 0
+  [[ "${AUTONOM8_CURSOR_UNLOCK_KEYCHAIN:-${AUTONOM8_UNLOCK_KEYCHAIN:-1}}" != "0" ]] || return 0
+  command -v security >/dev/null 2>&1 || return 0
+
+  if [[ "${AUTONOM8_CURSOR_NORMALIZE_HOME:-1}" != "0" ]]; then
+    local login_home=""
+    login_home="$(cursor_login_home)"
+    if [[ -n "$login_home" && -d "$login_home" && "${HOME:-}" != "$login_home" && -f "$login_home/Library/Keychains/login.keychain-db" ]]; then
+      export HOME="$login_home"
+      log_verbose "Cursor HOME normalized to login home for macOS keychain access"
+    fi
+  fi
+
+  local default_keychain=""
+  default_keychain="$(cursor_default_login_keychain)"
+  local keychain="${AUTONOM8_KEYCHAIN_PATH:-$default_keychain}"
+  [[ -n "$keychain" && -f "$keychain" ]] || return 0
+
+  local password="${AUTONOM8_KEYCHAIN_PASSWORD:-}"
+  if [[ -z "$password" ]]; then
+    password="$(read_cursor_keychain_password_from_env_file)"
+  fi
+  if [[ -z "$password" ]]; then
+    log_verbose "Cursor keychain unlock skipped: no AUTONOM8_KEYCHAIN_PASSWORD or configured env-file value"
+    return 0
+  fi
+
+  if security unlock-keychain -p "$password" "$keychain" >/dev/null 2>&1; then
+    refresh_cursor_keychain_search_list "$keychain"
+    if [[ "${AUTONOM8_KEYCHAIN_SET_TIMEOUT:-1}" != "0" ]]; then
+      security set-keychain-settings -lut "${AUTONOM8_KEYCHAIN_UNLOCK_TIMEOUT_SECONDS:-21600}" "$keychain" >/dev/null 2>&1 || true
+    fi
+    log_verbose "Cursor keychain readiness refreshed"
+  else
+    log_warn "Cursor keychain unlock failed; provider call may return credential_unavailable"
+  fi
+}
+
+is_cursor_keychain_locked_error() {
+  local text="${1:-}"
+  printf "%s" "$text" | grep -qiE 'login keychain is locked|macos login keychain is locked|security unlock-keychain'
+}
+
 cursor_agent_cli() {
   if [[ -z "${CURSOR_AGENT_BIN:-}" ]]; then
     return 127
   fi
+  ensure_cursor_keychain_ready
   "$CURSOR_AGENT_BIN" "$@"
 }
 
@@ -117,6 +314,7 @@ cursor_agent_cli() {
 run_with_timeout() {
   local timeout_secs="$1"
   shift
+  ensure_cursor_keychain_ready
 
   local timeout_cmd=""
   if command -v timeout &>/dev/null; then
@@ -137,8 +335,18 @@ run_with_timeout() {
     CURSOR_PID=""
     return $exit_code
   else
-    # Fallback: run in background with manual timeout
-    "$@" &
+    # Fallback: preserve piped stdin by buffering it before backgrounding the command.
+    local stdin_tmp=""
+    if [[ ! -t 0 ]]; then
+      stdin_tmp="$(mktemp)"
+      cat > "$stdin_tmp"
+    fi
+
+    if [[ -n "$stdin_tmp" ]]; then
+      "$@" < "$stdin_tmp" &
+    else
+      "$@" &
+    fi
     local pid=$!
     CURSOR_PID=$pid
 
@@ -166,6 +374,41 @@ run_with_timeout() {
 compact_reasoning_text() {
   local text="${1:-}"
   printf "%s" "$text" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' | sed 's/^ //;s/ $//'
+}
+
+cursor_main_output_format() {
+  local requested="${AUTONOM8_CURSOR_OUTPUT_FORMAT:-stream-json}"
+  case "$requested" in
+    json|stream-json|text)
+      printf "%s" "$requested"
+      ;;
+    *)
+      log_warn "Unsupported AUTONOM8_CURSOR_OUTPUT_FORMAT '$requested'; using stream-json"
+      printf "%s" "stream-json"
+      ;;
+  esac
+}
+
+cursor_stream_partial_output_enabled() {
+  [[ "${AUTONOM8_CURSOR_STREAM_PARTIAL_OUTPUT:-1}" != "0" ]]
+}
+
+extract_cursor_result_json() {
+  local raw_output="${1:-}"
+  local result_json=""
+
+  result_json="$(printf "%s\n" "$raw_output" | jq -c 'select(type == "object" and .type == "result")' 2>/dev/null | tail -n 1 || true)"
+  if [[ -n "$result_json" ]]; then
+    printf "%s" "$result_json"
+    return 0
+  fi
+
+  if printf "%s" "$raw_output" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    printf "%s" "$raw_output"
+    return 0
+  fi
+
+  return 1
 }
 
 is_reasoning_placeholder() {
@@ -416,7 +659,7 @@ emit_cli_error_response() {
   local reasoning_absent_reason="error_path"
   local recoverable=false
   case "$error_type" in
-    quota|rate_limit|timeout|invalid_session|invalid_model)
+    quota|rate_limit|timeout|invalid_session|invalid_model|credential_unavailable)
       recoverable=true
       ;;
   esac
@@ -1014,7 +1257,7 @@ CONTEXT_FILE=""
 CONTEXT_DIR=""
 CONTEXT_MAX=51200  # 50KB default max context size
 SKIP_CONTEXT_FILE=false
-ALLOW_TOOLS=false  # Cursor uses --force/--approve-mcps for tool access
+ALLOW_TOOLS=false  # Cursor uses --force for tool access; MCP approval is separate
 SESSION_ID=""        # Existing session ID to resume
 MANAGE_SESSION=""    # Request to create a new session (Cursor returns ID)
 SKILL_NAME=""        # Skill to invoke (from .cursor/skills/)
@@ -1050,7 +1293,9 @@ while [[ $# -gt 0 ]]; do
       YOLO_MODE=true; shift
       ;;
     --allow-tools|--allowed-tools)
-      # Cursor equivalent: enable tool access and auto-approve MCPs
+      # Cursor equivalent: enable tool access. MCP startup approval is handled
+      # independently below because even read-only/review calls can encounter
+      # Cursor's "MCP Server Approval Required" prompt before the model starts.
       ALLOW_TOOLS=true
       YOLO_MODE=true  # Cursor uses --force for command approvals
       shift
@@ -1105,6 +1350,12 @@ if [[ -n "$MODEL" ]]; then
     log_info "Model resolution: $MODEL_RESOLUTION_NOTE"
   fi
 fi
+case "$(printf "%s" "$PERMISSION_MODE" | tr '[:upper:]' '[:lower:]')" in
+  default)
+    log_info "Cursor mode 'default' requested; omitting --mode because cursor-agent only accepts plan/ask"
+    PERMISSION_MODE=""
+    ;;
+esac
 
 # ===================
 # Quota Status Mode
@@ -1166,7 +1417,7 @@ fi
 # ===================
 # If --health-check flag is provided, check provider health and return status
 if [[ "$HEALTH_CHECK" == "true" ]]; then
-  log_verbose "Health check mode: testing cursor CLI availability"
+  log_verbose "Health check mode: testing cursor CLI availability, auth, and headless response"
 
   START_TIME=$(date +%s%N 2>/dev/null || date +%s)
 
@@ -1182,9 +1433,39 @@ if [[ "$HEALTH_CHECK" == "true" ]]; then
     exit 1
   fi
 
-  # Try a minimal invocation to verify CLI works
-  HEALTH_OUTPUT=$(cursor_agent_cli --version 2>&1 || echo "version_check_failed")
-  HEALTH_EXIT=$?
+  # Try minimal invocations to verify CLI, macOS keychain-backed auth, and a
+  # headless model response. On macOS every fresh non-interactive SSH session may
+  # need login.keychain-db unlocked before cursor-agent can read credentials.
+  VERSION_OUTPUT=$(cursor_agent_cli --version 2>&1 || true)
+  VERSION_EXIT=$?
+  AUTH_OUTPUT=$(cursor_agent_cli status 2>&1 || true)
+  AUTH_EXIT=$?
+
+  PROBE_OUTPUT_FILE="$(mktemp)"
+  PROBE_ERR_FILE="$(mktemp)"
+  PROBE_TIMEOUT="${AUTONOM8_CURSOR_HEALTH_PROBE_TIMEOUT_SECONDS:-30}"
+  PROBE_MODEL="${AUTONOM8_CURSOR_HEALTH_PROBE_MODEL:-composer-2-fast}"
+  PROBE_PROMPT='Return exactly this JSON and no markdown: {"ok":true,"probe":"cursor_health"}'
+  PROBE_START=$(date +%s%N 2>/dev/null || date +%s)
+  set +e
+  run_with_timeout "$PROBE_TIMEOUT" "$CURSOR_AGENT_BIN" \
+    --print \
+    --output-format json \
+    --model "$PROBE_MODEL" \
+    --trust \
+    --workspace "${TMPDIR:-/tmp}" \
+    "$PROBE_PROMPT" > "$PROBE_OUTPUT_FILE" 2> "$PROBE_ERR_FILE"
+  PROBE_EXIT=$?
+  set -e
+  PROBE_END=$(date +%s%N 2>/dev/null || date +%s)
+  if [[ ${#PROBE_START} -gt 10 ]]; then
+    PROBE_LATENCY_MS=$(( (PROBE_END - PROBE_START) / 1000000 ))
+  else
+    PROBE_LATENCY_MS=$(( (PROBE_END - PROBE_START) * 1000 ))
+  fi
+  PROBE_OUTPUT="$(cat "$PROBE_OUTPUT_FILE" 2>/dev/null || true)"
+  PROBE_ERR="$(cat "$PROBE_ERR_FILE" 2>/dev/null || true)"
+  rm -f "$PROBE_OUTPUT_FILE" "$PROBE_ERR_FILE"
 
   END_TIME=$(date +%s%N 2>/dev/null || date +%s)
 
@@ -1195,34 +1476,67 @@ if [[ "$HEALTH_CHECK" == "true" ]]; then
     LATENCY_MS=$(( (END_TIME - START_TIME) * 1000 ))
   fi
 
-  if [[ $HEALTH_EXIT -eq 0 ]]; then
+  AUTH_OK=false
+  if [[ $AUTH_EXIT -eq 0 ]] && printf "%s" "$AUTH_OUTPUT" | grep -qi "logged in"; then
+    AUTH_OK=true
+  fi
+  PROBE_OK=false
+  PROBE_RESPONSE="$(printf "%s" "$PROBE_OUTPUT" | jq -r '.result // empty' 2>/dev/null || true)"
+  if [[ $PROBE_EXIT -eq 0 ]] && [[ -n "$PROBE_RESPONSE" ]] && printf "%s" "$PROBE_RESPONSE" | jq -e '.ok == true and .probe == "cursor_health"' >/dev/null 2>&1; then
+    PROBE_OK=true
+  fi
+
+  if [[ $VERSION_EXIT -eq 0 && "$AUTH_OK" == "true" && "$PROBE_OK" == "true" ]]; then
     # Extract version if available
-    VERSION=$(echo "$HEALTH_OUTPUT" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
+    VERSION=$(echo "$VERSION_OUTPUT" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
 
     jq -n --arg provider "cursor" \
           --arg status "ok" \
           --argjson latency "$LATENCY_MS" \
+          --argjson probe_latency "$PROBE_LATENCY_MS" \
           --arg version "$VERSION" \
+          --arg probe_model "$PROBE_MODEL" \
           '{
             provider: $provider,
             status: $status,
             latency_ms: $latency,
+            response_probe_latency_ms: $probe_latency,
             cli_available: true,
+            auth_ok: true,
+            response_probe_ok: true,
             version: $version,
+            probe_model: $probe_model,
+            mac_keychain_unlock: true,
             session_support: true
           }'
   else
     jq -n --arg provider "cursor" \
-          --arg error "$HEALTH_OUTPUT" \
+          --arg version_output "$VERSION_OUTPUT" \
+          --arg auth_output "$AUTH_OUTPUT" \
+          --arg probe_error "$PROBE_ERR" \
+          --arg probe_output "$PROBE_OUTPUT" \
           --argjson latency "$LATENCY_MS" \
+          --argjson probe_latency "$PROBE_LATENCY_MS" \
+          --argjson auth_ok "$AUTH_OK" \
+          --argjson probe_ok "$PROBE_OK" \
+          --arg probe_model "$PROBE_MODEL" \
           '{
             provider: $provider,
             status: "error",
             latency_ms: $latency,
+            response_probe_latency_ms: $probe_latency,
             cli_available: true,
-            error: $error,
+            auth_ok: $auth_ok,
+            response_probe_ok: $probe_ok,
+            version_output: $version_output,
+            auth_output: $auth_output,
+            probe_error: $probe_error,
+            probe_output: $probe_output,
+            probe_model: $probe_model,
+            mac_keychain_unlock: true,
             session_support: true
           }'
+    exit 1
   fi
   exit 0
 fi
@@ -1352,9 +1666,9 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
 
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
-    run_with_timeout "$CLI_TIMEOUT" "$CURSOR_AGENT_BIN" "${CURSOR_ARGS[@]}" "$SKILL_PROMPT" 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
+    run_with_timeout "$CLI_TIMEOUT" "$CURSOR_AGENT_BIN" "${CURSOR_ARGS[@]}" "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
   else
-    cursor_agent_cli "${CURSOR_ARGS[@]}" "$SKILL_PROMPT" 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
+    cursor_agent_cli "${CURSOR_ARGS[@]}" "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
   fi
   CURSOR_EXIT=$?
   set -e
@@ -1365,6 +1679,8 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
     ERROR_TYPE="provider_error"
     if [[ "$CURSOR_EXIT" -eq 124 ]]; then
       ERROR_TYPE="timeout"
+    elif is_cursor_keychain_locked_error "$ERROR_MSG"; then
+      ERROR_TYPE="credential_unavailable"
     elif echo "$ERROR_MSG" | grep -qi "Cannot use this model\|Unknown model\|Invalid model"; then
       ERROR_TYPE="invalid_model"
     elif declare -F classify_error >/dev/null; then
@@ -1506,16 +1822,31 @@ if [[ -f "${1-}" && "$1" == *.md ]]; then
     exit 2
   fi
 
+  MATERIALIZATION_ONLY_MODE=false
+  if printf '%s\n%s\n' "${INPUT_DATA:-}" "${AGENT_PROMPT:-}" | grep -Eiq 'bookend-start|bookend_start_contract_scope|BOOKEND-START MATERIALIZATION BOUNDARY|materialization[- ]only'; then
+    MATERIALIZATION_ONLY_MODE=true
+  fi
+
   # Build conditional tool rules based on --allowed-tools flag (same pattern as claude.sh)
   if [[ "$ALLOW_TOOLS" == "true" ]]; then
-    TOOL_RULES="- You MUST actually CREATE/MODIFY files as specified in the design plan
+    if [[ "$MATERIALIZATION_ONLY_MODE" == "true" ]]; then
+      TOOL_RULES="- You MUST actually CREATE/MODIFY only the explicitly scoped files in the design plan
+- You may create directories and read/write files required for materialization
+- Do NOT run browser automation, Playwright, screenshots, visual QA, golden tests, spec validation, dev servers, package managers, linters, formatters, or test commands
+- Do NOT use browser/test MCP tools in this pass
+- Stop immediately after materializing the scoped files and return the required JSON manifest
+- The worker/harness owns downstream validation, browser testing, screenshots, and finish-bookend integration"
+      log_verbose "Tools ENABLED in bookend-start materialization-only mode"
+    else
+      TOOL_RULES="- You MUST actually CREATE/MODIFY files as specified in the design plan
 - Use your file writing capabilities to create each file with proper content
 - After creating files, respond with a JSON summary of what you implemented
 - DO NOT just describe what files should contain - ACTUALLY WRITE THEM
 - The working directory is the project root - create files with the correct relative paths
 - You MAY use available MCP tools (file, browser, tests) to inspect and verify your work
 - Use verification tools after code changes to ensure correctness"
-    log_verbose "Tools ENABLED for this invocation"
+      log_verbose "Tools ENABLED for this invocation"
+    fi
   else
     TOOL_RULES="- Do NOT use any tools or commands
 - Do NOT explore the codebase or read files"
@@ -1699,21 +2030,37 @@ $TOOL_RULES
       ensure_cursor_mcp_config "$WORKSPACE_DIR" "$MCP_CONFIG_PATH"
     fi
   fi
+  if [[ "$ALLOW_TOOLS" != "true" && "${AUTONOM8_CURSOR_AUTO_APPROVE_MCPS:-1}" != "0" ]]; then
+    # Cursor can block non-interactive review/QA calls before the model starts
+    # with "MCP Server Approval Required" if the workspace has configured MCPs.
+    # Normalize/validate the MCP config for every call, but do not imply tool
+    # execution permissions; those remain controlled by --allowed-tools/--force.
+    MCP_CONFIG_PATH="$(get_cursor_mcp_config || true)"
+    if [[ -n "$MCP_CONFIG_PATH" ]]; then
+      ensure_cursor_mcp_config "$WORKSPACE_DIR" "$MCP_CONFIG_PATH"
+    fi
+  fi
 
-  # Build cursor-agent args
-  # Use JSON format to capture session_id from response (like claude.sh)
+  # Build cursor-agent args.
+  # Default to stream-json so the worker receives progress bytes during long
+  # Cursor implement calls; parse the final type=result event below to preserve
+  # the existing wrapper contract.
+  CURSOR_OUTPUT_FORMAT="$(cursor_main_output_format)"
   CURSOR_ARGS=(
     "--print"
-    "--output-format" "json"
+    "--output-format" "$CURSOR_OUTPUT_FORMAT"
     "--workspace" "$WORKSPACE_DIR"
     "--trust"
   )
+  if [[ "$CURSOR_OUTPUT_FORMAT" == "stream-json" ]] && cursor_stream_partial_output_enabled; then
+    CURSOR_ARGS+=("--stream-partial-output")
+  fi
 
   if [[ "$YOLO_MODE" == "true" ]]; then
     CURSOR_ARGS+=("--force")
   fi
 
-  if [[ "$ALLOW_TOOLS" == "true" ]]; then
+  if [[ "$ALLOW_TOOLS" == "true" || "${AUTONOM8_CURSOR_AUTO_APPROVE_MCPS:-1}" != "0" ]]; then
     CURSOR_ARGS+=("--approve-mcps")
   fi
 
@@ -1761,16 +2108,16 @@ $TOOL_RULES
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
     log_verbose "Running cursor-agent with timeout: ${CLI_TIMEOUT}s"
     if [[ -n "$AGENT_LOG" ]]; then
-      run_with_timeout "$CLI_TIMEOUT" "$CURSOR_AGENT_BIN" "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
+      run_with_timeout "$CLI_TIMEOUT" "$CURSOR_AGENT_BIN" "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
     else
-      run_with_timeout "$CLI_TIMEOUT" "$CURSOR_AGENT_BIN" "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
+      run_with_timeout "$CLI_TIMEOUT" "$CURSOR_AGENT_BIN" "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
     fi
     CURSOR_EXIT=$?
   else
     if [[ -n "$AGENT_LOG" ]]; then
-      cursor_agent_cli "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
+      cursor_agent_cli "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
     else
-      cursor_agent_cli "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
+      cursor_agent_cli "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
     fi
     CURSOR_EXIT=$?
   fi
@@ -1844,6 +2191,8 @@ $TOOL_RULES
     ERROR_TYPE="provider_error"
     if [[ "$CURSOR_EXIT" -eq 124 ]]; then
       ERROR_TYPE="timeout"
+    elif is_cursor_keychain_locked_error "$ERROR_MSG"; then
+      ERROR_TYPE="credential_unavailable"
     elif declare -F classify_error >/dev/null; then
       ERROR_TYPE="$(classify_error "$ERROR_MSG")"
     fi
@@ -1857,15 +2206,26 @@ $TOOL_RULES
   rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
 
   if [[ -n "$RAW_OUTPUT" ]]; then
-    # JSON format: Extract session_id and result from cursor-agent response
-    # cursor-agent returns: {"type":"result","result":"...","session_id":"..."}
-    CURSOR_SESSION_ID="$(echo "$RAW_OUTPUT" | jq -r '.session_id // empty' 2>/dev/null || true)"
-    RESPONSE_TEXT="$(echo "$RAW_OUTPUT" | jq -r '.result // empty' 2>/dev/null || true)"
+    RESULT_OUTPUT="$RAW_OUTPUT"
+    if [[ "${CURSOR_OUTPUT_FORMAT:-json}" == "stream-json" ]]; then
+      RESULT_OUTPUT="$(extract_cursor_result_json "$RAW_OUTPUT" || true)"
+    fi
+
+    if [[ -z "$RESULT_OUTPUT" ]]; then
+      emit_cli_error_response "No result event in response from cursor-agent" "provider_error" "$CURSOR_SESSION_ID" 1
+      exit 1
+    fi
+
+    # JSON/stream-json format: Extract session_id and result from cursor-agent
+    # response. Stream-json emits many events; RESULT_OUTPUT is only the final
+    # type=result event.
+    CURSOR_SESSION_ID="$(echo "$RESULT_OUTPUT" | jq -r '.session_id // empty' 2>/dev/null || true)"
+    RESPONSE_TEXT="$(echo "$RESULT_OUTPUT" | jq -r '.result // empty' 2>/dev/null || true)"
 
     # Check for error response
-    IS_ERROR="$(echo "$RAW_OUTPUT" | jq -r '.is_error // false' 2>/dev/null || true)"
+    IS_ERROR="$(echo "$RESULT_OUTPUT" | jq -r '.is_error // false' 2>/dev/null || true)"
     if [[ "$IS_ERROR" == "true" ]]; then
-      ERROR_MSG="$(echo "$RAW_OUTPUT" | jq -r '.result // "Unknown error"' 2>/dev/null || true)"
+      ERROR_MSG="$(echo "$RESULT_OUTPUT" | jq -r '.result // "Unknown error"' 2>/dev/null || true)"
       emit_cli_error_response "$ERROR_MSG" "provider_error" "$CURSOR_SESSION_ID" 1
       exit 1
     fi
@@ -1881,9 +2241,9 @@ $TOOL_RULES
       fi
 
       if [[ -n "$MODEL_RESOLUTION_NOTE" ]]; then
-        emit_cli_response "$RESPONSE_TEXT" "$CURSOR_SESSION_ID" "$RAW_OUTPUT" "model_resolution" "$MODEL_RESOLUTION_NOTE" "$STDERR_TEXT"
+        emit_cli_response "$RESPONSE_TEXT" "$CURSOR_SESSION_ID" "$RESULT_OUTPUT" "model_resolution" "$MODEL_RESOLUTION_NOTE" "$(printf "%s\n%s" "$RAW_OUTPUT" "$STDERR_TEXT")"
       else
-        emit_cli_response "$RESPONSE_TEXT" "$CURSOR_SESSION_ID" "$RAW_OUTPUT" "" "" "$STDERR_TEXT"
+        emit_cli_response "$RESPONSE_TEXT" "$CURSOR_SESSION_ID" "$RESULT_OUTPUT" "" "" "$(printf "%s\n%s" "$RAW_OUTPUT" "$STDERR_TEXT")"
       fi
     else
       # No result field - try raw response as fallback

@@ -5,6 +5,8 @@
 
 set -euo pipefail
 
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+
 WRAPPER_REQ_ID="${AUTONOM8_REQUEST_ID:-${A8_REQUEST_ID:-}}"
 exec 3>&2
 if [[ -n "${WRAPPER_REQ_ID}" ]]; then
@@ -91,8 +93,18 @@ run_with_timeout() {
     "$timeout_cmd" --foreground --signal=TERM --kill-after=5 "$timeout_secs" "$@"
     return $?
   else
-    # Fallback: run in background with manual timeout
-    "$@" &
+    # Fallback: preserve piped stdin by buffering it before backgrounding the command.
+    local stdin_tmp=""
+    if [[ ! -t 0 ]]; then
+      stdin_tmp="$(mktemp)"
+      cat > "$stdin_tmp"
+    fi
+
+    if [[ -n "$stdin_tmp" ]]; then
+      "$@" < "$stdin_tmp" &
+    else
+      "$@" &
+    fi
     local pid=$!
     GEMINI_PID=$pid
 
@@ -122,9 +134,9 @@ stream_stdout_to_files() {
   local stream_log="${2:-}"
 
   if [[ -n "$stream_log" ]]; then
-    tee -a "$stream_log" "$output_file" >&3
+    tee -a "$stream_log" "$output_file" >/dev/null
   else
-    tee "$output_file" >&3
+    cat > "$output_file"
   fi
 }
 
@@ -945,7 +957,7 @@ is_gemini_capacity_error() {
   local error_msg="${1:-}"
   local error_lower=""
   error_lower="$(printf "%s" "$error_msg" | tr '[:upper:]' '[:lower:]')"
-  printf "%s" "$error_lower" | grep -qiE 'model_capacity_exhausted|resource_exhausted|no capacity available for model|ratelimitexceeded'
+  printf "%s" "$error_lower" | grep -qiE 'model_capacity_exhausted|resource_exhausted|no capacity available for model|ratelimitexceeded|exhausted your capacity on this model|quota will reset after'
 }
 
 retry_with_gemini_capacity_fallback() {
@@ -1627,7 +1639,7 @@ if [[ -f "${1-}" && "$1" == *.md ]]; then
       ensure_gemini_mcp_servers "$MCP_CONFIG_PATH"
       MCP_SERVER_NAMES=()
       MCP_SERVER_NAMES_COUNT=0
-      local mcp_server_name=""
+      mcp_server_name=""
       while IFS= read -r mcp_server_name; do
         [[ -z "$mcp_server_name" ]] && continue
         MCP_SERVER_NAMES+=("$mcp_server_name")

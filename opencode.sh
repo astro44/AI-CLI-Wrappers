@@ -5,9 +5,11 @@
 
 set -euo pipefail
 
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+
 WRAPPER_REQ_ID="${AUTONOM8_REQUEST_ID:-${A8_REQUEST_ID:-}}"
-exec 3>&2
 if [[ -n "${WRAPPER_REQ_ID}" ]]; then
+  exec 3>&2
   exec 2> >(while IFS= read -r __a8_line; do
     printf '[req=%s] %s\n' "${WRAPPER_REQ_ID}" "${__a8_line}" >&3
   done)
@@ -92,8 +94,18 @@ run_with_timeout() {
     OPENCODE_PID=""
     return $exit_code
   else
-    # Fallback: run in background with manual timeout
-    "$@" &
+    # Fallback: preserve piped stdin by buffering it before backgrounding the command.
+    local stdin_tmp=""
+    if [[ ! -t 0 ]]; then
+      stdin_tmp="$(mktemp)"
+      cat > "$stdin_tmp"
+    fi
+
+    if [[ -n "$stdin_tmp" ]]; then
+      "$@" < "$stdin_tmp" &
+    else
+      "$@" &
+    fi
     local pid=$!
     OPENCODE_PID=$pid
 
@@ -998,10 +1010,10 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
     # shellcheck disable=SC2086
-    run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$SKILL_PROMPT" 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
+    run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
   else
     # shellcheck disable=SC2086
-    opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$SKILL_PROMPT" 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
+    opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
   fi
   OPENCODE_EXIT=$?
   set -e
@@ -1292,16 +1304,16 @@ $TOOL_RULES
     echo "🤖 [OpenCode] Timeout: ${CLI_TIMEOUT}s" >&2
     # shellcheck disable=SC2086
     if [[ -n "$AGENT_LOG" ]]; then
-      run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$FULL_PROMPT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
+      run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$FULL_PROMPT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
     else
-      run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$FULL_PROMPT" 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
+      run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$FULL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
     fi
   else
     # shellcheck disable=SC2086
     if [[ -n "$AGENT_LOG" ]]; then
-      opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$FULL_PROMPT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
+      opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$FULL_PROMPT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
     else
-      opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$FULL_PROMPT" 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
+      opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$FULL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
     fi
   fi
   OPENCODE_EXIT=$?

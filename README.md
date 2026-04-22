@@ -23,6 +23,31 @@ The wrappers standardize the execution of AI agents by handling:
 | `opencode.sh` | OpenCode | Catalog-backed model normalization/fallback, optimized for fast code generation. |
 | `cursor.sh` | Cursor Agent | Workspace-aware, beta skills support, auto-approval for MCPs. |
 
+### Cursor macOS Keychain Bootstrap
+
+`cursor.sh` refreshes the macOS login keychain before each Cursor CLI process when running on Darwin. This is required for SSH-launched Mac Mini workers because Cursor stores CLI credentials in `login.keychain-db`, while a non-GUI worker process can outlive or miss a manual keychain unlock. The wrapper only unlocks the keychain so an already-authenticated Cursor CLI can read its credentials; it does not log in to Cursor or create credentials.
+
+Configuration:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AUTONOM8_CURSOR_UNLOCK_KEYCHAIN` | `1` | Set to `0` to disable Cursor-specific keychain refresh. |
+| `AUTONOM8_UNLOCK_KEYCHAIN` | `1` | Shared fallback opt-out when the Cursor-specific variable is unset. |
+| `AUTONOM8_KEYCHAIN_PASSWORD` | unset | Explicit keychain password. Preferred for process supervisors that inject secrets directly. |
+| `AUTONOM8_KEYCHAIN_PASSWORD_ENV` | `mini` | Name of the env var containing the keychain password. |
+| `AUTONOM8_KEYCHAIN_ENV_FILE` | `<login-home>/.env` | File sourced or parsed when the password env var is not already exported. Falls back to the login user's home if `HOME` is sanitized by a worker. |
+| `AUTONOM8_KEYCHAIN_PATH` | `<login-home>/Library/Keychains/login.keychain-db` | Keychain unlocked before invoking Cursor. Falls back to the login user's home if `HOME` is sanitized by a worker. |
+| `AUTONOM8_KEYCHAIN_UNLOCK_TIMEOUT_SECONDS` | `21600` | Timeout passed to `security set-keychain-settings -lut`. |
+| `AUTONOM8_KEYCHAIN_SET_TIMEOUT` | `1` | Set to `0` to unlock without refreshing the keychain timeout. |
+| `AUTONOM8_CURSOR_NORMALIZE_HOME` | `1` | Set to `0` to keep process `HOME` unchanged. By default Cursor invocations on macOS use the login user's home so Cursor Agent resolves the same keychain/config as an interactive session. |
+
+Security and operations notes:
+
+- Do not print or commit the `mini` value or any `.env` file containing it.
+- The wrapper first checks the already-exported password variable, then sources `AUTONOM8_KEYCHAIN_ENV_FILE`, then falls back to a simple `KEY=value` parser. This mirrors the operator command `set -a; . "$HOME/.env"; security unlock-keychain -p "$mini" ...` without logging the secret.
+- Missing or failed unlock is intentionally non-fatal. The Cursor call continues so the caller receives the provider's real `credential_unavailable` error.
+- If `credential_unavailable` only appears when multiple Cursor sessions start concurrently, treat that as a routing/concurrency issue rather than a password issue; avoid overlapping Cursor QA and implement calls or add a provider-level Cursor lock.
+
 ## Unified Interface
 
 All wrappers support a common set of arguments to ensure interchangeable usage by the `climanager`.
