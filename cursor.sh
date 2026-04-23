@@ -6,7 +6,10 @@
 #   2. cursor-agent — legacy / alternate install name on PATH
 #   3. agent — official Cursor CLI (https://cursor.com/docs/cli/overview), verified not to be another tool named agent
 # Updated to support --dry-run, --verbose, macOS keychain refresh, and
-# non-interactive MCP startup approval (v2.3)
+# non-interactive MCP startup approval (v2.3).
+# Fix 1 (CLI): pass --approve-mcps on all headless --print invocations by default
+# so workers do not block on "MCP Server Approval Required". Opt out with:
+#   AUTONOM8_CURSOR_AUTO_APPROVE_MCPS=0
 
 set -euo pipefail
 
@@ -25,6 +28,18 @@ CURSOR_PID=""
 CLI_TIMEOUT=""  # Timeout in seconds, passed from Go worker
 RESPONSE_EMITTED=false
 CURSOR_INVALID_MODEL_RETRIED=false
+
+TOOL_TELEMETRY_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib/tool-telemetry.sh"
+if [[ -f "$TOOL_TELEMETRY_LIB" ]]; then
+  # shellcheck disable=SC1090
+  source "$TOOL_TELEMETRY_LIB"
+fi
+if ! declare -F autonom8_tool_activity_json >/dev/null; then
+  autonom8_tool_activity_json() { jq -cn '{call_count:0, write_count:0, error_count:0, tool_names:[], result_classes:[], activity_class:"none", source:"unavailable"}'; }
+fi
+if ! declare -F autonom8_merge_tool_activity >/dev/null; then
+  autonom8_merge_tool_activity() { cat; }
+fi
 
 # Cleanup function to kill child processes on script termination
 cleanup() {
@@ -302,12 +317,26 @@ is_cursor_keychain_locked_error() {
   printf "%s" "$text" | grep -qiE 'login keychain is locked|macos login keychain is locked|security unlock-keychain'
 }
 
+should_retry_cursor_keychain_unlock() {
+  local text="${1:-}"
+  [[ "${AUTONOM8_CURSOR_KEYCHAIN_ERROR_RETRY:-1}" != "0" ]] || return 1
+  [[ "${CURSOR_KEYCHAIN_ERROR_RETRIED:-false}" != "true" ]] || return 1
+  is_cursor_keychain_locked_error "$text"
+}
+
 cursor_agent_cli() {
   if [[ -z "${CURSOR_AGENT_BIN:-}" ]]; then
     return 127
   fi
   ensure_cursor_keychain_ready
   "$CURSOR_AGENT_BIN" "$@"
+}
+
+# True when we should pass --approve-mcps (always except AUTONOM8_CURSOR_AUTO_APPROVE_MCPS=0).
+# --allow-tools implies MCP may run; auto-approve also covers review-only runs that still
+# load workspace MCP config (Cursor prompts before the model starts).
+cursor_agent_want_approve_mcps() {
+  [[ "${ALLOW_TOOLS:-false}" == "true" ]] || [[ "${AUTONOM8_CURSOR_AUTO_APPROVE_MCPS:-1}" != "0" ]]
 }
 
 # Run command with timeout (runs in background so we can track PID for cleanup)
@@ -595,6 +624,9 @@ emit_cli_response() {
     | if .cache_creation_input_tokens == null then .cache_creation_input_tokens = 0 else . end
   ' 2>/dev/null || echo "$tokens_json")"
 
+  local tool_activity_json
+  tool_activity_json="$(autonom8_tool_activity_json "$raw_output" "$stream_output" "wrapper:cursor")"
+
   RESPONSE_EMITTED=true
 
   if [[ -n "$session_id" && -n "$extra_field_name" ]]; then
@@ -609,7 +641,8 @@ emit_cli_response() {
       --argjson reasoning_available "$reasoning_available" \
       --arg reasoning_source "$reasoning_source" \
       --arg reasoning_absent_reason "$reasoning_absent_reason" \
-      '{response: $resp, session_id: $sid, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}} + {($extra_name): $extra_val}'
+      '{response: $resp, session_id: $sid, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}} + {($extra_name): $extra_val}' \
+      | autonom8_merge_tool_activity "$tool_activity_json"
   elif [[ -n "$session_id" ]]; then
     jq -n \
       --arg resp "$response_text" \
@@ -620,7 +653,8 @@ emit_cli_response() {
       --argjson reasoning_available "$reasoning_available" \
       --arg reasoning_source "$reasoning_source" \
       --arg reasoning_absent_reason "$reasoning_absent_reason" \
-      '{response: $resp, session_id: $sid, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}}'
+      '{response: $resp, session_id: $sid, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}}' \
+      | autonom8_merge_tool_activity "$tool_activity_json"
   elif [[ -n "$extra_field_name" ]]; then
     jq -n \
       --arg resp "$response_text" \
@@ -632,7 +666,8 @@ emit_cli_response() {
       --argjson reasoning_available "$reasoning_available" \
       --arg reasoning_source "$reasoning_source" \
       --arg reasoning_absent_reason "$reasoning_absent_reason" \
-      '{response: $resp, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}} + {($extra_name): $extra_val}'
+      '{response: $resp, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}} + {($extra_name): $extra_val}' \
+      | autonom8_merge_tool_activity "$tool_activity_json"
   else
     jq -n \
       --arg resp "$response_text" \
@@ -642,7 +677,8 @@ emit_cli_response() {
       --argjson reasoning_available "$reasoning_available" \
       --arg reasoning_source "$reasoning_source" \
       --arg reasoning_absent_reason "$reasoning_absent_reason" \
-      '{response: $resp, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}}'
+      '{response: $resp, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}}' \
+      | autonom8_merge_tool_activity "$tool_activity_json"
   fi
 }
 
@@ -897,6 +933,12 @@ ensure_cursor_mcp_config() {
 # Script is in bin/cursor.sh, so CORE_DIR is parent of bin/
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CORE_DIR="$(dirname "$SCRIPT_DIR")"
+
+is_agent_markdown_arg() {
+  local candidate="${1:-}"
+  [[ "$candidate" == *.md ]] || return 1
+  [[ -f "$candidate" || -f "$CORE_DIR/$candidate" ]]
+}
 
 extract_tenant_root() {
   local path="${1:-}"
@@ -1448,11 +1490,16 @@ if [[ "$HEALTH_CHECK" == "true" ]]; then
   PROBE_PROMPT='Return exactly this JSON and no markdown: {"ok":true,"probe":"cursor_health"}'
   PROBE_START=$(date +%s%N 2>/dev/null || date +%s)
   set +e
+  PROBE_MCP_ARGS=()
+  if cursor_agent_want_approve_mcps; then
+    PROBE_MCP_ARGS+=(--approve-mcps)
+  fi
   run_with_timeout "$PROBE_TIMEOUT" "$CURSOR_AGENT_BIN" \
     --print \
     --output-format json \
     --model "$PROBE_MODEL" \
     --trust \
+    "${PROBE_MCP_ARGS[@]}" \
     --workspace "${TMPDIR:-/tmp}" \
     "$PROBE_PROMPT" > "$PROBE_OUTPUT_FILE" 2> "$PROBE_ERR_FILE"
   PROBE_EXIT=$?
@@ -1644,16 +1691,20 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
     fi
   fi
 
-  # Build cursor-agent args
+  # Build cursor-agent args (--approve-mcps: see cursor_agent_want_approve_mcps).
   CURSOR_ARGS=(
     "--print"
     "--output-format" "text"
+    "--trust"
   )
   if [[ -n "$WORK_DIR" ]]; then
     CURSOR_ARGS+=("--workspace" "$WORK_DIR")
   fi
   if [[ "$YOLO_MODE" == "true" ]]; then
     CURSOR_ARGS+=("--force")
+  fi
+  if cursor_agent_want_approve_mcps; then
+    CURSOR_ARGS+=("--approve-mcps")
   fi
 
   # Add model flag if specified
@@ -1663,6 +1714,13 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
   fi
 
   log_verbose "Invoking cursor-agent CLI for skill (WorkDir: ${WORK_DIR:-none}, Source: ${WORK_DIR_SOURCE:-none}, Model: ${MODEL:-default})"
+
+  if cursor_agent_want_approve_mcps; then
+    MCP_CONFIG_PATH="$(get_cursor_mcp_config || true)"
+    if [[ -n "$MCP_CONFIG_PATH" ]]; then
+      ensure_cursor_mcp_config "$WORK_DIR" "$MCP_CONFIG_PATH"
+    fi
+  fi
 
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
@@ -1675,11 +1733,24 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
 
   if [[ $CURSOR_EXIT -ne 0 ]]; then
     ERROR_MSG=$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' || echo "Unknown error")
+    ERROR_STDOUT=$(cat "$TMPFILE_OUTPUT" 2>/dev/null | tr -d '\0' || true)
+    ERROR_COMBINED="$ERROR_MSG"
+    if [[ -n "$ERROR_STDOUT" ]]; then
+      ERROR_COMBINED="${ERROR_COMBINED}"$'\n'"${ERROR_STDOUT}"
+    fi
+    if should_retry_cursor_keychain_unlock "$ERROR_COMBINED"; then
+      CURSOR_KEYCHAIN_ERROR_RETRIED=true
+      log_info "Cursor reported locked macOS keychain after pre-call refresh; unlocking and retrying once"
+      ensure_cursor_keychain_ready
+      : > "$TMPFILE_OUTPUT"
+      : > "$TMPFILE_ERR"
+      continue
+    fi
     rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
     ERROR_TYPE="provider_error"
     if [[ "$CURSOR_EXIT" -eq 124 ]]; then
       ERROR_TYPE="timeout"
-    elif is_cursor_keychain_locked_error "$ERROR_MSG"; then
+    elif is_cursor_keychain_locked_error "$ERROR_COMBINED"; then
       ERROR_TYPE="credential_unavailable"
     elif echo "$ERROR_MSG" | grep -qi "Cannot use this model\|Unknown model\|Invalid model"; then
       ERROR_TYPE="invalid_model"
@@ -1726,7 +1797,7 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
   exit 0
 fi
 
-if [[ -f "${1-}" && "$1" == *.md ]]; then
+if is_agent_markdown_arg "${1-}"; then
   AGENT_FILE="$1"; shift
 
   # Resolve agent file path to absolute path
@@ -2024,17 +2095,7 @@ $TOOL_RULES
     WORKSPACE_SOURCE="tenant_fallback"
   fi
   log_verbose "Invoking cursor-agent CLI (Workspace: ${WORKSPACE_DIR}, Source: ${WORKSPACE_SOURCE}, YOLO: $YOLO_MODE)"
-  if [[ "$ALLOW_TOOLS" == "true" ]]; then
-    MCP_CONFIG_PATH="$(get_cursor_mcp_config || true)"
-    if [[ -n "$MCP_CONFIG_PATH" ]]; then
-      ensure_cursor_mcp_config "$WORKSPACE_DIR" "$MCP_CONFIG_PATH"
-    fi
-  fi
-  if [[ "$ALLOW_TOOLS" != "true" && "${AUTONOM8_CURSOR_AUTO_APPROVE_MCPS:-1}" != "0" ]]; then
-    # Cursor can block non-interactive review/QA calls before the model starts
-    # with "MCP Server Approval Required" if the workspace has configured MCPs.
-    # Normalize/validate the MCP config for every call, but do not imply tool
-    # execution permissions; those remain controlled by --allowed-tools/--force.
+  if cursor_agent_want_approve_mcps; then
     MCP_CONFIG_PATH="$(get_cursor_mcp_config || true)"
     if [[ -n "$MCP_CONFIG_PATH" ]]; then
       ensure_cursor_mcp_config "$WORKSPACE_DIR" "$MCP_CONFIG_PATH"
@@ -2138,7 +2199,21 @@ $TOOL_RULES
   if [[ $CURSOR_EXIT -ne 0 ]]; then
     # Cursor failed - return error with stderr
     ERROR_MSG=$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' || echo "Unknown error")
+    ERROR_STDOUT=$(cat "$TMPFILE_OUTPUT" 2>/dev/null | tr -d '\0' || true)
+    ERROR_COMBINED="$ERROR_MSG"
+    if [[ -n "$ERROR_STDOUT" ]]; then
+      ERROR_COMBINED="${ERROR_COMBINED}"$'\n'"${ERROR_STDOUT}"
+    fi
     log_verbose "Cursor execution failed: $ERROR_MSG"
+
+    if should_retry_cursor_keychain_unlock "$ERROR_COMBINED"; then
+      CURSOR_KEYCHAIN_ERROR_RETRIED=true
+      log_info "Cursor reported locked macOS keychain after pre-call refresh; unlocking and retrying once"
+      ensure_cursor_keychain_ready
+      : > "$TMPFILE_OUTPUT"
+      : > "$TMPFILE_ERR"
+      continue
+    fi
 
     if [[ "$CURSOR_INVALID_MODEL_RETRIED" != "true" ]] && declare -F is_invalid_model_error >/dev/null && is_invalid_model_error "$ERROR_MSG"; then
       REQUESTED_MODEL_LABEL="${MODEL_REQUESTED_RAW:-$MODEL}"
@@ -2191,7 +2266,7 @@ $TOOL_RULES
     ERROR_TYPE="provider_error"
     if [[ "$CURSOR_EXIT" -eq 124 ]]; then
       ERROR_TYPE="timeout"
-    elif is_cursor_keychain_locked_error "$ERROR_MSG"; then
+    elif is_cursor_keychain_locked_error "$ERROR_COMBINED"; then
       ERROR_TYPE="credential_unavailable"
     elif declare -F classify_error >/dev/null; then
       ERROR_TYPE="$(classify_error "$ERROR_MSG")"

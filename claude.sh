@@ -20,6 +20,18 @@ CLAUDE_PID=""
 CLI_TIMEOUT=""  # Timeout in seconds, passed from Go worker
 RESPONSE_EMITTED=false
 
+TOOL_TELEMETRY_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib/tool-telemetry.sh"
+if [[ -f "$TOOL_TELEMETRY_LIB" ]]; then
+  # shellcheck disable=SC1090
+  source "$TOOL_TELEMETRY_LIB"
+fi
+if ! declare -F autonom8_tool_activity_json >/dev/null; then
+  autonom8_tool_activity_json() { jq -cn '{call_count:0, write_count:0, error_count:0, tool_names:[], result_classes:[], activity_class:"none", source:"unavailable"}'; }
+fi
+if ! declare -F autonom8_merge_tool_activity >/dev/null; then
+  autonom8_merge_tool_activity() { cat; }
+fi
+
 # Cleanup function to kill child processes on script termination
 cleanup() {
   if [[ -n "$CLAUDE_PID" ]] && kill -0 "$CLAUDE_PID" 2>/dev/null; then
@@ -375,6 +387,9 @@ emit_cli_response() {
     | if .cache_creation_input_tokens == null then .cache_creation_input_tokens = 0 else . end
   ' 2>/dev/null || echo "$tokens_json")"
 
+  local tool_activity_json
+  tool_activity_json="$(autonom8_tool_activity_json "$raw_output" "$stream_output" "wrapper:claude")"
+
   RESPONSE_EMITTED=true
 
   if [[ -n "$session_id" && -n "$extra_field_name" ]]; then
@@ -389,7 +404,8 @@ emit_cli_response() {
       --argjson reasoning_available "$reasoning_available" \
       --arg reasoning_source "$reasoning_source" \
       --arg reasoning_absent_reason "$reasoning_absent_reason" \
-      '{response: $resp, session_id: $sid, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}} + {($extra_name): $extra_val}'
+      '{response: $resp, session_id: $sid, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}} + {($extra_name): $extra_val}' \
+      | autonom8_merge_tool_activity "$tool_activity_json"
   elif [[ -n "$session_id" ]]; then
     jq -n \
       --arg resp "$response_text" \
@@ -400,7 +416,8 @@ emit_cli_response() {
       --argjson reasoning_available "$reasoning_available" \
       --arg reasoning_source "$reasoning_source" \
       --arg reasoning_absent_reason "$reasoning_absent_reason" \
-      '{response: $resp, session_id: $sid, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}}'
+      '{response: $resp, session_id: $sid, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}}' \
+      | autonom8_merge_tool_activity "$tool_activity_json"
   elif [[ -n "$extra_field_name" ]]; then
     jq -n \
       --arg resp "$response_text" \
@@ -412,7 +429,8 @@ emit_cli_response() {
       --argjson reasoning_available "$reasoning_available" \
       --arg reasoning_source "$reasoning_source" \
       --arg reasoning_absent_reason "$reasoning_absent_reason" \
-      '{response: $resp, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}} + {($extra_name): $extra_val}'
+      '{response: $resp, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}} + {($extra_name): $extra_val}' \
+      | autonom8_merge_tool_activity "$tool_activity_json"
   else
     jq -n \
       --arg resp "$response_text" \
@@ -422,7 +440,8 @@ emit_cli_response() {
       --argjson reasoning_available "$reasoning_available" \
       --arg reasoning_source "$reasoning_source" \
       --arg reasoning_absent_reason "$reasoning_absent_reason" \
-      '{response: $resp, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}}'
+      '{response: $resp, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}}' \
+      | autonom8_merge_tool_activity "$tool_activity_json"
   fi
 }
 
@@ -539,6 +558,12 @@ log_verbose() {
 # Script is in bin/claude.sh, so CORE_DIR is parent of bin/
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CORE_DIR="$(dirname "$SCRIPT_DIR")"
+
+is_agent_markdown_arg() {
+  local candidate="${1:-}"
+  [[ "$candidate" == *.md ]] || return 1
+  [[ -f "$candidate" || -f "$CORE_DIR/$candidate" ]]
+}
 
 # =============================================================================
 # Prompt Utilities (inlined, provider-specific)
@@ -1355,7 +1380,7 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
   exit 0
 fi
 
-if [[ -f "${1-}" && "$1" == *.md ]]; then
+if is_agent_markdown_arg "${1-}"; then
   AGENT_FILE="$1"; shift
 
   # Resolve agent file path to absolute path
@@ -1451,12 +1476,27 @@ if [[ -f "${1-}" && "$1" == *.md ]]; then
     exit 2
   fi
 
+  MATERIALIZATION_ONLY_MODE=false
+  if printf '%s\n%s\n' "${INPUT_DATA:-}" "${AGENT_PROMPT:-}" | grep -Eiq 'bookend-start|bookend_start_contract_scope|BOOKEND-START MATERIALIZATION BOUNDARY|materialization[- ]only'; then
+    MATERIALIZATION_ONLY_MODE=true
+  fi
+
   # Build conditional tool rules based on --allow-tools flag
   if [[ "$ALLOW_TOOLS" == "true" ]]; then
-    TOOL_RULES="- You MAY use available MCP tools (file, browser, tests) to inspect and verify your work
+    if [[ "$MATERIALIZATION_ONLY_MODE" == "true" ]]; then
+      TOOL_RULES="- You MUST actually CREATE/MODIFY only the explicitly scoped files in the design plan
+- You may create directories and read/write files required for materialization
+- Do NOT run browser automation, Playwright, screenshots, visual QA, golden tests, spec validation, dev servers, package managers, linters, formatters, or test commands
+- Do NOT use browser/test MCP tools in this pass
+- Stop immediately after materializing the scoped files and return the required JSON manifest
+- The worker/harness owns downstream validation, browser testing, screenshots, and finish-bookend integration"
+      log_verbose "Tools ENABLED in bookend-start materialization-only mode"
+    else
+      TOOL_RULES="- You MAY use available MCP tools (file, browser, tests) to inspect and verify your work
 - Use verification tools after code changes to ensure correctness
 - You can read files and explore the codebase as needed"
-    log_verbose "Tools ENABLED for this invocation"
+      log_verbose "Tools ENABLED for this invocation"
+    fi
   else
     TOOL_RULES="- Do NOT use any tools or commands
 - Do NOT explore the codebase or read files"
