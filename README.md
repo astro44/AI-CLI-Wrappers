@@ -11,6 +11,7 @@ The wrappers standardize the execution of AI agents by handling:
 - **Skill Execution**: Invoking specific skills with structured input.
 - **Process Lifecycle**: Managing timeouts, signal handling, and cleanup of child processes.
 - **Tool Access**: configuring sandbox permissions and MCP tool access (YOLO mode).
+- **Tool Activity Telemetry**: extracting tool/function call counts, classes, and error signals into the response envelope.
 - **JSON Output**: Ensuring responses are returned in a structured JSON format for the caller.
 
 ## Available Wrappers
@@ -108,7 +109,16 @@ The wrappers print JSON to **stdout** via `emit_cli_response`. All wrappers shar
     "token_usage_available": true,
     "reasoning_available": true,
     "reasoning_source": "session_assistant",
-    "reasoning_absent_reason": "available"
+    "reasoning_absent_reason": "available",
+    "tool_activity": {
+      "call_count": 4,
+      "write_count": 1,
+      "error_count": 0,
+      "tool_names": ["Read", "Grep", "Edit"],
+      "result_classes": ["read", "write"],
+      "activity_class": "write_active",
+      "source": "wrapper:claude"
+    }
   },
   "model_resolution": "provider model 'requested' -> 'effective' (fallback)"
 }
@@ -117,6 +127,7 @@ The wrappers print JSON to **stdout** via `emit_cli_response`. All wrappers shar
 Optional fields:
 - `"model_resolution"` when the wrapper normalized or fell back from the requested model.
 - `"skill"` for skill-oriented wrapper paths.
+- `"metadata.tool_activity"` only appears when the wrapper observed one or more tool calls; omitted for pure-text responses.
 
 Skill invocations include an extra `"skill": "<name>"` field. Markdown code fences are stripped automatically.
 
@@ -220,6 +231,69 @@ Token usage is extracted from multiple sources, in priority order:
 3. **Stream output** — Regex extraction of `tokens used [N]` from stderr progress output.
 
 All sources are normalized to the same schema: `{input_tokens, output_tokens, total_tokens, cost_usd}`. If `total_tokens` is zero but input + output are available, the total is computed automatically.
+
+## Tool Activity Telemetry
+
+All wrappers source `lib/tool-telemetry.sh` to emit a best-effort summary of tool/function calls observed during the run. When any calls are detected, the summary is merged into `metadata.tool_activity` on the success envelope; when none are detected, the field is omitted.
+
+Two functions drive this:
+
+- `autonom8_tool_activity_json <raw_output> <stream_output> <source>` — parses JSON payloads and stream text to produce the telemetry object.
+- `autonom8_merge_tool_activity <tool_activity_json>` — piped after the final `jq` stage to fold the object into `metadata.tool_activity` only when activity was observed.
+
+### Extraction Sources
+
+The library inspects both the raw CLI output and the streamed stderr for tool-call evidence:
+
+1. **Structured JSON** — recognizes `toolCalls[]`, `tool_calls[]`, `functionCall`, `function_call`, and events whose `type` matches `tool`, `tool_use`, `tool_call`, `function_call`, `tool-call`, `tool.start`, or `tool_start`.
+2. **Stream text** — scans for patterns like `Tool <name> executed|called|started|completed|failed` (also matches `function` and `mcp` prefixes).
+3. **Provider-native stores** — `opencode.sh` additionally reads tool events from the OpenCode session SQLite (`~/.local/share/opencode/opencode.db`, `part` table) so tool activity is captured even when the CLI did not stream it.
+
+Tool names are compacted: `functions.<name>` is stripped, `mcp__ns__tool` is normalized to `ns.tool`, and non-alphanumeric noise is collapsed to `_`.
+
+### Schema
+
+```json
+{
+  "call_count": 4,
+  "write_count": 1,
+  "error_count": 0,
+  "tool_names": ["Read", "Grep", "Edit"],
+  "result_classes": ["read", "write"],
+  "activity_class": "write_active",
+  "source": "wrapper:claude"
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `call_count` | Total tool invocations observed (duplicates counted). |
+| `write_count` | Invocations classified as mutating (see below). |
+| `error_count` | Tool calls reporting `is_error`, `ok: false`, or error-class status/result, plus stream matches for `tool ... error/failed/failure`. |
+| `tool_names` | Deduplicated list of compacted tool names. |
+| `result_classes` | Deduplicated list of behavior classes seen. |
+| `activity_class` | Roll-up: `tool_errors` \| `write_active` \| `tool_active` \| `none`. |
+| `source` | Origin tag, e.g. `wrapper:claude`, `wrapper:opencode`. |
+
+### Tool Classification
+
+Tool names are classified by regex over their lowercased form:
+
+| Class | Matches |
+|-------|---------|
+| `write` | `apply_patch`, `write`, `edit`, `multi_edit`, `replace`, `create`, `delete`, `remove`, `move`, `rename`, `insert` |
+| `read` | `read`, `cat`, `open`, `view`, `list`, `ls`, `find`, `grep`, `rg`, `search` |
+| `browser` | `browser`, `playwright`, `screenshot`, `page`, `dom`, `axe`, `lighthouse` |
+| `web` | `web`, `fetch`, `http`, `url`, `search_query` |
+| `shell` | `exec`, `bash`, `shell`, `command`, `terminal` |
+| `other` | anything else |
+
+### Consumer Guidance
+
+- Use `activity_class == "tool_errors"` as a signal to inspect logs before trusting the response.
+- `write_active` indicates the agent mutated the working tree; callers may want to diff before committing.
+- `tool_active` with only `read`/`browser`/`web` classes implies a review or investigation pass rather than a change pass.
+- Missing `tool_activity` does not prove zero tool use — it means the wrapper could not detect any from the available signals.
 
 ## Agent Stream Logging
 
