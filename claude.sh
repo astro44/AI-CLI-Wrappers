@@ -31,14 +31,26 @@ fi
 if ! declare -F autonom8_merge_tool_activity >/dev/null; then
   autonom8_merge_tool_activity() { cat; }
 fi
+WRAPPER_LIFECYCLE_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib/wrapper-lifecycle.sh"
+if [[ -f "$WRAPPER_LIFECYCLE_LIB" ]]; then
+  # shellcheck disable=SC1090
+  source "$WRAPPER_LIFECYCLE_LIB"
+fi
 
 # Cleanup function to kill child processes on script termination
 cleanup() {
-  if [[ -n "$CLAUDE_PID" ]] && kill -0 "$CLAUDE_PID" 2>/dev/null; then
-    # Kill process group to ensure children are terminated
-    kill -- -"$CLAUDE_PID" 2>/dev/null || kill "$CLAUDE_PID" 2>/dev/null || true
+  if declare -F autonom8_wrapper_write_cleanup_event >/dev/null; then
+    autonom8_wrapper_write_cleanup_event "claude" "${CLAUDE_PID:-}" "${WORK_DIR:-$(pwd)}" "wrapper_cleanup"
+  fi
+  if declare -F autonom8_wrapper_stop_parent_monitor >/dev/null; then
+    autonom8_wrapper_stop_parent_monitor
+  fi
+  if declare -F autonom8_wrapper_reap_child_tree >/dev/null; then
+    autonom8_wrapper_reap_child_tree "claude" "${CLAUDE_PID:-}" "${WORK_DIR:-$(pwd)}" "wrapper_cleanup"
+  elif [[ -n "$CLAUDE_PID" ]] && kill -0 "$CLAUDE_PID" 2>/dev/null; then
+    kill "$CLAUDE_PID" 2>/dev/null || true
     sleep 0.5
-    kill -9 -- -"$CLAUDE_PID" 2>/dev/null || kill -9 "$CLAUDE_PID" 2>/dev/null || true
+    kill -9 "$CLAUDE_PID" 2>/dev/null || true
   fi
   # Also kill any orphaned child processes
   pkill -P $$ 2>/dev/null || true
@@ -105,6 +117,9 @@ run_with_timeout() {
     fi
     local pid=$!
     CLAUDE_PID=$pid
+    if declare -F autonom8_wrapper_monitor_parent >/dev/null; then
+      autonom8_wrapper_monitor_parent "$pid" "claude" "${WORK_DIR:-$(pwd)}"
+    fi
 
     local elapsed=0
     while kill -0 $pid 2>/dev/null && [[ $elapsed -lt $timeout_secs ]]; do
@@ -116,11 +131,17 @@ run_with_timeout() {
       kill $pid 2>/dev/null || true
       sleep 0.5
       kill -9 $pid 2>/dev/null || true
+      if declare -F autonom8_wrapper_stop_parent_monitor >/dev/null; then
+        autonom8_wrapper_stop_parent_monitor
+      fi
       CLAUDE_PID=""
       return 124
     else
       wait $pid
       local exit_code=$?
+      if declare -F autonom8_wrapper_stop_parent_monitor >/dev/null; then
+        autonom8_wrapper_stop_parent_monitor
+      fi
       CLAUDE_PID=""
       return $exit_code
     fi

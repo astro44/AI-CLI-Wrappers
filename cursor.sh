@@ -28,6 +28,8 @@ CURSOR_PID=""
 CLI_TIMEOUT=""  # Timeout in seconds, passed from Go worker
 RESPONSE_EMITTED=false
 CURSOR_INVALID_MODEL_RETRIED=false
+CURSOR_IGNORE_BEGIN_MARKER="# BEGIN AUTONOM8 PROVIDER WORKSPACE EXCLUDES"
+CURSOR_IGNORE_END_MARKER="# END AUTONOM8 PROVIDER WORKSPACE EXCLUDES"
 
 TOOL_TELEMETRY_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib/tool-telemetry.sh"
 if [[ -f "$TOOL_TELEMETRY_LIB" ]]; then
@@ -40,14 +42,26 @@ fi
 if ! declare -F autonom8_merge_tool_activity >/dev/null; then
   autonom8_merge_tool_activity() { cat; }
 fi
+WRAPPER_LIFECYCLE_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib/wrapper-lifecycle.sh"
+if [[ -f "$WRAPPER_LIFECYCLE_LIB" ]]; then
+  # shellcheck disable=SC1090
+  source "$WRAPPER_LIFECYCLE_LIB"
+fi
 
 # Cleanup function to kill child processes on script termination
 cleanup() {
-  if [[ -n "$CURSOR_PID" ]] && kill -0 "$CURSOR_PID" 2>/dev/null; then
-    # Kill process group to ensure children are terminated
-    kill -- -"$CURSOR_PID" 2>/dev/null || kill "$CURSOR_PID" 2>/dev/null || true
+  if declare -F autonom8_wrapper_write_cleanup_event >/dev/null; then
+    autonom8_wrapper_write_cleanup_event "cursor" "${CURSOR_PID:-}" "${WORK_DIR:-${WORKSPACE_DIR:-$(pwd)}}" "wrapper_cleanup"
+  fi
+  if declare -F autonom8_wrapper_stop_parent_monitor >/dev/null; then
+    autonom8_wrapper_stop_parent_monitor
+  fi
+  if declare -F autonom8_wrapper_reap_child_tree >/dev/null; then
+    autonom8_wrapper_reap_child_tree "cursor" "${CURSOR_PID:-}" "${WORK_DIR:-${WORKSPACE_DIR:-$(pwd)}}" "wrapper_cleanup"
+  elif [[ -n "$CURSOR_PID" ]] && kill -0 "$CURSOR_PID" 2>/dev/null; then
+    kill "$CURSOR_PID" 2>/dev/null || true
     sleep 0.5
-    kill -9 -- -"$CURSOR_PID" 2>/dev/null || kill -9 "$CURSOR_PID" 2>/dev/null || true
+    kill -9 "$CURSOR_PID" 2>/dev/null || true
   fi
   # Also kill any orphaned child processes
   pkill -P $$ 2>/dev/null || true
@@ -357,10 +371,16 @@ run_with_timeout() {
     "$timeout_cmd" --signal=TERM --kill-after=5 "$timeout_secs" "$@" &
     local pid=$!
     CURSOR_PID=$pid
+    if declare -F autonom8_wrapper_monitor_parent >/dev/null; then
+      autonom8_wrapper_monitor_parent "$pid" "cursor" "${WORK_DIR:-${WORKSPACE_DIR:-$(pwd)}}"
+    fi
 
     # Wait for completion
     wait $pid
     local exit_code=$?
+    if declare -F autonom8_wrapper_stop_parent_monitor >/dev/null; then
+      autonom8_wrapper_stop_parent_monitor
+    fi
     CURSOR_PID=""
     return $exit_code
   else
@@ -378,6 +398,9 @@ run_with_timeout() {
     fi
     local pid=$!
     CURSOR_PID=$pid
+    if declare -F autonom8_wrapper_monitor_parent >/dev/null; then
+      autonom8_wrapper_monitor_parent "$pid" "cursor" "${WORK_DIR:-${WORKSPACE_DIR:-$(pwd)}}"
+    fi
 
     local elapsed=0
     while kill -0 $pid 2>/dev/null && [[ $elapsed -lt $timeout_secs ]]; do
@@ -389,11 +412,17 @@ run_with_timeout() {
       kill $pid 2>/dev/null || true
       sleep 0.5
       kill -9 $pid 2>/dev/null || true
+      if declare -F autonom8_wrapper_stop_parent_monitor >/dev/null; then
+        autonom8_wrapper_stop_parent_monitor
+      fi
       CURSOR_PID=""
       return 124
     else
       wait $pid
       local exit_code=$?
+      if declare -F autonom8_wrapper_stop_parent_monitor >/dev/null; then
+        autonom8_wrapper_stop_parent_monitor
+      fi
       CURSOR_PID=""
       return $exit_code
     fi
@@ -927,6 +956,46 @@ ensure_cursor_mcp_config() {
   fi
 
   validate_cursor_mcp_config "$cursor_config" || true
+}
+
+ensure_cursor_workspace_scope() {
+  local workspace_dir="${1:-}"
+  [[ -n "$workspace_dir" ]] || return 0
+  [[ -d "$workspace_dir" ]] || return 0
+  [[ "${AUTONOM8_PROVIDER_WORKSPACE_SCOPE:-}" == "filtered" ]] || return 0
+  [[ -n "${AUTONOM8_PROVIDER_WORKSPACE_EXCLUDES_JSON:-}" ]] || return 0
+
+  local patterns
+  patterns="$(printf '%s' "$AUTONOM8_PROVIDER_WORKSPACE_EXCLUDES_JSON" | jq -r '.[]? // empty' 2>/dev/null | awk 'NF' || true)"
+  [[ -n "$patterns" ]] || return 0
+
+  local ignore_file="${workspace_dir}/.cursorignore"
+  local tmp_file block_file
+  tmp_file="$(mktemp)"
+  block_file="$(mktemp)"
+
+  {
+    printf '%s\n' "$CURSOR_IGNORE_BEGIN_MARKER"
+    printf '%s\n' "$patterns"
+    printf '%s\n' "$CURSOR_IGNORE_END_MARKER"
+  } > "$block_file"
+
+  if [[ -f "$ignore_file" ]]; then
+    awk -v begin="$CURSOR_IGNORE_BEGIN_MARKER" -v end="$CURSOR_IGNORE_END_MARKER" '
+      $0 == begin { skipping=1; next }
+      $0 == end { skipping=0; next }
+      !skipping { print }
+    ' "$ignore_file" > "$tmp_file" || cp "$ignore_file" "$tmp_file"
+    if [[ -s "$tmp_file" ]]; then
+      printf '\n' >> "$tmp_file"
+    fi
+    cat "$block_file" >> "$tmp_file"
+  else
+    cat "$block_file" > "$tmp_file"
+  fi
+
+  mv "$tmp_file" "$ignore_file"
+  rm -f "$block_file" 2>/dev/null || true
 }
 
 # Determine core directory based on script location
@@ -1714,6 +1783,9 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
   fi
 
   log_verbose "Invoking cursor-agent CLI for skill (WorkDir: ${WORK_DIR:-none}, Source: ${WORK_DIR_SOURCE:-none}, Model: ${MODEL:-default})"
+  if [[ -n "${WORK_DIR:-}" ]]; then
+    ensure_cursor_workspace_scope "$WORK_DIR"
+  fi
 
   if cursor_agent_want_approve_mcps; then
     MCP_CONFIG_PATH="$(get_cursor_mcp_config || true)"
@@ -2095,6 +2167,7 @@ $TOOL_RULES
     WORKSPACE_SOURCE="tenant_fallback"
   fi
   log_verbose "Invoking cursor-agent CLI (Workspace: ${WORKSPACE_DIR}, Source: ${WORKSPACE_SOURCE}, YOLO: $YOLO_MODE)"
+  ensure_cursor_workspace_scope "$WORKSPACE_DIR"
   if cursor_agent_want_approve_mcps; then
     MCP_CONFIG_PATH="$(get_cursor_mcp_config || true)"
     if [[ -n "$MCP_CONFIG_PATH" ]]; then

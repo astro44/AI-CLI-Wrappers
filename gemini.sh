@@ -35,21 +35,106 @@ fi
 if ! declare -F autonom8_merge_tool_activity >/dev/null; then
   autonom8_merge_tool_activity() { cat; }
 fi
+WRAPPER_LIFECYCLE_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib/wrapper-lifecycle.sh"
+if [[ -f "$WRAPPER_LIFECYCLE_LIB" ]]; then
+  # shellcheck disable=SC1090
+  source "$WRAPPER_LIFECYCLE_LIB"
+fi
 
 if [[ "${NODE_OPTIONS:-}" != *"max-old-space-size"* ]]; then
   export NODE_OPTIONS="--max-old-space-size=${GEMINI_NODE_MAX_OLD_SPACE_SIZE_MB}${NODE_OPTIONS:+ ${NODE_OPTIONS}}"
 fi
 
+gemini_parent_pid_dead() {
+  local parent_pid="${AUTONOM8_WORKER_PID:-${A8_WORKER_PID:-${AUTONOM8_PARENT_PID:-}}}"
+  [[ -n "${parent_pid}" && "${parent_pid}" =~ ^[0-9]+$ ]] || return 1
+  ! kill -0 "${parent_pid}" 2>/dev/null
+}
+
+persist_gemini_interrupted_artifact() {
+  [[ "${RESPONSE_EMITTED:-false}" != "true" ]] || return 0
+  gemini_parent_pid_dead || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  local stdout_path="${TMPFILE_OUTPUT:-}"
+  local stderr_path="${TMPFILE_ERR:-}"
+  local stdout_text=""
+  local stderr_text=""
+  local stdout_bytes=0
+  local stderr_bytes=0
+
+  if [[ -n "${stdout_path}" && -f "${stdout_path}" ]]; then
+    stdout_bytes="$(wc -c < "${stdout_path}" 2>/dev/null | tr -d '[:space:]' || echo 0)"
+    stdout_text="$(head -c 20000 "${stdout_path}" 2>/dev/null | tr -d '\0' || true)"
+  fi
+  if [[ -n "${stderr_path}" && -f "${stderr_path}" ]]; then
+    stderr_bytes="$(wc -c < "${stderr_path}" 2>/dev/null | tr -d '[:space:]' || echo 0)"
+    stderr_text="$(head -c 20000 "${stderr_path}" 2>/dev/null | tr -d '\0' || true)"
+  fi
+
+  local payload=""
+  payload="$(jq -n \
+    --arg provider "gemini" \
+    --arg request_id "${AUTONOM8_REQUEST_ID:-${A8_REQUEST_ID:-}}" \
+    --arg workflow "${A8_WORKFLOW:-${AUTONOM8_WORKFLOW:-unknown-workflow}}" \
+    --arg ticket "${A8_TICKET_ID:-${AUTONOM8_TICKET_ID:-unknown-ticket}}" \
+    --arg stdout_preview "${stdout_text}" \
+    --arg stderr_preview "${stderr_text}" \
+    --argjson stdout_bytes "${stdout_bytes:-0}" \
+    --argjson stderr_bytes "${stderr_bytes:-0}" \
+    '{
+      response: "",
+      error: "worker parent exited before wrapper emitted a terminal response",
+      error_type: "worker_parent_gone_interrupted",
+      provider: $provider,
+      request_id: $request_id,
+      workflow: $workflow,
+      ticket: $ticket,
+      recoverable: true,
+      metadata: {
+        parent_gone: true,
+        terminal_response_emitted: false,
+        stdout_bytes: $stdout_bytes,
+        stderr_bytes: $stderr_bytes,
+        stdout_preview: $stdout_preview,
+        stderr_preview: $stderr_preview
+      }
+    }' 2>/dev/null || true)"
+  if [[ -n "${payload}" ]]; then
+    if declare -F autonom8_persist_provider_result_json >/dev/null; then
+      autonom8_persist_provider_result_json "${payload}" || true
+    fi
+  fi
+}
+
 # Cleanup function to kill child processes on script termination
 cleanup() {
-  if [[ -n "$GEMINI_PID" ]] && kill -0 "$GEMINI_PID" 2>/dev/null; then
-    # Kill process group to ensure children are terminated
-    kill -- -"$GEMINI_PID" 2>/dev/null || kill "$GEMINI_PID" 2>/dev/null || true
+  if declare -F autonom8_wrapper_write_cleanup_event >/dev/null; then
+    autonom8_wrapper_write_cleanup_event "gemini" "${GEMINI_PID:-}" "${WORK_DIR:-${WORKSPACE_DIR:-$(pwd)}}" "wrapper_cleanup"
+  fi
+  local preserve_child=false
+  if declare -F autonom8_wrapper_should_preserve_child_after_parent_gone >/dev/null; then
+    if autonom8_wrapper_should_preserve_child_after_parent_gone "gemini" "${GEMINI_PID:-}" "${WORK_DIR:-${WORKSPACE_DIR:-$(pwd)}}" "wrapper_cleanup_parent_gone"; then
+      preserve_child=true
+    fi
+  fi
+  if declare -F autonom8_wrapper_stop_parent_monitor >/dev/null; then
+    autonom8_wrapper_stop_parent_monitor
+  fi
+  persist_gemini_interrupted_artifact || true
+  if [[ "${preserve_child}" == "true" ]]; then
+    :
+  elif declare -F autonom8_wrapper_reap_child_tree >/dev/null; then
+    autonom8_wrapper_reap_child_tree "gemini" "${GEMINI_PID:-}" "${WORK_DIR:-${WORKSPACE_DIR:-$(pwd)}}" "wrapper_cleanup"
+  elif [[ -n "$GEMINI_PID" ]] && kill -0 "$GEMINI_PID" 2>/dev/null; then
+    kill "$GEMINI_PID" 2>/dev/null || true
     sleep 0.5
-    kill -9 -- -"$GEMINI_PID" 2>/dev/null || kill -9 "$GEMINI_PID" 2>/dev/null || true
+    kill -9 "$GEMINI_PID" 2>/dev/null || true
   fi
   # Also kill any orphaned child processes
-  pkill -P $$ 2>/dev/null || true
+  if [[ "${preserve_child}" != "true" ]]; then
+    pkill -P $$ 2>/dev/null || true
+  fi
   restore_gemini_workspace_settings
 }
 trap cleanup EXIT TERM INT
@@ -99,7 +184,7 @@ run_with_timeout() {
     timeout_cmd="gtimeout"
   fi
 
-  if [[ -n "$timeout_cmd" ]]; then
+  if [[ -n "$timeout_cmd" && "${AUTONOM8_WRAPPER_FORCE_FALLBACK_TIMEOUT:-0}" != "1" && "${AUTONOM8_WRAPPER_CHILD_SESSION:-0}" != "1" ]]; then
     # Run timeout in foreground to preserve stdin (piped input)
     # Use --foreground to allow signal handling with job control
     "$timeout_cmd" --foreground --signal=TERM --kill-after=5 "$timeout_secs" "$@"
@@ -112,13 +197,43 @@ run_with_timeout() {
       cat > "$stdin_tmp"
     fi
 
-    if [[ -n "$stdin_tmp" ]]; then
-      "$@" < "$stdin_tmp" &
+    local child_env_prefix=()
+    if [[ "${AUTONOM8_WRAPPER_STRIP_PARENT_PID_ENV_FOR_CHILD:-0}" == "1" ]]; then
+      child_env_prefix=(env -u AUTONOM8_WORKER_PID -u A8_WORKER_PID -u AUTONOM8_PARENT_PID)
+    fi
+
+    if [[ "${AUTONOM8_WRAPPER_CHILD_SESSION:-0}" == "1" && -n "$(command -v python3 2>/dev/null || true)" ]]; then
+      if [[ -n "$stdin_tmp" ]]; then
+        if (( ${#child_env_prefix[@]} > 0 )); then
+          "${child_env_prefix[@]}" python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" < "$stdin_tmp" &
+        else
+          python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" < "$stdin_tmp" &
+        fi
+      else
+        if (( ${#child_env_prefix[@]} > 0 )); then
+          "${child_env_prefix[@]}" python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" &
+        else
+          python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" &
+        fi
+      fi
+    elif [[ -n "$stdin_tmp" ]]; then
+      if (( ${#child_env_prefix[@]} > 0 )); then
+        "${child_env_prefix[@]}" "$@" < "$stdin_tmp" &
+      else
+        "$@" < "$stdin_tmp" &
+      fi
     else
-      "$@" &
+      if (( ${#child_env_prefix[@]} > 0 )); then
+        "${child_env_prefix[@]}" "$@" &
+      else
+        "$@" &
+      fi
     fi
     local pid=$!
     GEMINI_PID=$pid
+    if declare -F autonom8_wrapper_monitor_parent >/dev/null; then
+      autonom8_wrapper_monitor_parent "$pid" "gemini" "${WORK_DIR:-${WORKSPACE_DIR:-$(pwd)}}"
+    fi
 
     local elapsed=0
     while kill -0 $pid 2>/dev/null && [[ $elapsed -lt $timeout_secs ]]; do
@@ -127,14 +242,24 @@ run_with_timeout() {
     done
 
     if kill -0 $pid 2>/dev/null; then
-      kill $pid 2>/dev/null || true
-      sleep 0.5
-      kill -9 $pid 2>/dev/null || true
+      if declare -F autonom8_wrapper_reap_child_tree >/dev/null; then
+        autonom8_wrapper_reap_child_tree "gemini" "$pid" "${WORK_DIR:-${WORKSPACE_DIR:-$(pwd)}}" "wrapper_timeout"
+      else
+        kill $pid 2>/dev/null || true
+        sleep 0.5
+        kill -9 $pid 2>/dev/null || true
+      fi
+      if declare -F autonom8_wrapper_stop_parent_monitor >/dev/null; then
+        autonom8_wrapper_stop_parent_monitor
+      fi
       GEMINI_PID=""
       return 124
     else
       wait $pid
       local exit_code=$?
+      if declare -F autonom8_wrapper_stop_parent_monitor >/dev/null; then
+        autonom8_wrapper_stop_parent_monitor
+      fi
       GEMINI_PID=""
       return $exit_code
     fi
@@ -328,8 +453,17 @@ emit_cli_response() {
     | if .cache_creation_input_tokens == null then .cache_creation_input_tokens = 0 else . end
   ' 2>/dev/null || echo "$tokens_json")"
 
+  local tool_activity_input="$raw_output"
+  if [[ -n "$session_id" ]]; then
+    local session_tool_events
+    session_tool_events="$(get_gemini_session_tool_events "$session_id" 2>/dev/null || true)"
+    if [[ -n "$session_tool_events" ]]; then
+      tool_activity_input="${tool_activity_input}"$'\n'"${session_tool_events}"
+    fi
+  fi
+
   local tool_activity_json
-  tool_activity_json="$(autonom8_tool_activity_json "$raw_output" "$stream_output" "wrapper:gemini")"
+  tool_activity_json="$(autonom8_tool_activity_json "$tool_activity_input" "$stream_output" "wrapper:gemini")"
 
   RESPONSE_EMITTED=true
 
@@ -383,6 +517,9 @@ emit_cli_response() {
       --arg reasoning_absent_reason "$reasoning_absent_reason" \
       '{response: $resp, reasoning: $reasoning, tokens_used: $tokens, metadata: {token_usage_available: $available, reasoning_available: $reasoning_available, reasoning_source: $reasoning_source, reasoning_absent_reason: $reasoning_absent_reason}}' \
       | autonom8_merge_tool_activity "$tool_activity_json"
+  fi
+  if declare -F autonom8_wrapper_probe_hold_if_requested >/dev/null; then
+    autonom8_wrapper_probe_hold_if_requested "gemini" "after_success_emit"
   fi
 }
 
@@ -456,7 +593,8 @@ emit_cli_error_response() {
           error_type: $type,
           exit_code: $code,
           recoverable: $recoverable
-        } + {($extra_name): $extra_val}'
+        } + {($extra_name): $extra_val}' \
+        | autonom8_merge_tool_activity "{}"
     else
       jq -n \
         --arg sid "$session_id" \
@@ -480,7 +618,8 @@ emit_cli_error_response() {
           error_type: $type,
           exit_code: $code,
           recoverable: $recoverable
-        }'
+        }' \
+        | autonom8_merge_tool_activity "{}"
     fi
   else
     if [[ -n "$extra_field_name" ]]; then
@@ -506,7 +645,8 @@ emit_cli_error_response() {
           error_type: $type,
           exit_code: $code,
           recoverable: $recoverable
-        } + {($extra_name): $extra_val}'
+        } + {($extra_name): $extra_val}' \
+        | autonom8_merge_tool_activity "{}"
     else
       jq -n \
         --arg err "$error_msg" \
@@ -528,7 +668,8 @@ emit_cli_error_response() {
           error_type: $type,
           exit_code: $code,
           recoverable: $recoverable
-        }'
+        }' \
+        | autonom8_merge_tool_activity "{}"
     fi
   fi
 }
@@ -547,6 +688,40 @@ get_gemini_mcp_config() {
   elif [[ -f "$CORE_DIR/.mcp.json" ]]; then
     echo "$CORE_DIR/.mcp.json"
   fi
+}
+
+resolve_gemini_mcp_arg_path() {
+  local config_path="${1:-}"
+  local arg="${2:-}"
+  [[ -n "$arg" ]] || return 1
+  if [[ "$arg" == /* || "$arg" == http://* || "$arg" == https://* || "$arg" == -* ]]; then
+    printf "%s" "$arg"
+    return 0
+  fi
+
+  local config_dir=""
+  config_dir="$(cd "$(dirname "$config_path")" 2>/dev/null && pwd -P || true)"
+  local candidate=""
+  for candidate in \
+    "${config_dir:+$config_dir/$arg}" \
+    "${CORE_DIR:-}/$arg"; do
+    if [[ -n "$candidate" && -e "$candidate" ]]; then
+      (cd "$(dirname "$candidate")" 2>/dev/null && printf "%s/%s" "$(pwd -P)" "$(basename "$candidate")")
+      return 0
+    fi
+  done
+
+  if [[ "$arg" == *mcp-servers/* && -n "${CORE_DIR:-}" ]]; then
+    local suffix="${arg#*mcp-servers/}"
+    candidate="$CORE_DIR/mcp-servers/$suffix"
+    if [[ -e "$candidate" ]]; then
+      (cd "$(dirname "$candidate")" 2>/dev/null && printf "%s/%s" "$(pwd -P)" "$(basename "$candidate")")
+      return 0
+    fi
+  fi
+
+  printf "%s" "$arg"
+  return 0
 }
 
 # Ensure a skill is enabled in Gemini's native skill registry
@@ -687,15 +862,7 @@ ensure_gemini_mcp_servers() {
         args_count=$((args_count + 1))
       done < <(jq -r ".mcpServers.\"$server_name\".args[]?" "$config_path" 2>/dev/null || true)
       for arg in "${args[@]}"; do
-        if [[ -n "$arg" && "$arg" != /* && "$arg" != http://* && "$arg" != https://* && "$arg" != -* ]]; then
-          if [[ -e "$CORE_DIR/$arg" ]]; then
-            resolved_args+=("$CORE_DIR/$arg")
-          else
-            resolved_args+=("$arg")
-          fi
-        else
-          resolved_args+=("$arg")
-        fi
+        resolved_args+=("$(resolve_gemini_mcp_arg_path "$config_path" "$arg")")
       done
       gemini mcp add --scope user "$server_name" "$command" "${resolved_args[@]}" >/dev/null 2>&1 || true
       log_verbose "Registered MCP server for gemini: $server_name"
@@ -713,7 +880,8 @@ normalize_gemini_settings_file_if_needed() {
     return 0
   fi
 
-  local resolved_browser_verify="$CORE_DIR/$browser_verify_entry"
+  local resolved_browser_verify
+  resolved_browser_verify="$(resolve_gemini_mcp_arg_path "$settings_path" "$browser_verify_entry")"
   if [[ ! -e "$resolved_browser_verify" ]]; then
     return 0
   fi
@@ -814,10 +982,33 @@ restore_gemini_workspace_settings() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CORE_DIR="$(dirname "$SCRIPT_DIR")"
 
-is_agent_markdown_arg() {
+resolve_agent_markdown_path() {
   local candidate="${1:-}"
   [[ "$candidate" == *.md ]] || return 1
-  [[ -f "$candidate" || -f "$CORE_DIR/$candidate" ]]
+
+  local stripped_core="${candidate#Autonom8-core/}"
+  local after_agents="${candidate#*agents/}"
+  local paths=(
+    "$candidate"
+    "$CORE_DIR/$candidate"
+    "$CORE_DIR/$stripped_core"
+  )
+  if [[ "$after_agents" != "$candidate" ]]; then
+    paths+=("$CORE_DIR/agents/$after_agents")
+  fi
+
+  local path
+  for path in "${paths[@]}"; do
+    if [[ -f "$path" ]]; then
+      printf "%s" "$path"
+      return 0
+    fi
+  done
+  return 1
+}
+
+is_agent_markdown_arg() {
+  resolve_agent_markdown_path "${1:-}" >/dev/null 2>&1
 }
 
 # =============================================================================
@@ -1054,6 +1245,21 @@ parse_arg_json_or_stdin() {
   fi
 }
 
+append_image_prompt_context() {
+  local prompt="$1"
+  if [[ ${#IMAGE_PATHS[@]} -eq 0 ]]; then
+    printf "%s" "$prompt"
+    return 0
+  fi
+
+  printf "%s\n\n---\n\nIMAGE ATTACHMENTS:\n" "$prompt"
+  local image_path
+  for image_path in "${IMAGE_PATHS[@]}"; do
+    printf -- "- %s\n" "$image_path"
+  done
+  printf "\nUse these local image file paths as the attached visual references for this task.\n"
+}
+
 get_gemini_session_file_by_id() {
   local session_id="$1"
   [[ -z "$session_id" ]] && return 1
@@ -1127,6 +1333,24 @@ get_gemini_session_reasoning() {
   ' "$session_file" 2>/dev/null || true)"
 
   [[ -n "$reasoning" ]] && printf "%s" "$reasoning" | sed 's/[[:space:]]\+/ /g' | sed 's/^ //;s/ $//' | cut -c1-600
+}
+
+get_gemini_session_tool_events() {
+  local session_id="$1"
+  local session_file=""
+  session_file="$(get_gemini_session_file_by_id "$session_id" 2>/dev/null || true)"
+  [[ -z "$session_file" || ! -f "$session_file" ]] && return 1
+
+  jq -rc '
+    .. | objects
+    | select(
+        ((.toolCalls? | type) == "array")
+        or ((.tool_calls? | type) == "array")
+        or ((.functionCall? | type) == "object")
+        or ((.function_call? | type) == "object")
+        or (((.type? // "") | tostring | ascii_downcase) | test("tool_use|tool_call|function_call"))
+      )
+  ' "$session_file" 2>/dev/null || true
 }
 
 # Get the latest Gemini session index for the current project
@@ -1227,6 +1451,7 @@ HEALTH_CHECK=false   # P6.4: Health check mode
 MODEL=""             # Model selection (pro, flash, flash-thinking, or full model name)
 PERMISSION_MODE=""   # Permission mode (ignored by gemini - no plan mode support)
 REASONING_FALLBACK=false # Emit fallback reasoning/tokens from session logs only
+IMAGE_PATHS=()       # Optional image attachment path(s) from the uniform wrapper interface
 
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
@@ -1257,6 +1482,13 @@ while [[ $# -gt 0 ]]; do
       ALLOW_TOOLS=true
       YOLO_MODE=true  # Gemini uses yolo mode for unrestricted access
       shift
+      ;;
+    --image)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        emit_cli_error_response "--image requires a file path" "invalid_input" "$SESSION_ID" 3
+        exit 3
+      fi
+      IMAGE_PATHS+=("$2"); shift 2
       ;;
     --dry-run)
       DRY_RUN=true; shift
@@ -1457,6 +1689,7 @@ $SKILL_CONTENT
 
 CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown, no explanations."
   fi
+  SKILL_PROMPT="$(append_image_prompt_context "$SKILL_PROMPT")"
 
   # Dry run mode
   if [[ "$DRY_RUN" == "true" ]]; then
@@ -1557,12 +1790,7 @@ if is_agent_markdown_arg "${1-}"; then
   AGENT_FILE="$1"; shift
 
   # Resolve agent file path to absolute path
-  # If it's already absolute, use as-is; otherwise resolve relative to CORE_DIR
-  if [[ "$AGENT_FILE" = /* ]]; then
-    AGENT_FILE_ABS="$AGENT_FILE"
-  else
-    AGENT_FILE_ABS="$CORE_DIR/$AGENT_FILE"
-  fi
+  AGENT_FILE_ABS="$(resolve_agent_markdown_path "$AGENT_FILE")"
 
   # Validate agent file format before proceeding
   validate_agent_file "$AGENT_FILE_ABS"
@@ -1786,9 +2014,9 @@ $TOOL_RULES
 - Respond immediately with your assessment
 - Return ONLY valid JSON matching the schema - no markdown, no explanations, no questions"
     fi
-    FULL_PROMPT="${BASE_PROMPT}${CRITICAL_SUFFIX}"
+    FULL_PROMPT="$(append_image_prompt_context "${BASE_PROMPT}${CRITICAL_SUFFIX}")"
   else
-    FULL_PROMPT="$AGENT_PROMPT"
+    FULL_PROMPT="$(append_image_prompt_context "$AGENT_PROMPT")"
   fi
 
   # P2.1: Check prompt size and log warnings
@@ -2241,7 +2469,12 @@ else
       GEMINI_ARGS+=("--yolo")
     fi
     log_verbose "Running in direct invocation mode (Model: ${MODEL:-default})"
-    gemini "${GEMINI_ARGS[@]}" "$@"
+    if [[ ${#IMAGE_PATHS[@]} -gt 0 ]]; then
+      DIRECT_PROMPT="$(append_image_prompt_context "$*")"
+      gemini "${GEMINI_ARGS[@]}" "$DIRECT_PROMPT"
+    else
+      gemini "${GEMINI_ARGS[@]}" "$@"
+    fi
     exit $?
   fi
 
@@ -2253,6 +2486,7 @@ else
   TMPFILE_PROMPT="$(mktemp)"
   TMPFILE_OUTPUT="$(mktemp)"
   TMPFILE_ERR="$(mktemp)"
+  INPUT_DATA="$(append_image_prompt_context "$INPUT_DATA")"
   echo "$INPUT_DATA" > "$TMPFILE_PROMPT"
 
   GEMINI_SESSION_ARG=""

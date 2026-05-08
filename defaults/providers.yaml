@@ -1,0 +1,27 @@
+providers:
+  claude:
+    models:
+      opus: claude-opus-4-7
+      sonnet: claude-sonnet-4-6
+      haiku: claude-haiku-4-5-20251001
+    default_model: sonnet
+  codex:
+    models:
+      latest: gpt-5.5
+      optimal: gpt-5.4
+    default_model: latest
+  gemini:
+    models:
+      latest: gemini-3.1-pro-preview
+      optimal: gemini-3-flash-preview
+    default_model: latest
+  opencode:
+    models:
+      latest: opencode/big-pickle
+      optimal: opencode/mimo-v2-omni-free
+    default_model: latest
+  cursor:
+    models:
+      latest: composer 2
+      optimal: composer 1.5
+    default_model: latest

@@ -33,19 +33,30 @@ fi
 if ! declare -F autonom8_merge_tool_activity >/dev/null; then
   autonom8_merge_tool_activity() { cat; }
 fi
+WRAPPER_LIFECYCLE_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib/wrapper-lifecycle.sh"
+if [[ -f "$WRAPPER_LIFECYCLE_LIB" ]]; then
+  # shellcheck disable=SC1090
+  source "$WRAPPER_LIFECYCLE_LIB"
+fi
 
 # OpenCode model configuration
-# Note: grok-code was deprecated, openai models have quota limits
-# Available: opencode/big-pickle, opencode/gpt-5-nano
-OPENCODE_MODEL="opencode/big-pickle"
+# Resolved from --model, provider config, live provider catalog, or bundled defaults.
+OPENCODE_MODEL=""
 
 # Cleanup function to kill child processes on script termination
 cleanup() {
-  if [[ -n "$OPENCODE_PID" ]] && kill -0 "$OPENCODE_PID" 2>/dev/null; then
-    # Kill process group to ensure children are terminated
-    kill -- -"$OPENCODE_PID" 2>/dev/null || kill "$OPENCODE_PID" 2>/dev/null || true
+  if declare -F autonom8_wrapper_write_cleanup_event >/dev/null; then
+    autonom8_wrapper_write_cleanup_event "opencode" "${OPENCODE_PID:-}" "${WORK_DIR:-${WORKSPACE_DIR:-$(pwd)}}" "wrapper_cleanup"
+  fi
+  if declare -F autonom8_wrapper_stop_parent_monitor >/dev/null; then
+    autonom8_wrapper_stop_parent_monitor
+  fi
+  if declare -F autonom8_wrapper_reap_child_tree >/dev/null; then
+    autonom8_wrapper_reap_child_tree "opencode" "${OPENCODE_PID:-}" "${WORK_DIR:-${WORKSPACE_DIR:-$(pwd)}}" "wrapper_cleanup"
+  elif [[ -n "$OPENCODE_PID" ]] && kill -0 "$OPENCODE_PID" 2>/dev/null; then
+    kill "$OPENCODE_PID" 2>/dev/null || true
     sleep 0.5
-    kill -9 -- -"$OPENCODE_PID" 2>/dev/null || kill -9 "$OPENCODE_PID" 2>/dev/null || true
+    kill -9 "$OPENCODE_PID" 2>/dev/null || true
   fi
   # Also kill any orphaned child processes
   pkill -P $$ 2>/dev/null || true
@@ -99,10 +110,16 @@ run_with_timeout() {
     "$timeout_cmd" --signal=TERM --kill-after=5 "$timeout_secs" "$@" &
     local pid=$!
     OPENCODE_PID=$pid
+    if declare -F autonom8_wrapper_monitor_parent >/dev/null; then
+      autonom8_wrapper_monitor_parent "$pid" "opencode" "${WORK_DIR:-${WORKSPACE_DIR:-$(pwd)}}"
+    fi
 
     # Wait for completion
     wait $pid
     local exit_code=$?
+    if declare -F autonom8_wrapper_stop_parent_monitor >/dev/null; then
+      autonom8_wrapper_stop_parent_monitor
+    fi
     OPENCODE_PID=""
     return $exit_code
   else
@@ -120,6 +137,9 @@ run_with_timeout() {
     fi
     local pid=$!
     OPENCODE_PID=$pid
+    if declare -F autonom8_wrapper_monitor_parent >/dev/null; then
+      autonom8_wrapper_monitor_parent "$pid" "opencode" "${WORK_DIR:-${WORKSPACE_DIR:-$(pwd)}}"
+    fi
 
     local elapsed=0
     while kill -0 $pid 2>/dev/null && [[ $elapsed -lt $timeout_secs ]]; do
@@ -131,11 +151,17 @@ run_with_timeout() {
       kill $pid 2>/dev/null || true
       sleep 0.5
       kill -9 $pid 2>/dev/null || true
+      if declare -F autonom8_wrapper_stop_parent_monitor >/dev/null; then
+        autonom8_wrapper_stop_parent_monitor
+      fi
       OPENCODE_PID=""
       return 124
     else
       wait $pid
       local exit_code=$?
+      if declare -F autonom8_wrapper_stop_parent_monitor >/dev/null; then
+        autonom8_wrapper_stop_parent_monitor
+      fi
       OPENCODE_PID=""
       return $exit_code
     fi
@@ -903,6 +929,21 @@ if [[ -n "$MODEL" ]]; then
   if [[ -n "$MODEL_RESOLUTION_NOTE" ]]; then
     log_info "Model resolution: $MODEL_RESOLUTION_NOTE"
   fi
+elif declare -F resolve_configured_default_model_for_provider >/dev/null; then
+  OPENCODE_MODEL="$(resolve_configured_default_model_for_provider "opencode" "${WORK_DIR:-${WORKSPACE_DIR:-$PWD}}" 2>/dev/null || true)"
+  if [[ -n "$OPENCODE_MODEL" ]]; then
+    MODEL="$OPENCODE_MODEL"
+    log_verbose "Model resolved from provider config: $OPENCODE_MODEL"
+  fi
+fi
+if [[ -z "${OPENCODE_MODEL:-}" ]] && declare -F default_fallback_model_for_provider >/dev/null; then
+  OPENCODE_MODEL="$(default_fallback_model_for_provider "opencode" "" 2>/dev/null || true)"
+  if [[ -n "$OPENCODE_MODEL" && "$OPENCODE_MODEL" != "${MODEL_PROVIDER_DEFAULT:-__provider_default__}" ]]; then
+    MODEL="$OPENCODE_MODEL"
+    log_verbose "Model resolved from provider fallback: $OPENCODE_MODEL"
+  elif [[ "$OPENCODE_MODEL" == "${MODEL_PROVIDER_DEFAULT:-__provider_default__}" ]]; then
+    OPENCODE_MODEL=""
+  fi
 fi
 
 # ===================
@@ -971,6 +1012,14 @@ if [[ "$HEALTH_CHECK" == "true" ]]; then
   exit 0
 fi
 
+require_opencode_model() {
+  if [[ -n "${OPENCODE_MODEL:-}" ]]; then
+    return 0
+  fi
+  emit_cli_error_response "OpenCode model was not supplied by provider configuration; refusing wrapper-level model default" "invalid_input" "${SESSION_ID:-}" 2
+  exit 2
+}
+
 # ===================
 # Reasoning Fallback Mode
 # ===================
@@ -993,6 +1042,7 @@ fi
 # If --skill flag is provided, invoke skill directly via OpenCode
 if [[ -n "$SKILL_NAME" ]]; then
   log_verbose "Skill mode: invoking /$SKILL_NAME"
+  require_opencode_model
 
   # Gather input data from remaining args or stdin
   SKILL_INPUT="$(parse_arg_json_or_stdin "$@")"
@@ -1099,6 +1149,8 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
 
   exit 0
 fi
+
+require_opencode_model
 
 if is_agent_markdown_arg "${1-}"; then
   AGENT_FILE="$1"; shift

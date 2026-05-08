@@ -168,20 +168,30 @@ Returned via `emit_cli_error_response` when a provider call fails:
 
 Wrappers now harden invalid model handling locally instead of always failing the call on first contact.
 
+Model resolution order:
+1. Explicit `--model <name>` from the caller.
+2. `AI_CLI_PROVIDERS_CONFIG` or `AUTONOM8_PROVIDERS_CONFIG`, when set.
+3. A nearby repo config discovered from the working directory: `providers.yaml`, `go-autonom8/providers.yaml`, `.ai-cli-wrappers/providers.yaml`, or `.autonom8/providers.yaml`.
+4. Bundled wrapper defaults in `defaults/providers.yaml`.
+5. Provider-native current/default model where the CLI exposes a live catalog.
+
+Provider configs can use aliases under `models:` plus `default_model:`. Wrappers resolve the alias before execution and emit `model_resolution` whenever normalization or fallback occurs. Provider-specific CLI mechanics still live inside each wrapper; callers should not need to know whether a provider expects a family alias, full model ID, or provider-prefixed ID.
+
 Behavior by provider:
 1. `cursor.sh`
    - validates requested models against `cursor-agent models`
-   - falls back to the current/default provider model when the requested model does not exist
+   - falls back to the current/default provider model when the requested or configured model does not exist
 2. `opencode.sh`
    - validates requested models against `opencode models`
    - resolves common tail aliases like `gpt-5.1` to full IDs like `openai/gpt-5.1`
-   - falls back to the provider default when needed
+   - uses config-backed defaults for no-model calls
+   - falls back to the live provider catalog if a configured default is stale
 3. `claude.sh`, `codex.sh`, `gemini.sh`
    - attempt the requested model first
    - if the provider returns an invalid-model class error, retry once with provider default
    - `gemini.sh` additionally retries `gemini-2.5-flash` when provider-default routing hits Gemini capacity exhaustion
 
-When fallback or normalization occurs, wrappers emit `model_resolution` in the response JSON so callers can see the effective model used.
+If all config/default discovery fails and the provider CLI requires an explicit model, the wrapper fails fast with `invalid_input` instead of silently embedding a task-model choice in shell code.
 
 ### Health Check Response
 
@@ -423,4 +433,3 @@ Security and operations notes:
 - The wrapper first checks the already-exported password variable, then sources `AUTONOM8_KEYCHAIN_ENV_FILE`, then falls back to a simple `KEY=value` parser. This mirrors the operator command `set -a; . "$HOME/.env"; security unlock-keychain -p "$mini" ...` without logging the secret.
 - Missing or failed unlock is intentionally non-fatal. The Cursor call continues so the caller receives the provider's real `credential_unavailable` error.
 - If `credential_unavailable` only appears when multiple Cursor sessions start concurrently, treat that as a routing/concurrency issue rather than a password issue; avoid overlapping Cursor QA and implement calls or add a provider-level Cursor lock.
-

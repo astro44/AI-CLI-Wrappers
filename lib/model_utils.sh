@@ -3,6 +3,12 @@
 
 MODEL_PROVIDER_DEFAULT="__provider_default__"
 
+PROVIDER_CONFIG_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/provider-config.sh"
+if [[ -f "$PROVIDER_CONFIG_LIB" ]]; then
+  # shellcheck disable=SC1090
+  source "$PROVIDER_CONFIG_LIB"
+fi
+
 trim_model_string() {
   local value="${1:-}"
   printf "%s" "$value" | sed 's/^[[:space:]]\+//; s/[[:space:]]\+$//'
@@ -42,7 +48,47 @@ cursor_available_models_tsv() {
 }
 
 opencode_available_models() {
-  opencode models 2>/dev/null | sed '/^[[:space:]]*$/d'
+	opencode models 2>/dev/null | sed '/^[[:space:]]*$/d'
+}
+
+opencode_default_model() {
+  opencode_available_models | head -n 1
+}
+
+resolve_configured_default_model_for_provider() {
+  local provider="${1:-}"
+  local start_dir="${2:-${WORK_DIR:-${WORKSPACE_DIR:-$PWD}}}"
+  local resolved=""
+  local catalog_resolved=""
+  if declare -F ai_cli_resolve_configured_default_model >/dev/null; then
+    resolved="$(ai_cli_resolve_configured_default_model "$provider" "$start_dir" "${SCRIPT_DIR:-}" 2>/dev/null || true)"
+  fi
+  [[ -n "$resolved" ]] || return 1
+
+  case "$provider" in
+    cursor)
+      catalog_resolved="$(resolve_model_from_cursor_catalog "$resolved" 2>/dev/null || true)"
+      if [[ -n "$catalog_resolved" ]]; then
+        printf "%s" "$catalog_resolved"
+        return 0
+      fi
+      if cursor_available_models_tsv >/dev/null 2>&1 && [[ -n "$(cursor_available_models_tsv 2>/dev/null)" ]]; then
+        return 1
+      fi
+      ;;
+    opencode)
+      catalog_resolved="$(resolve_model_from_opencode_catalog "$resolved" 2>/dev/null || true)"
+      if [[ -n "$catalog_resolved" ]]; then
+        printf "%s" "$catalog_resolved"
+        return 0
+      fi
+      if opencode_available_models >/dev/null 2>&1 && [[ -n "$(opencode_available_models 2>/dev/null)" ]]; then
+        return 1
+      fi
+      ;;
+  esac
+
+  resolve_requested_model_for_provider "$provider" "$resolved"
 }
 
 resolve_model_from_cursor_catalog() {
@@ -165,20 +211,24 @@ resolve_requested_model_for_provider() {
 default_fallback_model_for_provider() {
   local provider="${1:-}"
   local current_model="${2:-}"
+  local live_default=""
 
-  case "$provider" in
-    claude|codex|gemini)
-      printf "%s" "$MODEL_PROVIDER_DEFAULT"
-      ;;
-    cursor)
-      cursor_default_model 2>/dev/null || printf "%s" "$MODEL_PROVIDER_DEFAULT"
-      ;;
-    opencode)
-      if [[ -n "${OPENCODE_MODEL:-}" && "${OPENCODE_MODEL:-}" != "$current_model" ]]; then
-        printf "%s" "$OPENCODE_MODEL"
-      else
-        printf "%s" "$MODEL_PROVIDER_DEFAULT"
-      fi
+	case "$provider" in
+	    claude|codex|gemini)
+	      resolve_configured_default_model_for_provider "$provider" 2>/dev/null || printf "%s" "$MODEL_PROVIDER_DEFAULT"
+	      ;;
+	    cursor)
+	      cursor_default_model 2>/dev/null || resolve_configured_default_model_for_provider "$provider" 2>/dev/null || printf "%s" "$MODEL_PROVIDER_DEFAULT"
+	      ;;
+	    opencode)
+	      live_default="$(opencode_default_model 2>/dev/null || true)"
+	      if [[ -n "$live_default" ]]; then
+	        printf "%s" "$live_default"
+	      elif [[ -n "${OPENCODE_MODEL:-}" && "${OPENCODE_MODEL:-}" != "$current_model" ]]; then
+	        printf "%s" "$OPENCODE_MODEL"
+	      else
+	        resolve_configured_default_model_for_provider "$provider" 2>/dev/null || printf "%s" "$MODEL_PROVIDER_DEFAULT"
+	      fi
       ;;
     *)
       printf "%s" ""
