@@ -653,8 +653,17 @@ emit_cli_response() {
     | if .cache_creation_input_tokens == null then .cache_creation_input_tokens = 0 else . end
   ' 2>/dev/null || echo "$tokens_json")"
 
+  local tool_activity_input="$raw_output"
+  if [[ -n "$session_id" ]]; then
+    local session_tool_events
+    session_tool_events="$(get_cursor_session_tool_events "$session_id" 2>/dev/null || true)"
+    if [[ -n "$session_tool_events" ]]; then
+      tool_activity_input="${tool_activity_input}"$'\n'"${session_tool_events}"
+    fi
+  fi
+
   local tool_activity_json
-  tool_activity_json="$(autonom8_tool_activity_json "$raw_output" "$stream_output" "wrapper:cursor")"
+  tool_activity_json="$(autonom8_tool_activity_json "$tool_activity_input" "$stream_output" "wrapper:cursor")"
 
   RESPONSE_EMITTED=true
 
@@ -724,7 +733,7 @@ emit_cli_error_response() {
   local reasoning_absent_reason="error_path"
   local recoverable=false
   case "$error_type" in
-    quota|rate_limit|timeout|invalid_session|invalid_model|credential_unavailable)
+    quota|rate_limit|timeout|invalid_session|invalid_model|credential_unavailable|provider_no_result)
       recoverable=true
       ;;
   esac
@@ -776,7 +785,8 @@ emit_cli_error_response() {
         error_type: $type,
         exit_code: $code,
         recoverable: $recoverable
-      }'
+      }' \
+      | autonom8_merge_tool_activity "{}"
   else
     jq -n \
       --arg err "$error_msg" \
@@ -798,7 +808,8 @@ emit_cli_error_response() {
         error_type: $type,
         exit_code: $code,
         recoverable: $recoverable
-      }'
+      }' \
+      | autonom8_merge_tool_activity "{}"
   fi
 }
 
@@ -1003,10 +1014,33 @@ ensure_cursor_workspace_scope() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CORE_DIR="$(dirname "$SCRIPT_DIR")"
 
-is_agent_markdown_arg() {
+resolve_agent_markdown_path() {
   local candidate="${1:-}"
   [[ "$candidate" == *.md ]] || return 1
-  [[ -f "$candidate" || -f "$CORE_DIR/$candidate" ]]
+
+  local stripped_core="${candidate#Autonom8-core/}"
+  local after_agents="${candidate#*agents/}"
+  local paths=(
+    "$candidate"
+    "$CORE_DIR/$candidate"
+    "$CORE_DIR/$stripped_core"
+  )
+  if [[ "$after_agents" != "$candidate" ]]; then
+    paths+=("$CORE_DIR/agents/$after_agents")
+  fi
+
+  local path
+  for path in "${paths[@]}"; do
+    if [[ -f "$path" ]]; then
+      printf "%s" "$path"
+      return 0
+    fi
+  done
+  return 1
+}
+
+is_agent_markdown_arg() {
+  resolve_agent_markdown_path "${1:-}" >/dev/null 2>&1
 }
 
 extract_tenant_root() {
@@ -1248,6 +1282,21 @@ parse_arg_json_or_stdin() {
   fi
 }
 
+append_image_prompt_context() {
+  local prompt="$1"
+  if [[ ${#IMAGE_PATHS[@]} -eq 0 ]]; then
+    printf "%s" "$prompt"
+    return 0
+  fi
+
+  printf "%s\n\n---\n\nIMAGE ATTACHMENTS:\n" "$prompt"
+  local image_path
+  for image_path in "${IMAGE_PATHS[@]}"; do
+    printf -- "- %s\n" "$image_path"
+  done
+  printf "\nUse these local image file paths as the attached visual references for this task.\n"
+}
+
 get_cursor_session_file_by_id() {
   local session_id="$1"
   [[ -z "$session_id" ]] && return 1
@@ -1307,6 +1356,24 @@ get_cursor_session_reasoning() {
   ' "$session_file" 2>/dev/null || true)"
 
   [[ -n "$reasoning" ]] && printf "%s" "$reasoning" | sed 's/[[:space:]]\+/ /g' | sed 's/^ //;s/ $//' | cut -c1-600
+}
+
+get_cursor_session_tool_events() {
+  local session_id="$1"
+  local session_file=""
+  session_file="$(get_cursor_session_file_by_id "$session_id" 2>/dev/null || true)"
+  [[ -z "$session_file" || ! -f "$session_file" ]] && return 1
+
+  jq -rc '
+    .. | objects
+    | select(
+        ((.toolCalls? | type) == "array")
+        or ((.tool_calls? | type) == "array")
+        or ((.functionCall? | type) == "object")
+        or ((.function_call? | type) == "object")
+        or (((.type? // "") | tostring | ascii_downcase) | test("tool_use|tool_call|function_call"))
+      )
+  ' "$session_file" 2>/dev/null || true
 }
 
 create_cursor_session() {
@@ -1377,6 +1444,7 @@ HEALTH_CHECK=false   # P6.4: Health check mode
 MODEL=""             # Model selection (cursor passes via --model flag)
 PERMISSION_MODE=""   # Permission mode (cursor supports --mode=plan)
 REASONING_FALLBACK=false # Emit fallback reasoning/tokens from session logs only
+IMAGE_PATHS=()       # Optional image attachment path(s) from the uniform wrapper interface
 
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
@@ -1410,6 +1478,13 @@ while [[ $# -gt 0 ]]; do
       ALLOW_TOOLS=true
       YOLO_MODE=true  # Cursor uses --force for command approvals
       shift
+      ;;
+    --image)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        emit_cli_error_response "--image requires a file path" "invalid_input" "$SESSION_ID" 3
+        exit 3
+      fi
+      IMAGE_PATHS+=("$2"); shift 2
       ;;
     --dry-run)
       DRY_RUN=true; shift
@@ -1734,6 +1809,7 @@ $SKILL_CONTENT
 
 CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown, no explanations."
   fi
+  SKILL_PROMPT="$(append_image_prompt_context "$SKILL_PROMPT")"
 
   # Dry run mode
   if [[ "$DRY_RUN" == "true" ]]; then
@@ -1873,12 +1949,7 @@ if is_agent_markdown_arg "${1-}"; then
   AGENT_FILE="$1"; shift
 
   # Resolve agent file path to absolute path
-  # If it's already absolute, use as-is; otherwise resolve relative to CORE_DIR
-  if [[ "$AGENT_FILE" = /* ]]; then
-    AGENT_FILE_ABS="$AGENT_FILE"
-  else
-    AGENT_FILE_ABS="$CORE_DIR/$AGENT_FILE"
-  fi
+  AGENT_FILE_ABS="$(resolve_agent_markdown_path "$AGENT_FILE")"
 
   # Validate agent file format before proceeding
   validate_agent_file "$AGENT_FILE_ABS"
@@ -2090,9 +2161,9 @@ $TOOL_RULES
 - Respond immediately with your assessment
 - Return ONLY valid JSON matching the schema - no markdown, no explanations, no questions"
     fi
-    FULL_PROMPT="${BASE_PROMPT}${CRITICAL_SUFFIX}"
+    FULL_PROMPT="$(append_image_prompt_context "${BASE_PROMPT}${CRITICAL_SUFFIX}")"
   else
-    FULL_PROMPT="$AGENT_PROMPT"
+    FULL_PROMPT="$(append_image_prompt_context "$AGENT_PROMPT")"
   fi
 
   # P2.1: Check prompt size and log warnings
@@ -2360,7 +2431,7 @@ $TOOL_RULES
     fi
 
     if [[ -z "$RESULT_OUTPUT" ]]; then
-      emit_cli_error_response "No result event in response from cursor-agent" "provider_error" "$CURSOR_SESSION_ID" 1
+      emit_cli_error_response "No result event in response from cursor-agent" "provider_no_result" "$CURSOR_SESSION_ID" 1
       exit 1
     fi
 
@@ -2395,10 +2466,10 @@ $TOOL_RULES
       fi
     else
       # No result field - try raw response as fallback
-      emit_cli_error_response "No result in response from cursor-agent" "provider_error" "$CURSOR_SESSION_ID" 1
+      emit_cli_error_response "No result in response from cursor-agent" "provider_no_result" "$CURSOR_SESSION_ID" 1
     fi
   else
-    emit_cli_error_response "No response from Cursor CLI" "provider_error" "$CURSOR_SESSION_ID" 1
+    emit_cli_error_response "No response from Cursor CLI" "provider_no_result" "$CURSOR_SESSION_ID" 1
   fi
 else
   # Direct invocation with text prompt
@@ -2444,5 +2515,10 @@ else
   fi
 
   log_verbose "Running in direct invocation mode (Workspace: ${WORKSPACE_DIR}, Source: ${WORKSPACE_SOURCE}, Model: ${MODEL:-default}, Mode: ${PERMISSION_MODE:-default})"
-  cursor_agent_cli "${CURSOR_ARGS[@]}" "$@"
+  if [[ ${#IMAGE_PATHS[@]} -gt 0 ]]; then
+    DIRECT_PROMPT="$(append_image_prompt_context "$*")"
+    cursor_agent_cli "${CURSOR_ARGS[@]}" "$DIRECT_PROMPT"
+  else
+    cursor_agent_cli "${CURSOR_ARGS[@]}" "$@"
+  fi
 fi

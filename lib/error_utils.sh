@@ -54,9 +54,15 @@ AUTH_PATTERNS=(
 # Quota/usage limit patterns
 QUOTA_PATTERNS=(
     "usage limit"
+    "out of.*usage"
     "out of.*messages"
     "out of.*credits"
+    "increase limits"
+    "increase your limit"
+    "switch to auto"
     "purchase more credits"
+    "credit balance"
+    "balance is too low"
     "quota exceeded"
     "limit reached"
 )

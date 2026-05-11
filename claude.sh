@@ -408,8 +408,17 @@ emit_cli_response() {
     | if .cache_creation_input_tokens == null then .cache_creation_input_tokens = 0 else . end
   ' 2>/dev/null || echo "$tokens_json")"
 
+  local tool_activity_input="$raw_output"
+  if [[ -n "$session_id" ]]; then
+    local session_tool_events
+    session_tool_events="$(get_claude_session_tool_events "$session_id" 2>/dev/null || true)"
+    if [[ -n "$session_tool_events" ]]; then
+      tool_activity_input="${tool_activity_input}"$'\n'"${session_tool_events}"
+    fi
+  fi
+
   local tool_activity_json
-  tool_activity_json="$(autonom8_tool_activity_json "$raw_output" "$stream_output" "wrapper:claude")"
+  tool_activity_json="$(autonom8_tool_activity_json "$tool_activity_input" "$stream_output" "wrapper:claude")"
 
   RESPONSE_EMITTED=true
 
@@ -531,7 +540,8 @@ emit_cli_error_response() {
         error_type: $type,
         exit_code: $code,
         recoverable: $recoverable
-      }'
+      }' \
+      | autonom8_merge_tool_activity "{}"
   else
     jq -n \
       --arg err "$error_msg" \
@@ -553,7 +563,8 @@ emit_cli_error_response() {
         error_type: $type,
         exit_code: $code,
         recoverable: $recoverable
-      }'
+      }' \
+      | autonom8_merge_tool_activity "{}"
   fi
 }
 
@@ -580,10 +591,33 @@ log_verbose() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CORE_DIR="$(dirname "$SCRIPT_DIR")"
 
-is_agent_markdown_arg() {
+resolve_agent_markdown_path() {
   local candidate="${1:-}"
   [[ "$candidate" == *.md ]] || return 1
-  [[ -f "$candidate" || -f "$CORE_DIR/$candidate" ]]
+
+  local stripped_core="${candidate#Autonom8-core/}"
+  local after_agents="${candidate#*agents/}"
+  local paths=(
+    "$candidate"
+    "$CORE_DIR/$candidate"
+    "$CORE_DIR/$stripped_core"
+  )
+  if [[ "$after_agents" != "$candidate" ]]; then
+    paths+=("$CORE_DIR/agents/$after_agents")
+  fi
+
+  local path
+  for path in "${paths[@]}"; do
+    if [[ -f "$path" ]]; then
+      printf "%s" "$path"
+      return 0
+    fi
+  done
+  return 1
+}
+
+is_agent_markdown_arg() {
+  resolve_agent_markdown_path "${1:-}" >/dev/null 2>&1
 }
 
 # =============================================================================
@@ -786,6 +820,21 @@ parse_arg_json_or_stdin() {
   else
     printf "%s" "$*"
   fi
+}
+
+append_image_prompt_context() {
+  local prompt="$1"
+  if [[ ${#IMAGE_PATHS[@]} -eq 0 ]]; then
+    printf "%s" "$prompt"
+    return 0
+  fi
+
+  printf "%s\n\n---\n\nIMAGE ATTACHMENTS:\n" "$prompt"
+  local image_path
+  for image_path in "${IMAGE_PATHS[@]}"; do
+    printf -- "- %s\n" "$image_path"
+  done
+  printf "\nUse these local image file paths as the attached visual references for this task.\n"
 }
 
 # Validate if a Claude session exists
@@ -1023,6 +1072,26 @@ get_claude_session_reasoning() {
   return 1
 }
 
+get_claude_session_tool_events() {
+  local session_id="$1"
+  local session_file=""
+  session_file="$(get_claude_session_file_by_id "$session_id" 2>/dev/null || true)"
+  [[ -z "$session_file" || ! -f "$session_file" ]] && return 1
+
+  tail -n 1200 "$session_file" 2>/dev/null | jq -rc '
+    select(.type == "assistant" and (.message.content | type == "array"))
+    | . as $entry
+    | .message.content[]?
+    | select((.type // "") == "tool_use")
+    | {
+        type: "tool_use",
+        name: (.name // .tool_name // .toolName // empty),
+        id: (.id // empty),
+        timestamp: ($entry.timestamp // empty)
+      }
+  ' 2>/dev/null || true
+}
+
 # Initialize flags
 PERSONA_OVERRIDE=""
 YOLO_MODE=false
@@ -1042,6 +1111,7 @@ HEALTH_CHECK=false   # P6.4: Health check mode
 MODEL=""             # Model selection (opus, sonnet, haiku, or full name)
 PERMISSION_MODE=""   # Permission mode (plan, default, etc.)
 REASONING_FALLBACK=false # Emit fallback reasoning/tokens from session logs only
+IMAGE_PATHS=()       # Optional image attachment path(s) from the uniform wrapper interface
 
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
@@ -1066,6 +1136,13 @@ while [[ $# -gt 0 ]]; do
       ;;
     --yolo)
       YOLO_MODE=true; shift
+      ;;
+    --image)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        emit_cli_error_response "--image requires a file path" "invalid_input" "$SESSION_ID" 3
+        exit 3
+      fi
+      IMAGE_PATHS+=("$2"); shift 2
       ;;
     --dry-run)
       DRY_RUN=true; shift
@@ -1317,6 +1394,7 @@ $SKILL_CONTENT
 
 CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown, no explanations."
   fi
+  SKILL_PROMPT="$(append_image_prompt_context "$SKILL_PROMPT")"
 
   # Dry run mode
   if [[ "$DRY_RUN" == "true" ]]; then
@@ -1374,9 +1452,30 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
   set -e
 
   if [[ $CLAUDE_EXIT -ne 0 ]]; then
-    ERROR_MSG=$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' || echo "Unknown error")
+    ERROR_MSG=$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' || true)
+    if [[ -z "$ERROR_MSG" && -s "$TMPFILE_OUTPUT" ]]; then
+      ERROR_MSG="$(jq -r '
+        if .is_error == true
+        then (.result // (.errors | join(", ")) // .error // empty)
+        else (.error // empty)
+        end
+      ' "$TMPFILE_OUTPUT" 2>/dev/null || true)"
+    fi
+    if [[ -z "$ERROR_MSG" && -s "$TMPFILE_OUTPUT" ]]; then
+      ERROR_MSG="$(cat "$TMPFILE_OUTPUT" 2>/dev/null | tr -d '\0' || true)"
+    fi
+    if [[ -z "$ERROR_MSG" ]]; then
+      ERROR_MSG="Unknown error"
+    fi
+    ERROR_TYPE="unknown"
+    if type classify_error &>/dev/null; then
+      ERROR_TYPE=$(classify_error "$ERROR_MSG")
+    fi
+    if [[ $CLAUDE_EXIT -eq 124 ]]; then
+      ERROR_TYPE="timeout"
+    fi
     rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
-    emit_cli_error_response "$ERROR_MSG" "provider_error" "" "$CLAUDE_EXIT"
+    emit_cli_error_response "$ERROR_MSG" "$ERROR_TYPE" "" "$CLAUDE_EXIT"
     exit 1
   fi
 
@@ -1405,12 +1504,7 @@ if is_agent_markdown_arg "${1-}"; then
   AGENT_FILE="$1"; shift
 
   # Resolve agent file path to absolute path
-  # If it's already absolute, use as-is; otherwise resolve relative to CORE_DIR
-  if [[ "$AGENT_FILE" = /* ]]; then
-    AGENT_FILE_ABS="$AGENT_FILE"
-  else
-    AGENT_FILE_ABS="$CORE_DIR/$AGENT_FILE"
-  fi
+  AGENT_FILE_ABS="$(resolve_agent_markdown_path "$AGENT_FILE")"
 
   # Validate agent file format before proceeding
   validate_agent_file "$AGENT_FILE_ABS"
@@ -1618,9 +1712,9 @@ $TOOL_RULES
 - Respond immediately with your assessment
 - Return ONLY valid JSON matching the schema - no markdown, no explanations, no questions"
     fi
-    FULL_PROMPT="${BASE_PROMPT}${CRITICAL_SUFFIX}"
+    FULL_PROMPT="$(append_image_prompt_context "${BASE_PROMPT}${CRITICAL_SUFFIX}")"
   else
-    FULL_PROMPT="$AGENT_PROMPT"
+    FULL_PROMPT="$(append_image_prompt_context "$AGENT_PROMPT")"
   fi
 
   # P2.1: Check prompt size and log warnings
@@ -1885,6 +1979,9 @@ $TOOL_RULES
         end
       ' "$TMPFILE_OUTPUT" 2>/dev/null || true)"
     fi
+    if [[ -z "$ERROR_MSG" && -s "$TMPFILE_OUTPUT" ]]; then
+      ERROR_MSG="$(cat "$TMPFILE_OUTPUT" 2>/dev/null | tr -d '\0' || true)"
+    fi
     if [[ -z "$ERROR_MSG" ]]; then
       ERROR_MSG="Unknown error"
     fi
@@ -2002,9 +2099,15 @@ else
 
   if [[ -z "$INPUT_DATA" ]]; then
     log_verbose "Running in direct invocation mode"
-    claude --print --output-format text $BYPASS_ARG "$@"
+    if [[ ${#IMAGE_PATHS[@]} -gt 0 ]]; then
+      DIRECT_PROMPT="$(append_image_prompt_context "$*")"
+      claude --print --output-format text $BYPASS_ARG "$DIRECT_PROMPT"
+    else
+      claude --print --output-format text $BYPASS_ARG "$@"
+    fi
     exit $?
   fi
+  INPUT_DATA="$(append_image_prompt_context "$INPUT_DATA")"
 
   WORK_DIR=""
   if [[ -n "$CONTEXT_DIR" && -d "$CONTEXT_DIR" ]]; then

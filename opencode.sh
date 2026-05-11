@@ -39,8 +39,8 @@ if [[ -f "$WRAPPER_LIFECYCLE_LIB" ]]; then
   source "$WRAPPER_LIFECYCLE_LIB"
 fi
 
-# OpenCode model configuration
-# Resolved from --model, provider config, live provider catalog, or bundled defaults.
+# OpenCode model is supplied by runtime/provider configuration. The wrapper must
+# not choose a concrete model unless --model is passed by the orchestrator.
 OPENCODE_MODEL=""
 
 # Cleanup function to kill child processes on script termination
@@ -460,7 +460,8 @@ emit_cli_error_response() {
         error_type: $type,
         exit_code: $code,
         recoverable: $recoverable
-      }'
+      }' \
+      | autonom8_merge_tool_activity "{}"
   else
     jq -n \
       --arg err "$error_msg" \
@@ -482,7 +483,8 @@ emit_cli_error_response() {
         error_type: $type,
         exit_code: $code,
         recoverable: $recoverable
-      }'
+      }' \
+      | autonom8_merge_tool_activity "{}"
   fi
 }
 
@@ -595,7 +597,7 @@ get_opencode_session_tool_events() {
   [[ -z "$session_id" || ! -f "$db_path" ]] && return 1
 
   sqlite3 -cmd "PRAGMA busy_timeout=2000" "$db_path" "
-    SELECT data
+    SELECT json_set(data, '$.time_created', time_created)
     FROM part
     WHERE session_id='${session_id}' AND json_extract(data,'$.type')='tool'
     ORDER BY time_created ASC;
@@ -622,10 +624,33 @@ build_session_args() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CORE_DIR="$(dirname "$SCRIPT_DIR")"
 
-is_agent_markdown_arg() {
+resolve_agent_markdown_path() {
   local candidate="${1:-}"
   [[ "$candidate" == *.md ]] || return 1
-  [[ -f "$candidate" || -f "$CORE_DIR/$candidate" ]]
+
+  local stripped_core="${candidate#Autonom8-core/}"
+  local after_agents="${candidate#*agents/}"
+  local paths=(
+    "$candidate"
+    "$CORE_DIR/$candidate"
+    "$CORE_DIR/$stripped_core"
+  )
+  if [[ "$after_agents" != "$candidate" ]]; then
+    paths+=("$CORE_DIR/agents/$after_agents")
+  fi
+
+  local path
+  for path in "${paths[@]}"; do
+    if [[ -f "$path" ]]; then
+      printf "%s" "$path"
+      return 0
+    fi
+  done
+  return 1
+}
+
+is_agent_markdown_arg() {
+  resolve_agent_markdown_path "${1:-}" >/dev/null 2>&1
 }
 
 # =============================================================================
@@ -839,6 +864,21 @@ parse_arg_json_or_stdin() {
   fi
 }
 
+append_image_prompt_context() {
+  local prompt="$1"
+  if [[ ${#IMAGE_PATHS[@]} -eq 0 ]]; then
+    printf "%s" "$prompt"
+    return 0
+  fi
+
+  printf "%s\n\n---\n\nIMAGE ATTACHMENTS:\n" "$prompt"
+  local image_path
+  for image_path in "${IMAGE_PATHS[@]}"; do
+    printf -- "- %s\n" "$image_path"
+  done
+  printf "\nUse these local image file paths as the attached visual references for this task.\n"
+}
+
 # Initialize flags
 PERSONA_OVERRIDE=""
 YOLO_MODE=false
@@ -854,6 +894,8 @@ HEALTH_CHECK=false # P6.4: Health check mode
 MODEL=""             # Model selection (overrides OPENCODE_MODEL if specified)
 PERMISSION_MODE=""   # Permission mode (ignored by opencode - no plan mode support)
 REASONING_FALLBACK=false # Emit fallback reasoning/tokens from session logs only
+IMAGE_PATHS=()       # Optional image attachment path(s) from the uniform wrapper interface
+OPENCODE_IMAGE_ARGS=() # Native opencode run -f/--file attachment args
 
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
@@ -888,6 +930,15 @@ while [[ $# -gt 0 ]]; do
       ALLOW_TOOLS=true
       YOLO_MODE=true  # OpenCode uses yolo mode for unrestricted access
       shift
+      ;;
+    --image)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        emit_cli_error_response "--image requires a file path" "invalid_input" "$SESSION_ID" 3
+        exit 3
+      fi
+      IMAGE_PATHS+=("$2")
+      OPENCODE_IMAGE_ARGS+=("-f" "$2")
+      shift 2
       ;;
     --verbose|--debug)
       VERBOSE=true; shift
@@ -1100,6 +1151,7 @@ $SKILL_CONTENT
 
 CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown, no explanations."
   fi
+  SKILL_PROMPT="$(append_image_prompt_context "$SKILL_PROMPT")"
 
   # Invoke OpenCode with skill prompt
   TMPFILE_OUTPUT="$(mktemp)"
@@ -1114,10 +1166,10 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
     # shellcheck disable=SC2086
-    run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+    run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
   else
     # shellcheck disable=SC2086
-    opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+    opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
   fi
   OPENCODE_EXIT=$?
   set -e
@@ -1156,12 +1208,7 @@ if is_agent_markdown_arg "${1-}"; then
   AGENT_FILE="$1"; shift
 
   # Resolve agent file path to absolute path
-  # If it's already absolute, use as-is; otherwise resolve relative to CORE_DIR
-  if [[ "$AGENT_FILE" = /* ]]; then
-    AGENT_FILE_ABS="$AGENT_FILE"
-  else
-    AGENT_FILE_ABS="$CORE_DIR/$AGENT_FILE"
-  fi
+  AGENT_FILE_ABS="$(resolve_agent_markdown_path "$AGENT_FILE")"
 
   # Validate agent file format before proceeding
   validate_agent_file "$AGENT_FILE_ABS"
@@ -1331,9 +1378,9 @@ $TOOL_RULES
 - Respond immediately with your assessment
 - Return ONLY valid JSON matching the schema - no markdown, no explanations, no questions"
     fi
-    FULL_PROMPT="${BASE_PROMPT}${CRITICAL_SUFFIX}"
+    FULL_PROMPT="$(append_image_prompt_context "${BASE_PROMPT}${CRITICAL_SUFFIX}")"
   else
-    FULL_PROMPT="$AGENT_PROMPT"
+    FULL_PROMPT="$(append_image_prompt_context "$AGENT_PROMPT")"
   fi
 
   # P2.1: Check prompt size and log warnings
@@ -1425,16 +1472,16 @@ $TOOL_RULES
     echo "🤖 [OpenCode] Timeout: ${CLI_TIMEOUT}s" >&2
     # shellcheck disable=SC2086
     if [[ -n "$AGENT_LOG" ]]; then
-      run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$FULL_PROMPT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
+      run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} "$FULL_PROMPT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
     else
-      run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$FULL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+      run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} "$FULL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
     fi
   else
     # shellcheck disable=SC2086
     if [[ -n "$AGENT_LOG" ]]; then
-      opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$FULL_PROMPT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
+      opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} "$FULL_PROMPT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
     else
-      opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$FULL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+      opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} "$FULL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
     fi
   fi
   OPENCODE_EXIT=$?
@@ -1495,5 +1542,10 @@ else
     echo "🤖 [OpenCode] Session: $SESSION_ARGS" >&2
   fi
   # shellcheck disable=SC2086
-  opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$@"
+  if [[ ${#IMAGE_PATHS[@]} -gt 0 ]]; then
+    DIRECT_PROMPT="$(append_image_prompt_context "$*")"
+    opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} "$DIRECT_PROMPT"
+  else
+    opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$@"
+  fi
 fi
