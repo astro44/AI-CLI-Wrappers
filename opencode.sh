@@ -21,6 +21,7 @@ TMPFILE_OUTPUT=""
 TMPFILE_ERR=""
 CLI_TIMEOUT=""  # Timeout in seconds, passed from Go worker
 RESPONSE_EMITTED=false
+OPENCODE_AUTH_MODE="${AUTONOM8_OPENCODE_AUTH_MODE:-${AUTONOM8_PROVIDER_AUTH_MODE:-auto}}"
 
 TOOL_TELEMETRY_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib/tool-telemetry.sh"
 if [[ -f "$TOOL_TELEMETRY_LIB" ]]; then
@@ -85,6 +86,10 @@ resolve_opencode_cmd() {
 }
 
 OPENCODE_BIN="$(resolve_opencode_cmd || true)"
+
+opencode_api_key_env_present() {
+  [[ -n "${OPENAI_API_KEY:-}" || -n "${ANTHROPIC_API_KEY:-}" || -n "${GEMINI_API_KEY:-}" || -n "${GOOGLE_API_KEY:-}" ]]
+}
 
 opencode() {
   if [[ -z "${OPENCODE_BIN:-}" ]]; then
@@ -950,12 +955,25 @@ while [[ $# -gt 0 ]]; do
     --skill)
       SKILL_NAME="$2"; shift 2
       ;;
-    --health-check)
-      HEALTH_CHECK=true; shift
+	--health-check)
+	  HEALTH_CHECK=true; shift
+	  ;;
+    --auth-mode|--opencode-auth-mode)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        emit_cli_error_response "--auth-mode requires one of: auto, subscription/login, api-key" "invalid_input" "$SESSION_ID" 3
+        exit 3
+      fi
+      OPENCODE_AUTH_MODE="$2"; shift 2
       ;;
-    --model)
-      # Model selection flag - overrides OPENCODE_MODEL
-      MODEL="$2"; shift 2
+    --use-api-key|--use-apikey)
+      OPENCODE_AUTH_MODE="api-key"; shift
+      ;;
+    --use-subscription|--use-login|--use-oauth)
+      OPENCODE_AUTH_MODE="subscription"; shift
+      ;;
+	--model)
+	  # Model selection flag - overrides OPENCODE_MODEL
+	  MODEL="$2"; shift 2
       ;;
     --mode|--permission-mode)
       # Permission mode flag - ignored by opencode (no plan mode support)
@@ -1021,6 +1039,10 @@ if [[ "$HEALTH_CHECK" == "true" ]]; then
   # Try a minimal invocation to verify CLI works
   HEALTH_OUTPUT=$(opencode --version 2>&1 || echo "version_check_failed")
   HEALTH_EXIT=$?
+  AUTH_API_KEY_ENV_PRESENT=false
+  if opencode_api_key_env_present; then
+    AUTH_API_KEY_ENV_PRESENT=true
+  fi
 
   END_TIME=$(date +%s%N 2>/dev/null || date +%s)
 
@@ -1035,30 +1057,42 @@ if [[ "$HEALTH_CHECK" == "true" ]]; then
     # Extract version if available
     VERSION=$(echo "$HEALTH_OUTPUT" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
 
-    jq -n --arg provider "opencode" \
-          --arg status "ok" \
-          --argjson latency "$LATENCY_MS" \
-          --arg version "$VERSION" \
-          '{
-            provider: $provider,
-            status: $status,
-            latency_ms: $latency,
-            cli_available: true,
-            version: $version,
-            session_support: true
-          }'
+	    jq -n --arg provider "opencode" \
+	          --arg status "ok" \
+	          --argjson latency "$LATENCY_MS" \
+	          --arg version "$VERSION" \
+	          --arg auth_mode "$OPENCODE_AUTH_MODE" \
+	          --argjson api_key_env_present "$AUTH_API_KEY_ENV_PRESENT" \
+	          '{
+	            provider: $provider,
+	            status: $status,
+	            latency_ms: $latency,
+	            cli_available: true,
+	            version: $version,
+	            auth_mode: $auth_mode,
+	            auth_strategy: "opencode_config",
+	            api_key_env_present: $api_key_env_present,
+	            api_key_ignored_for_subscription: false,
+	            session_support: true
+	          }'
   else
-    jq -n --arg provider "opencode" \
-          --arg error "$HEALTH_OUTPUT" \
-          --argjson latency "$LATENCY_MS" \
-          '{
-            provider: $provider,
-            status: "error",
-            latency_ms: $latency,
-            cli_available: true,
-            error: $error,
-            session_support: true
-          }'
+	    jq -n --arg provider "opencode" \
+	          --arg error "$HEALTH_OUTPUT" \
+	          --argjson latency "$LATENCY_MS" \
+	          --arg auth_mode "$OPENCODE_AUTH_MODE" \
+	          --argjson api_key_env_present "$AUTH_API_KEY_ENV_PRESENT" \
+	          '{
+	            provider: $provider,
+	            status: "error",
+	            latency_ms: $latency,
+	            cli_available: true,
+	            error: $error,
+	            auth_mode: $auth_mode,
+	            auth_strategy: "opencode_config",
+	            api_key_env_present: $api_key_env_present,
+	            api_key_ignored_for_subscription: false,
+	            session_support: true
+	          }'
   fi
   exit 0
 fi

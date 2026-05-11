@@ -77,18 +77,94 @@ resolve_claude_cmd() {
 }
 
 CLAUDE_BIN="$(resolve_claude_cmd || true)"
+CLAUDE_AUTH_STATUS_WITHOUT_API_KEY_CACHE=""
+CLAUDE_AUTH_UNSET_API_KEY_DECISION=""
+
+claude_auth_status_without_api_key() {
+  if [[ -z "${CLAUDE_AUTH_STATUS_WITHOUT_API_KEY_CACHE:-}" ]]; then
+    if [[ -n "${CLAUDE_BIN:-}" ]]; then
+      CLAUDE_AUTH_STATUS_WITHOUT_API_KEY_CACHE="$(env -u ANTHROPIC_API_KEY "$CLAUDE_BIN" auth status 2>/dev/null || true)"
+    fi
+    if [[ -z "${CLAUDE_AUTH_STATUS_WITHOUT_API_KEY_CACHE:-}" ]]; then
+      CLAUDE_AUTH_STATUS_WITHOUT_API_KEY_CACHE="{}"
+    fi
+  fi
+  printf "%s" "$CLAUDE_AUTH_STATUS_WITHOUT_API_KEY_CACHE"
+}
+
+claude_subscription_auth_available() {
+  local status_json subscription logged_in
+  status_json="$(claude_auth_status_without_api_key)"
+  logged_in="$(printf "%s" "$status_json" | jq -r '.loggedIn // false' 2>/dev/null || echo "false")"
+  subscription="$(printf "%s" "$status_json" | jq -r '.subscriptionType // empty' 2>/dev/null || true)"
+  [[ "$logged_in" == "true" && -n "$subscription" && "$subscription" != "null" ]]
+}
+
+claude_should_unset_api_key() {
+  if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+    return 1
+  fi
+  if [[ -n "${CLAUDE_AUTH_UNSET_API_KEY_DECISION:-}" ]]; then
+    [[ "$CLAUDE_AUTH_UNSET_API_KEY_DECISION" == "true" ]]
+    return $?
+  fi
+
+  local mode
+  mode="$(printf "%s" "${CLAUDE_AUTH_MODE:-${AUTONOM8_CLAUDE_AUTH_MODE:-auto}}" | tr '[:upper:]' '[:lower:]' | tr '-' '_')"
+  case "$mode" in
+    api_key|apikey|env|anthropic_api_key)
+      CLAUDE_AUTH_UNSET_API_KEY_DECISION="false"
+      ;;
+    subscription|oauth|claude_ai|max|pro)
+      CLAUDE_AUTH_UNSET_API_KEY_DECISION="true"
+      ;;
+    auto|"")
+      if claude_subscription_auth_available; then
+        CLAUDE_AUTH_UNSET_API_KEY_DECISION="true"
+      else
+        CLAUDE_AUTH_UNSET_API_KEY_DECISION="false"
+      fi
+      ;;
+    *)
+      CLAUDE_AUTH_UNSET_API_KEY_DECISION="false"
+      ;;
+  esac
+  [[ "$CLAUDE_AUTH_UNSET_API_KEY_DECISION" == "true" ]]
+}
+
+claude_command_args() {
+  if [[ -z "${CLAUDE_BIN:-}" ]]; then
+    return 127
+  fi
+  if claude_should_unset_api_key; then
+    printf "%s\0" env -u ANTHROPIC_API_KEY "$CLAUDE_BIN" "$@"
+  else
+    printf "%s\0" "$CLAUDE_BIN" "$@"
+  fi
+}
 
 claude() {
   if [[ -z "${CLAUDE_BIN:-}" ]]; then
     return 127
   fi
-  "$CLAUDE_BIN" "$@"
+  local cmd_args=()
+  while IFS= read -r -d '' arg; do
+    cmd_args+=("$arg")
+  done < <(claude_command_args "$@")
+  "${cmd_args[@]}"
 }
 
 # Run command with timeout (preserves stdin for piped input)
 run_with_timeout() {
   local timeout_secs="$1"
   shift
+  local cmd_args=("$@")
+  if [[ "${cmd_args[0]:-}" == "claude" ]]; then
+    cmd_args=()
+    while IFS= read -r -d '' arg; do
+      cmd_args+=("$arg")
+    done < <(claude_command_args "${@:2}")
+  fi
 
   local timeout_cmd=""
   if command -v timeout &>/dev/null; then
@@ -100,7 +176,7 @@ run_with_timeout() {
   if [[ -n "$timeout_cmd" ]]; then
     # Run timeout in foreground to preserve stdin (piped input)
     # Use --foreground to allow signal handling with job control
-    "$timeout_cmd" --foreground --signal=TERM --kill-after=5 "$timeout_secs" "$@"
+    "$timeout_cmd" --foreground --signal=TERM --kill-after=5 "$timeout_secs" "${cmd_args[@]}"
     return $?
   else
     # Fallback: preserve piped stdin by buffering it before backgrounding the command.
@@ -111,9 +187,9 @@ run_with_timeout() {
     fi
 
     if [[ -n "$stdin_tmp" ]]; then
-      "$@" < "$stdin_tmp" &
+      "${cmd_args[@]}" < "$stdin_tmp" &
     else
-      "$@" &
+      "${cmd_args[@]}" &
     fi
     local pid=$!
     CLAUDE_PID=$pid
@@ -1112,6 +1188,7 @@ MODEL=""             # Model selection (opus, sonnet, haiku, or full name)
 PERMISSION_MODE=""   # Permission mode (plan, default, etc.)
 REASONING_FALLBACK=false # Emit fallback reasoning/tokens from session logs only
 IMAGE_PATHS=()       # Optional image attachment path(s) from the uniform wrapper interface
+CLAUDE_AUTH_MODE="${AUTONOM8_CLAUDE_AUTH_MODE:-auto}" # auto, subscription, or api-key
 
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
@@ -1173,6 +1250,19 @@ while [[ $# -gt 0 ]]; do
       ;;
     --health-check)
       HEALTH_CHECK=true; shift
+      ;;
+    --auth-mode|--claude-auth-mode)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        emit_cli_error_response "--auth-mode requires one of: auto, subscription, api-key" "invalid_input" "$SESSION_ID" 3
+        exit 3
+      fi
+      CLAUDE_AUTH_MODE="$2"; shift 2
+      ;;
+    --use-api-key|--use-apikey)
+      CLAUDE_AUTH_MODE="api-key"; shift
+      ;;
+    --use-subscription|--use-claude-login|--use-login|--use-oauth)
+      CLAUDE_AUTH_MODE="subscription"; shift
       ;;
     --model)
       MODEL="$2"; shift 2
@@ -1257,7 +1347,7 @@ fi
 # ===================
 # If --health-check flag is provided, check provider health and return status
 if [[ "$HEALTH_CHECK" == "true" ]]; then
-  log_verbose "Health check mode: testing claude CLI availability"
+  log_verbose "Health check mode: testing claude CLI availability and headless response"
 
   START_TIME=$(date +%s%N 2>/dev/null || date +%s)
 
@@ -1273,9 +1363,50 @@ if [[ "$HEALTH_CHECK" == "true" ]]; then
     exit 1
   fi
 
-  # Try a minimal invocation to verify CLI works
+  # Try minimal invocations to verify CLI availability and that the account can
+  # actually receive model tokens. Version-only checks can pass while billing or
+  # profile state still rejects live requests.
   HEALTH_OUTPUT=$(claude --version 2>&1 || echo "version_check_failed")
   HEALTH_EXIT=$?
+  AUTH_API_KEY_ENV_PRESENT=false
+  if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+    AUTH_API_KEY_ENV_PRESENT=true
+  fi
+  AUTH_API_KEY_IGNORED=false
+  if claude_should_unset_api_key; then
+    AUTH_API_KEY_IGNORED=true
+    AUTH_STATUS_JSON="$(claude_auth_status_without_api_key)"
+  else
+    AUTH_STATUS_JSON="$("$CLAUDE_BIN" auth status 2>/dev/null || echo "{}")"
+  fi
+  AUTH_METHOD="$(printf "%s" "$AUTH_STATUS_JSON" | jq -r '.authMethod // ""' 2>/dev/null || true)"
+  AUTH_PROVIDER="$(printf "%s" "$AUTH_STATUS_JSON" | jq -r '.apiProvider // ""' 2>/dev/null || true)"
+  AUTH_API_KEY_SOURCE="$(printf "%s" "$AUTH_STATUS_JSON" | jq -r '.apiKeySource // ""' 2>/dev/null || true)"
+  AUTH_SUBSCRIPTION_TYPE="$(printf "%s" "$AUTH_STATUS_JSON" | jq -r '.subscriptionType // ""' 2>/dev/null || true)"
+
+  PROBE_OUTPUT_FILE="$(mktemp)"
+  PROBE_ERR_FILE="$(mktemp)"
+  PROBE_TIMEOUT="${AUTONOM8_CLAUDE_HEALTH_PROBE_TIMEOUT_SECONDS:-30}"
+  PROBE_MODEL="${AUTONOM8_CLAUDE_HEALTH_PROBE_MODEL:-}"
+  PROBE_PROMPT='Return exactly this JSON and no markdown: {"ok":true,"probe":"claude_health"}'
+  PROBE_START=$(date +%s%N 2>/dev/null || date +%s)
+  set +e
+  PROBE_ARGS=(--print --output-format text)
+  if [[ -n "$PROBE_MODEL" ]]; then
+    PROBE_ARGS+=(--model "$PROBE_MODEL")
+  fi
+  run_with_timeout "$PROBE_TIMEOUT" claude "${PROBE_ARGS[@]}" "$PROBE_PROMPT" > "$PROBE_OUTPUT_FILE" 2> "$PROBE_ERR_FILE"
+  PROBE_EXIT=$?
+  set -e
+  PROBE_END=$(date +%s%N 2>/dev/null || date +%s)
+  if [[ ${#PROBE_START} -gt 10 ]]; then
+    PROBE_LATENCY_MS=$(( (PROBE_END - PROBE_START) / 1000000 ))
+  else
+    PROBE_LATENCY_MS=$(( (PROBE_END - PROBE_START) * 1000 ))
+  fi
+  PROBE_OUTPUT="$(cat "$PROBE_OUTPUT_FILE" 2>/dev/null || true)"
+  PROBE_ERR="$(cat "$PROBE_ERR_FILE" 2>/dev/null || true)"
+  rm -f "$PROBE_OUTPUT_FILE" "$PROBE_ERR_FILE"
 
   END_TIME=$(date +%s%N 2>/dev/null || date +%s)
 
@@ -1286,34 +1417,84 @@ if [[ "$HEALTH_CHECK" == "true" ]]; then
     LATENCY_MS=$(( (END_TIME - START_TIME) * 1000 ))
   fi
 
-  if [[ $HEALTH_EXIT -eq 0 ]]; then
+  PROBE_RESPONSE="$(printf "%s" "$PROBE_OUTPUT" | jq -r 'if type == "object" and has("result") then .result else . end' 2>/dev/null || printf "%s" "$PROBE_OUTPUT")"
+  PROBE_OK=false
+  if [[ $PROBE_EXIT -eq 0 ]] && [[ -n "$PROBE_RESPONSE" ]] && printf "%s" "$PROBE_RESPONSE" | jq -e '.ok == true and .probe == "claude_health"' >/dev/null 2>&1; then
+    PROBE_OK=true
+  fi
+
+  if [[ $HEALTH_EXIT -eq 0 && "$PROBE_OK" == "true" ]]; then
     # Extract version if available
     VERSION=$(echo "$HEALTH_OUTPUT" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
 
     jq -n --arg provider "claude" \
           --arg status "ok" \
           --argjson latency "$LATENCY_MS" \
+          --argjson probe_latency "$PROBE_LATENCY_MS" \
           --arg version "$VERSION" \
+          --arg probe_model "$PROBE_MODEL" \
+          --arg auth_mode "$CLAUDE_AUTH_MODE" \
+          --arg auth_method "$AUTH_METHOD" \
+          --arg auth_provider "$AUTH_PROVIDER" \
+          --arg api_key_source "$AUTH_API_KEY_SOURCE" \
+          --arg subscription_type "$AUTH_SUBSCRIPTION_TYPE" \
+          --argjson api_key_env_present "$AUTH_API_KEY_ENV_PRESENT" \
+          --argjson api_key_ignored "$AUTH_API_KEY_IGNORED" \
           '{
             provider: $provider,
             status: $status,
             latency_ms: $latency,
+            response_probe_latency_ms: $probe_latency,
             cli_available: true,
+            response_probe_ok: true,
             version: $version,
+            probe_model: $probe_model,
+            auth_mode: $auth_mode,
+            auth_method: $auth_method,
+            auth_provider: $auth_provider,
+            api_key_source: $api_key_source,
+            subscription_type: $subscription_type,
+            api_key_env_present: $api_key_env_present,
+            api_key_ignored_for_subscription: $api_key_ignored,
             session_support: true
           }'
   else
     jq -n --arg provider "claude" \
           --arg error "$HEALTH_OUTPUT" \
+          --arg probe_error "$PROBE_ERR" \
+          --arg probe_output "$PROBE_OUTPUT" \
           --argjson latency "$LATENCY_MS" \
+          --argjson probe_latency "$PROBE_LATENCY_MS" \
+          --argjson probe_ok "$PROBE_OK" \
+          --arg probe_model "$PROBE_MODEL" \
+          --arg auth_mode "$CLAUDE_AUTH_MODE" \
+          --arg auth_method "$AUTH_METHOD" \
+          --arg auth_provider "$AUTH_PROVIDER" \
+          --arg api_key_source "$AUTH_API_KEY_SOURCE" \
+          --arg subscription_type "$AUTH_SUBSCRIPTION_TYPE" \
+          --argjson api_key_env_present "$AUTH_API_KEY_ENV_PRESENT" \
+          --argjson api_key_ignored "$AUTH_API_KEY_IGNORED" \
           '{
             provider: $provider,
             status: "error",
             latency_ms: $latency,
+            response_probe_latency_ms: $probe_latency,
             cli_available: true,
             error: $error,
+            response_probe_ok: $probe_ok,
+            probe_error: $probe_error,
+            probe_output: $probe_output,
+            probe_model: $probe_model,
+            auth_mode: $auth_mode,
+            auth_method: $auth_method,
+            auth_provider: $auth_provider,
+            api_key_source: $api_key_source,
+            subscription_type: $subscription_type,
+            api_key_env_present: $api_key_env_present,
+            api_key_ignored_for_subscription: $api_key_ignored,
             session_support: true
           }'
+    exit 1
   fi
   exit 0
 fi

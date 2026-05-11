@@ -30,6 +30,7 @@ RESPONSE_EMITTED=false
 CURSOR_INVALID_MODEL_RETRIED=false
 CURSOR_IGNORE_BEGIN_MARKER="# BEGIN AUTONOM8 PROVIDER WORKSPACE EXCLUDES"
 CURSOR_IGNORE_END_MARKER="# END AUTONOM8 PROVIDER WORKSPACE EXCLUDES"
+CURSOR_AUTH_MODE="${AUTONOM8_CURSOR_AUTH_MODE:-${AUTONOM8_PROVIDER_AUTH_MODE:-auto}}"
 
 TOOL_TELEMETRY_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib/tool-telemetry.sh"
 if [[ -f "$TOOL_TELEMETRY_LIB" ]]; then
@@ -169,6 +170,19 @@ resolve_cursor_agent_cmd() {
 }
 
 CURSOR_AGENT_BIN="$(resolve_cursor_agent_cmd || true)"
+
+cursor_normalized_auth_mode() {
+  printf "%s" "${CURSOR_AUTH_MODE:-auto}" | tr '[:upper:]' '[:lower:]' | tr '-' '_'
+}
+
+cursor_validate_auth_mode() {
+  case "$(cursor_normalized_auth_mode)" in
+    api_key|apikey|env|cursor_api_key)
+      emit_cli_error_response "Cursor wrapper does not support API-key auth mode; use auto/login keychain auth" "invalid_input" "$SESSION_ID" 3
+      exit 3
+      ;;
+  esac
+}
 
 # macOS keychain bootstrap
 #
@@ -1507,12 +1521,25 @@ while [[ $# -gt 0 ]]; do
     --skill)
       SKILL_NAME="$2"; shift 2
       ;;
-    --health-check)
-      HEALTH_CHECK=true; shift
+	--health-check)
+	  HEALTH_CHECK=true; shift
+	  ;;
+    --auth-mode|--cursor-auth-mode)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        emit_cli_error_response "--auth-mode requires one of: auto, subscription/login" "invalid_input" "$SESSION_ID" 3
+        exit 3
+      fi
+      CURSOR_AUTH_MODE="$2"; shift 2
       ;;
-    --quota-status)
-      QUOTA_STATUS=true; shift
+    --use-api-key|--use-apikey)
+      CURSOR_AUTH_MODE="api-key"; shift
       ;;
+    --use-subscription|--use-login|--use-oauth)
+      CURSOR_AUTH_MODE="subscription"; shift
+      ;;
+	--quota-status)
+	  QUOTA_STATUS=true; shift
+	  ;;
     --model)
       MODEL="$2"; shift 2
       ;;
@@ -1528,6 +1555,8 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+cursor_validate_auth_mode
 
 if [[ -n "$MODEL" ]]; then
   prepare_requested_model_value "cursor" "$MODEL"
@@ -1681,22 +1710,27 @@ if [[ "$HEALTH_CHECK" == "true" ]]; then
     # Extract version if available
     VERSION=$(echo "$VERSION_OUTPUT" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
 
-    jq -n --arg provider "cursor" \
-          --arg status "ok" \
-          --argjson latency "$LATENCY_MS" \
-          --argjson probe_latency "$PROBE_LATENCY_MS" \
-          --arg version "$VERSION" \
-          --arg probe_model "$PROBE_MODEL" \
-          '{
-            provider: $provider,
-            status: $status,
-            latency_ms: $latency,
-            response_probe_latency_ms: $probe_latency,
-            cli_available: true,
-            auth_ok: true,
-            response_probe_ok: true,
-            version: $version,
-            probe_model: $probe_model,
+	    jq -n --arg provider "cursor" \
+	          --arg status "ok" \
+	          --argjson latency "$LATENCY_MS" \
+	          --argjson probe_latency "$PROBE_LATENCY_MS" \
+	          --arg version "$VERSION" \
+	          --arg probe_model "$PROBE_MODEL" \
+	          --arg auth_mode "$CURSOR_AUTH_MODE" \
+	          '{
+	            provider: $provider,
+	            status: $status,
+	            latency_ms: $latency,
+	            response_probe_latency_ms: $probe_latency,
+	            cli_available: true,
+	            auth_ok: true,
+	            auth_mode: $auth_mode,
+	            auth_strategy: "cursor_keychain",
+	            api_key_env_present: false,
+	            api_key_ignored_for_subscription: false,
+	            response_probe_ok: true,
+	            version: $version,
+	            probe_model: $probe_model,
             mac_keychain_unlock: true,
             session_support: true
           }'
@@ -1706,20 +1740,25 @@ if [[ "$HEALTH_CHECK" == "true" ]]; then
           --arg auth_output "$AUTH_OUTPUT" \
           --arg probe_error "$PROBE_ERR" \
           --arg probe_output "$PROBE_OUTPUT" \
-          --argjson latency "$LATENCY_MS" \
-          --argjson probe_latency "$PROBE_LATENCY_MS" \
-          --argjson auth_ok "$AUTH_OK" \
-          --argjson probe_ok "$PROBE_OK" \
-          --arg probe_model "$PROBE_MODEL" \
-          '{
-            provider: $provider,
-            status: "error",
-            latency_ms: $latency,
-            response_probe_latency_ms: $probe_latency,
-            cli_available: true,
-            auth_ok: $auth_ok,
-            response_probe_ok: $probe_ok,
-            version_output: $version_output,
+	          --argjson latency "$LATENCY_MS" \
+	          --argjson probe_latency "$PROBE_LATENCY_MS" \
+	          --argjson auth_ok "$AUTH_OK" \
+	          --argjson probe_ok "$PROBE_OK" \
+	          --arg probe_model "$PROBE_MODEL" \
+	          --arg auth_mode "$CURSOR_AUTH_MODE" \
+	          '{
+	            provider: $provider,
+	            status: "error",
+	            latency_ms: $latency,
+	            response_probe_latency_ms: $probe_latency,
+	            cli_available: true,
+	            auth_ok: $auth_ok,
+	            auth_mode: $auth_mode,
+	            auth_strategy: "cursor_keychain",
+	            api_key_env_present: false,
+	            api_key_ignored_for_subscription: false,
+	            response_probe_ok: $probe_ok,
+	            version_output: $version_output,
             auth_output: $auth_output,
             probe_error: $probe_error,
             probe_output: $probe_output,

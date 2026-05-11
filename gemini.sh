@@ -23,6 +23,7 @@ GEMINI_SANITIZED_SETTINGS_PATHS=()
 GEMINI_SANITIZED_SETTINGS_BACKUPS=()
 GEMINI_SANITIZED_SETTINGS_MARKERS=()
 GEMINI_NODE_MAX_OLD_SPACE_SIZE_MB="${AUTONOM8_GEMINI_NODE_MAX_OLD_SPACE_SIZE_MB:-8192}"
+GEMINI_AUTH_MODE="${AUTONOM8_GEMINI_AUTH_MODE:-${AUTONOM8_PROVIDER_AUTH_MODE:-auto}}"
 
 TOOL_TELEMETRY_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib/tool-telemetry.sh"
 if [[ -f "$TOOL_TELEMETRY_LIB" ]]; then
@@ -160,21 +161,59 @@ resolve_gemini_cmd() {
 
 GEMINI_BIN="$(resolve_gemini_cmd || true)"
 
+gemini_normalized_auth_mode() {
+  printf "%s" "${GEMINI_AUTH_MODE:-auto}" | tr '[:upper:]' '[:lower:]' | tr '-' '_'
+}
+
+gemini_api_key_env_present() {
+  [[ -n "${GEMINI_API_KEY:-}" || -n "${GOOGLE_API_KEY:-}" ]]
+}
+
+gemini_should_unset_api_key() {
+  gemini_api_key_env_present || return 1
+  case "$(gemini_normalized_auth_mode)" in
+    subscription|oauth|login|google_login|google_account)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+gemini_command_args() {
+  if [[ -z "${GEMINI_BIN:-}" ]]; then
+    return 127
+  fi
+  if gemini_should_unset_api_key; then
+    printf "%s\0" env -u GEMINI_API_KEY -u GOOGLE_API_KEY "$GEMINI_BIN" "$@"
+  else
+    printf "%s\0" "$GEMINI_BIN" "$@"
+  fi
+}
+
 gemini() {
   if [[ -z "${GEMINI_BIN:-}" ]]; then
     return 127
   fi
-  "$GEMINI_BIN" "$@"
+  local cmd_args=()
+  while IFS= read -r -d '' arg; do
+    cmd_args+=("$arg")
+  done < <(gemini_command_args "$@")
+  "${cmd_args[@]}"
 }
 
 # Run command with timeout (preserves stdin for piped input)
 run_with_timeout() {
   local timeout_secs="$1"
   shift
+  local cmd_args=("$@")
 
-  if [[ "${1:-}" == "gemini" && -n "${GEMINI_BIN:-}" ]]; then
-    shift
-    set -- "$GEMINI_BIN" "$@"
+  if [[ -n "${GEMINI_BIN:-}" && ( "${cmd_args[0]:-}" == "gemini" || "${cmd_args[0]:-}" == "$GEMINI_BIN" ) ]]; then
+    cmd_args=()
+    while IFS= read -r -d '' arg; do
+      cmd_args+=("$arg")
+    done < <(gemini_command_args "${@:2}")
   fi
 
   local timeout_cmd=""
@@ -187,7 +226,7 @@ run_with_timeout() {
   if [[ -n "$timeout_cmd" && "${AUTONOM8_WRAPPER_FORCE_FALLBACK_TIMEOUT:-0}" != "1" && "${AUTONOM8_WRAPPER_CHILD_SESSION:-0}" != "1" ]]; then
     # Run timeout in foreground to preserve stdin (piped input)
     # Use --foreground to allow signal handling with job control
-    "$timeout_cmd" --foreground --signal=TERM --kill-after=5 "$timeout_secs" "$@"
+    "$timeout_cmd" --foreground --signal=TERM --kill-after=5 "$timeout_secs" "${cmd_args[@]}"
     return $?
   else
     # Fallback: preserve piped stdin by buffering it before backgrounding the command.
@@ -205,28 +244,28 @@ run_with_timeout() {
     if [[ "${AUTONOM8_WRAPPER_CHILD_SESSION:-0}" == "1" && -n "$(command -v python3 2>/dev/null || true)" ]]; then
       if [[ -n "$stdin_tmp" ]]; then
         if (( ${#child_env_prefix[@]} > 0 )); then
-          "${child_env_prefix[@]}" python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" < "$stdin_tmp" &
+          "${child_env_prefix[@]}" python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "${cmd_args[@]}" < "$stdin_tmp" &
         else
-          python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" < "$stdin_tmp" &
+          python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "${cmd_args[@]}" < "$stdin_tmp" &
         fi
       else
         if (( ${#child_env_prefix[@]} > 0 )); then
-          "${child_env_prefix[@]}" python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" &
+          "${child_env_prefix[@]}" python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "${cmd_args[@]}" &
         else
-          python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" &
+          python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "${cmd_args[@]}" &
         fi
       fi
     elif [[ -n "$stdin_tmp" ]]; then
       if (( ${#child_env_prefix[@]} > 0 )); then
-        "${child_env_prefix[@]}" "$@" < "$stdin_tmp" &
+        "${child_env_prefix[@]}" "${cmd_args[@]}" < "$stdin_tmp" &
       else
-        "$@" < "$stdin_tmp" &
+        "${cmd_args[@]}" < "$stdin_tmp" &
       fi
     else
       if (( ${#child_env_prefix[@]} > 0 )); then
-        "${child_env_prefix[@]}" "$@" &
+        "${child_env_prefix[@]}" "${cmd_args[@]}" &
       else
-        "$@" &
+        "${cmd_args[@]}" &
       fi
     fi
     local pid=$!
@@ -1511,12 +1550,25 @@ while [[ $# -gt 0 ]]; do
     --skill)
       SKILL_NAME="$2"; shift 2
       ;;
-    --health-check)
-      HEALTH_CHECK=true; shift
+	--health-check)
+	  HEALTH_CHECK=true; shift
+	  ;;
+    --auth-mode|--gemini-auth-mode)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        emit_cli_error_response "--auth-mode requires one of: auto, oauth, api-key" "invalid_input" "$SESSION_ID" 3
+        exit 3
+      fi
+      GEMINI_AUTH_MODE="$2"; shift 2
       ;;
-    --model)
-      MODEL="$2"; shift 2
+    --use-api-key|--use-apikey)
+      GEMINI_AUTH_MODE="api-key"; shift
       ;;
+    --use-subscription|--use-login|--use-oauth)
+      GEMINI_AUTH_MODE="oauth"; shift
+      ;;
+	--model)
+	  MODEL="$2"; shift 2
+	  ;;
     --mode|--permission-mode)
       PERMISSION_MODE="$2"; shift 2
       # Note: Gemini ignores mode flag - no plan mode support
@@ -1562,6 +1614,14 @@ if [[ "$HEALTH_CHECK" == "true" ]]; then
   # Try a minimal invocation to verify CLI works
   HEALTH_OUTPUT=$(gemini --version 2>&1 || echo "version_check_failed")
   HEALTH_EXIT=$?
+  AUTH_API_KEY_ENV_PRESENT=false
+  if gemini_api_key_env_present; then
+    AUTH_API_KEY_ENV_PRESENT=true
+  fi
+  AUTH_API_KEY_IGNORED=false
+  if gemini_should_unset_api_key; then
+    AUTH_API_KEY_IGNORED=true
+  fi
 
   END_TIME=$(date +%s%N 2>/dev/null || date +%s)
 
@@ -1576,30 +1636,42 @@ if [[ "$HEALTH_CHECK" == "true" ]]; then
     # Extract version if available
     VERSION=$(echo "$HEALTH_OUTPUT" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
 
-    jq -n --arg provider "gemini" \
-          --arg status "ok" \
-          --argjson latency "$LATENCY_MS" \
-          --arg version "$VERSION" \
-          '{
-            provider: $provider,
-            status: $status,
-            latency_ms: $latency,
-            cli_available: true,
-            version: $version,
-            session_support: true
-          }'
+	    jq -n --arg provider "gemini" \
+	          --arg status "ok" \
+	          --argjson latency "$LATENCY_MS" \
+	          --arg version "$VERSION" \
+	          --arg auth_mode "$GEMINI_AUTH_MODE" \
+	          --argjson api_key_env_present "$AUTH_API_KEY_ENV_PRESENT" \
+	          --argjson api_key_ignored "$AUTH_API_KEY_IGNORED" \
+	          '{
+	            provider: $provider,
+	            status: $status,
+	            latency_ms: $latency,
+	            cli_available: true,
+	            version: $version,
+	            auth_mode: $auth_mode,
+	            api_key_env_present: $api_key_env_present,
+	            api_key_ignored_for_subscription: $api_key_ignored,
+	            session_support: true
+	          }'
   else
-    jq -n --arg provider "gemini" \
-          --arg error "$HEALTH_OUTPUT" \
-          --argjson latency "$LATENCY_MS" \
-          '{
-            provider: $provider,
-            status: "error",
-            latency_ms: $latency,
-            cli_available: true,
-            error: $error,
-            session_support: true
-          }'
+	    jq -n --arg provider "gemini" \
+	          --arg error "$HEALTH_OUTPUT" \
+	          --argjson latency "$LATENCY_MS" \
+	          --arg auth_mode "$GEMINI_AUTH_MODE" \
+	          --argjson api_key_env_present "$AUTH_API_KEY_ENV_PRESENT" \
+	          --argjson api_key_ignored "$AUTH_API_KEY_IGNORED" \
+	          '{
+	            provider: $provider,
+	            status: "error",
+	            latency_ms: $latency,
+	            cli_available: true,
+	            error: $error,
+	            auth_mode: $auth_mode,
+	            api_key_env_present: $api_key_env_present,
+	            api_key_ignored_for_subscription: $api_key_ignored,
+	            session_support: true
+	          }'
   fi
   exit 0
 fi
