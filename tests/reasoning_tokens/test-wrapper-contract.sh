@@ -2,7 +2,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+WRAPPER_DIR="$ROOT_DIR/bin"
+if [[ ! -f "$WRAPPER_DIR/claude.sh" && -f "$SCRIPT_DIR/../../claude.sh" ]]; then
+  ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+  WRAPPER_DIR="$ROOT_DIR"
+fi
+LIB_DIR="$WRAPPER_DIR/lib"
 
 PROVIDERS=(codex claude gemini cursor opencode)
 MODE="static"
@@ -102,6 +108,21 @@ assert_wrapper_contract_wiring() {
   echo "[PASS] $name static contract wiring"
 }
 
+assert_tool_telemetry_contract_wiring() {
+  local file="$1"
+
+  bash -n "$file"
+  grep -q "autonom8_enrich_provider_payload_json()" "$file"
+  grep -q "reasoning_capture_summary" "$file"
+  grep -q "reasoning_capture" "$file"
+  grep -q "diagnostic_only" "$file"
+  grep -q "not_required_for_acceptance" "$file"
+  grep -q "quality_gate_role" "$file"
+  grep -q "methods_attempted" "$file"
+
+  echo "[PASS] tool telemetry reasoning_capture wiring"
+}
+
 assert_wrapper_session_wiring() {
   local file="$1"
   local name="$2"
@@ -116,9 +137,9 @@ assert_wrapper_session_wiring() {
       fi
       ;;
     gemini)
-      grep -Fq 'GEMINI_SESSION_ARGS=()' "$file"
-      grep -Fq 'GEMINI_SESSION_ARGS+=("--resume" "$SESSION_ID")' "$file"
-      grep -Fq 'gemini "${GEMINI_SESSION_ARGS[@]}" "${GEMINI_ARGS[@]}"' "$file"
+      grep -Fq 'GEMINI_CMD=(gemini)' "$file"
+      grep -Fq 'GEMINI_CMD+=("--resume" "$GEMINI_SESSION_ID")' "$file"
+      grep -Fq '"${GEMINI_CMD[@]}"' "$file"
       if grep -Fq 'GEMINI_SESSION_ID="$MANAGE_SESSION"' "$file"; then
         echo "[FAIL] gemini wrapper still persists MANAGE_SESSION as provider session id"
         return 1
@@ -127,6 +148,32 @@ assert_wrapper_session_wiring() {
   esac
 
   echo "[PASS] $name static session wiring"
+}
+
+assert_wrapper_skill_lookup_order() {
+  local file="$1"
+  local name="$2"
+
+  local canonical claude codex cursor gemini opencode legacy
+  canonical="$(grep -nF '"$CORE_DIR/modules/Autonom8-Agents/skills/${SKILL_NAME}/SKILL.md"' "$file" | head -1 | cut -d: -f1)"
+  claude="$(grep -nF '"$CORE_DIR/.claude/skills/${SKILL_NAME}/SKILL.md"' "$file" | head -1 | cut -d: -f1)"
+  codex="$(grep -nF '"$CORE_DIR/.codex/skills/${SKILL_NAME}/SKILL.md"' "$file" | head -1 | cut -d: -f1)"
+  cursor="$(grep -nF '"$CORE_DIR/.cursor/skills/${SKILL_NAME}/SKILL.md"' "$file" | head -1 | cut -d: -f1)"
+  gemini="$(grep -nF '"$CORE_DIR/.gemini/skills/${SKILL_NAME}/SKILL.md"' "$file" | head -1 | cut -d: -f1)"
+  opencode="$(grep -nF '"$CORE_DIR/modules/Autonom8-Agents/.opencode/skills/${SKILL_NAME}/SKILL.md"' "$file" | head -1 | cut -d: -f1)"
+  legacy="$(grep -nF '"$CORE_DIR/.claude/commands/${SKILL_NAME}.md"' "$file" | head -1 | cut -d: -f1)"
+
+  if [[ -z "$canonical" || -z "$claude" || -z "$codex" || -z "$cursor" || -z "$gemini" || -z "$opencode" || -z "$legacy" ]]; then
+    echo "[FAIL] $name skill lookup paths missing"
+    return 1
+  fi
+
+  if ! [[ "$canonical" -lt "$claude" && "$claude" -lt "$codex" && "$codex" -lt "$cursor" && "$cursor" -lt "$gemini" && "$gemini" -lt "$opencode" && "$opencode" -lt "$legacy" ]]; then
+    echo "[FAIL] $name skill lookup order drifted"
+    return 1
+  fi
+
+  echo "[PASS] $name static skill lookup order"
 }
 
 assert_response_contract_json() {
@@ -140,6 +187,11 @@ assert_response_contract_json() {
     has("metadata") and
     (.tokens_used | has("input_tokens") and has("output_tokens") and has("estimated_output_tokens") and has("total_tokens") and has("cost_usd") and has("cache_read_input_tokens") and has("cache_creation_input_tokens")) and
     (.metadata | has("reasoning_available") and has("reasoning_source") and has("token_usage_available") and has("reasoning_absent_reason")) and
+    (.metadata | has("reasoning_capture")) and
+    (.metadata.reasoning_capture | has("schema_version") and has("available") and has("source") and has("absent_reason") and has("captured_chars") and has("response_chars") and has("diagnostic_only") and has("not_required_for_acceptance") and has("quality_gate_role") and has("methods_attempted")) and
+    (.metadata.reasoning_capture.diagnostic_only == true) and
+    (.metadata.reasoning_capture.not_required_for_acceptance == true) and
+    (.metadata.reasoning_capture.quality_gate_role == "observability_only") and
     (.metadata.reasoning_source | (. == "none" or . == "raw_output" or . == "response_payload" or . == "stream_log" or . == "session_log" or . == "session_assistant" or . == "derived_excerpt")) and
     (.metadata.reasoning_absent_reason | (. == "available" or . == "model_not_emitted" or . == "error_path")) and
     ((.metadata.reasoning_available == true and .metadata.reasoning_absent_reason == "available") or (.metadata.reasoning_available == false and .metadata.reasoning_absent_reason != "available")) and
@@ -194,13 +246,19 @@ assert_response_contract_json() {
 
 run_static_checks() {
   echo "== Static Wrapper Contract Checks =="
-  assert_wrapper_contract_wiring "$ROOT_DIR/claude.sh" "claude"
-  assert_wrapper_contract_wiring "$ROOT_DIR/gemini.sh" "gemini"
-  assert_wrapper_contract_wiring "$ROOT_DIR/codex.sh" "codex"
-  assert_wrapper_contract_wiring "$ROOT_DIR/cursor.sh" "cursor"
-  assert_wrapper_contract_wiring "$ROOT_DIR/opencode.sh" "opencode"
-  assert_wrapper_session_wiring "$ROOT_DIR/gemini.sh" "gemini"
-  assert_wrapper_session_wiring "$ROOT_DIR/codex.sh" "codex"
+  assert_tool_telemetry_contract_wiring "$LIB_DIR/tool-telemetry.sh"
+  assert_wrapper_contract_wiring "$WRAPPER_DIR/claude.sh" "claude"
+  assert_wrapper_contract_wiring "$WRAPPER_DIR/gemini.sh" "gemini"
+  assert_wrapper_contract_wiring "$WRAPPER_DIR/codex.sh" "codex"
+  assert_wrapper_contract_wiring "$WRAPPER_DIR/cursor.sh" "cursor"
+  assert_wrapper_contract_wiring "$WRAPPER_DIR/opencode.sh" "opencode"
+  assert_wrapper_session_wiring "$WRAPPER_DIR/gemini.sh" "gemini"
+  assert_wrapper_session_wiring "$WRAPPER_DIR/codex.sh" "codex"
+  assert_wrapper_skill_lookup_order "$WRAPPER_DIR/claude.sh" "claude"
+  assert_wrapper_skill_lookup_order "$WRAPPER_DIR/gemini.sh" "gemini"
+  assert_wrapper_skill_lookup_order "$WRAPPER_DIR/codex.sh" "codex"
+  assert_wrapper_skill_lookup_order "$WRAPPER_DIR/cursor.sh" "cursor"
+  assert_wrapper_skill_lookup_order "$WRAPPER_DIR/opencode.sh" "opencode"
 }
 
 run_live_checks() {
@@ -243,7 +301,7 @@ JSON
     err_file="$(mktemp)"
 
     set +e
-    cat "$prompt_file" | "$ROOT_DIR/${provider}.sh" \
+    cat "$prompt_file" | "$WRAPPER_DIR/${provider}.sh" \
       --persona "reasoning-${provider}" \
       --skip-context-file \
       --timeout "$TIMEOUT" \

@@ -1358,8 +1358,8 @@ get_cursor_session_reasoning() {
       .[]
       | select(.role == "assistant")
       | (.message.content // [])[]
-      | select(.type == "text")
-      | (.text // "")
+      | select(.type == "text" or .type == "thinking")
+      | (if .type == "thinking" then (.thinking // .text // "") else (.text // "") end)
       | gsub("\\r";"")
       | gsub("^\\s+|\\s+$";"")
       | select(length > 0)
@@ -1935,7 +1935,14 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
     fi
     rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
     ERROR_TYPE="provider_error"
-    if [[ "$CURSOR_EXIT" -eq 124 ]]; then
+    if declare -F classify_wrapper_error >/dev/null; then
+      ERROR_TYPE="$(classify_wrapper_error "$ERROR_MSG" "$CURSOR_EXIT" "provider_error")"
+      if [[ "$ERROR_TYPE" == "provider_error" ]] && is_cursor_keychain_locked_error "$ERROR_COMBINED"; then
+        ERROR_TYPE="credential_unavailable"
+      elif [[ "$ERROR_TYPE" == "provider_error" ]] && echo "$ERROR_MSG" | grep -qi "Cannot use this model\|Unknown model\|Invalid model"; then
+        ERROR_TYPE="invalid_model"
+      fi
+    elif [[ "$CURSOR_EXIT" -eq 124 ]]; then
       ERROR_TYPE="timeout"
     elif is_cursor_keychain_locked_error "$ERROR_COMBINED"; then
       ERROR_TYPE="credential_unavailable"
@@ -2447,7 +2454,12 @@ $TOOL_RULES
 
     rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
     ERROR_TYPE="provider_error"
-    if [[ "$CURSOR_EXIT" -eq 124 ]]; then
+    if declare -F classify_wrapper_error >/dev/null; then
+      ERROR_TYPE="$(classify_wrapper_error "$ERROR_MSG" "$CURSOR_EXIT" "provider_error")"
+      if [[ "$ERROR_TYPE" == "provider_error" ]] && is_cursor_keychain_locked_error "$ERROR_COMBINED"; then
+        ERROR_TYPE="credential_unavailable"
+      fi
+    elif [[ "$CURSOR_EXIT" -eq 124 ]]; then
       ERROR_TYPE="timeout"
     elif is_cursor_keychain_locked_error "$ERROR_COMBINED"; then
       ERROR_TYPE="credential_unavailable"

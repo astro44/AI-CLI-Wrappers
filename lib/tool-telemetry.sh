@@ -320,6 +320,23 @@ autonom8_enrich_provider_payload_json() {
           activity_class: (($ta.activity_class // "none") | tostring),
           error_classes: (($ta.error_classes // []) | if type == "array" then . else [] end)
         };
+    def reasoning_capture_summary:
+      (.metadata // {}) as $m
+      | ((.reasoning // "") | tostring) as $reasoning
+      | (($m.reasoning_available // false) == true) as $available
+      | {
+          schema_version: 1,
+          provider: $ctx.provider,
+          available: $available,
+          source: (($m.reasoning_source // "none") | tostring),
+          absent_reason: (if $available then "available" else (($m.reasoning_absent_reason // "provider_reasoning_not_emitted") | tostring) end),
+          captured_chars: ($reasoning | length),
+          response_chars: (((.response // "") | tostring) | length),
+          diagnostic_only: true,
+          not_required_for_acceptance: true,
+          quality_gate_role: "observability_only",
+          methods_attempted: ["wrapper_top_level", "response_payload", "session_log", "stream_log"]
+        };
     classify_failure as $class
     | .provider = (.provider // $ctx.provider)
     | .workflow = (.workflow // $ctx.workflow)
@@ -328,6 +345,7 @@ autonom8_enrich_provider_payload_json() {
     | .model = (.model // $ctx.model_effective)
     | .metadata = (.metadata // {})
     | .metadata.wrapper_context = ((.metadata.wrapper_context // {}) + $ctx)
+    | .metadata.reasoning_capture = ((.metadata.reasoning_capture // {}) + reasoning_capture_summary)
     | .metadata.failure_signal = ((.metadata.failure_signal // {}) + {
         class: $class,
         corrective_action: action_for($class),

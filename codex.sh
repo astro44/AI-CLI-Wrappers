@@ -1417,8 +1417,19 @@ if [[ "$DRY_RUN" == "true" ]]; then
       ERROR_MSG="Codex exited with status $CODEX_EXIT (no error details captured)"
     fi
     rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
+    ERROR_TYPE="provider_error"
+    if type classify_wrapper_error &>/dev/null; then
+      ERROR_TYPE="$(classify_wrapper_error "$ERROR_MSG" "$CODEX_EXIT" "provider_error")"
+    elif type classify_error &>/dev/null; then
+      ERROR_TYPE="$(classify_error "$ERROR_MSG")"
+      if [[ $CODEX_EXIT -eq 124 && "$ERROR_TYPE" != "rate_limit" && "$ERROR_TYPE" != "quota" ]]; then
+        ERROR_TYPE="timeout"
+      fi
+    elif [[ $CODEX_EXIT -eq 124 ]]; then
+      ERROR_TYPE="timeout"
+    fi
     # Truncate error to avoid "argument list too long"
-    emit_cli_error_response "$(echo "$ERROR_MSG" | head -c 4000)" "provider_error" "$CODEX_SESSION_ID" "$CODEX_EXIT"
+    emit_cli_error_response "$(echo "$ERROR_MSG" | head -c 4000)" "$ERROR_TYPE" "$CODEX_SESSION_ID" "$CODEX_EXIT"
     exit 1
   fi
 
@@ -2001,13 +2012,15 @@ $TOOL_RULES
     fi
 
     # Classify the error type
-    ERROR_TYPE="unknown"
-    if type classify_error &>/dev/null; then
+    ERROR_TYPE="provider_error"
+    if type classify_wrapper_error &>/dev/null; then
+      ERROR_TYPE="$(classify_wrapper_error "$ERROR_MSG" "$CODEX_EXIT" "provider_error")"
+    elif type classify_error &>/dev/null; then
       ERROR_TYPE=$(classify_error "$ERROR_MSG")
-    fi
-
-    # Timeout classification (emit structured envelope below).
-    if [[ $CODEX_EXIT -eq 124 ]]; then
+      if [[ $CODEX_EXIT -eq 124 && "$ERROR_TYPE" != "rate_limit" && "$ERROR_TYPE" != "quota" ]]; then
+        ERROR_TYPE="timeout"
+      fi
+    elif [[ $CODEX_EXIT -eq 124 ]]; then
       ERROR_TYPE="timeout"
     fi
 
@@ -2216,7 +2229,18 @@ else
       ERROR_MSG="Codex exited with status $CODEX_EXIT (no error details captured)"
     fi
     rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
-    emit_cli_error_response "$(echo "$ERROR_MSG" | head -c 4000)" "provider_error" "${CODEX_SESSION_ID:-$SESSION_ID}" "$CODEX_EXIT"
+    ERROR_TYPE="provider_error"
+    if type classify_wrapper_error &>/dev/null; then
+      ERROR_TYPE="$(classify_wrapper_error "$ERROR_MSG" "$CODEX_EXIT" "provider_error")"
+    elif type classify_error &>/dev/null; then
+      ERROR_TYPE="$(classify_error "$ERROR_MSG")"
+      if [[ $CODEX_EXIT -eq 124 && "$ERROR_TYPE" != "rate_limit" && "$ERROR_TYPE" != "quota" ]]; then
+        ERROR_TYPE="timeout"
+      fi
+    elif [[ $CODEX_EXIT -eq 124 ]]; then
+      ERROR_TYPE="timeout"
+    fi
+    emit_cli_error_response "$(echo "$ERROR_MSG" | head -c 4000)" "$ERROR_TYPE" "${CODEX_SESSION_ID:-$SESSION_ID}" "$CODEX_EXIT"
     exit 1
   fi
 

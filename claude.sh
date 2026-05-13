@@ -1648,11 +1648,15 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
     if [[ -z "$ERROR_MSG" ]]; then
       ERROR_MSG="Unknown error"
     fi
-    ERROR_TYPE="unknown"
-    if type classify_error &>/dev/null; then
+    ERROR_TYPE="provider_error"
+    if type classify_wrapper_error &>/dev/null; then
+      ERROR_TYPE="$(classify_wrapper_error "$ERROR_MSG" "$CLAUDE_EXIT" "provider_error")"
+    elif type classify_error &>/dev/null; then
       ERROR_TYPE=$(classify_error "$ERROR_MSG")
-    fi
-    if [[ $CLAUDE_EXIT -eq 124 ]]; then
+      if [[ $CLAUDE_EXIT -eq 124 && "$ERROR_TYPE" != "rate_limit" && "$ERROR_TYPE" != "quota" ]]; then
+        ERROR_TYPE="timeout"
+      fi
+    elif [[ $CLAUDE_EXIT -eq 124 ]]; then
       ERROR_TYPE="timeout"
     fi
     rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
@@ -2178,13 +2182,15 @@ $TOOL_RULES
     fi
 
     # Classify the error type
-    ERROR_TYPE="unknown"
-    if type classify_error &>/dev/null; then
+    ERROR_TYPE="provider_error"
+    if type classify_wrapper_error &>/dev/null; then
+      ERROR_TYPE="$(classify_wrapper_error "$ERROR_MSG" "$CLAUDE_EXIT" "provider_error")"
+    elif type classify_error &>/dev/null; then
       ERROR_TYPE=$(classify_error "$ERROR_MSG")
-    fi
-
-    # Timeout classification (emit structured envelope below).
-    if [[ $CLAUDE_EXIT -eq 124 ]]; then
+      if [[ $CLAUDE_EXIT -eq 124 && "$ERROR_TYPE" != "rate_limit" && "$ERROR_TYPE" != "quota" ]]; then
+        ERROR_TYPE="timeout"
+      fi
+    elif [[ $CLAUDE_EXIT -eq 124 ]]; then
       ERROR_TYPE="timeout"
     fi
 
@@ -2382,7 +2388,18 @@ else
     if [[ -z "$ERROR_MSG" ]]; then
       ERROR_MSG="Unknown error"
     fi
-    emit_cli_error_response "$ERROR_MSG" "provider_error" "${CLAUDE_SESSION_ID:-$SESSION_ID}" "$CLAUDE_EXIT"
+    ERROR_TYPE="provider_error"
+    if type classify_wrapper_error &>/dev/null; then
+      ERROR_TYPE="$(classify_wrapper_error "$ERROR_MSG" "$CLAUDE_EXIT" "provider_error")"
+    elif type classify_error &>/dev/null; then
+      ERROR_TYPE="$(classify_error "$ERROR_MSG")"
+      if [[ $CLAUDE_EXIT -eq 124 && "$ERROR_TYPE" != "rate_limit" && "$ERROR_TYPE" != "quota" ]]; then
+        ERROR_TYPE="timeout"
+      fi
+    elif [[ $CLAUDE_EXIT -eq 124 ]]; then
+      ERROR_TYPE="timeout"
+    fi
+    emit_cli_error_response "$ERROR_MSG" "$ERROR_TYPE" "${CLAUDE_SESSION_ID:-$SESSION_ID}" "$CLAUDE_EXIT"
     exit 1
   fi
 

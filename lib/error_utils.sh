@@ -5,6 +5,7 @@
 # Error classification constants
 ERROR_TIMEOUT="timeout"
 ERROR_RATE_LIMIT="rate_limit"
+ERROR_CREDENTIAL_UNAVAILABLE="credential_unavailable"
 ERROR_AUTH="auth"
 ERROR_NETWORK="network"
 ERROR_QUOTA="quota"
@@ -36,6 +37,17 @@ RATE_LIMIT_PATTERNS=(
     "model_capacity_exhausted"
     "no capacity available for model"
     "ratelimitexceeded"
+)
+
+# Auth patterns
+CREDENTIAL_UNAVAILABLE_PATTERNS=(
+    "credential_unavailable"
+    "credentials unavailable"
+    "credential unavailable"
+    "login keychain is locked"
+    "macos login keychain is locked"
+    "unlock-keychain"
+    "keychain unlock failed"
 )
 
 # Auth patterns
@@ -116,6 +128,14 @@ classify_error() {
     done
 
     # Check auth patterns
+    for pattern in "${CREDENTIAL_UNAVAILABLE_PATTERNS[@]}"; do
+        if echo "$error_lower" | grep -qiE "$pattern"; then
+            echo "$ERROR_CREDENTIAL_UNAVAILABLE"
+            return 0
+        fi
+    done
+
+    # Check auth patterns
     for pattern in "${AUTH_PATTERNS[@]}"; do
         if echo "$error_lower" | grep -qiE "$pattern"; then
             echo "$ERROR_AUTH"
@@ -149,6 +169,29 @@ classify_error() {
 
     # Default to unknown
     echo "$ERROR_UNKNOWN"
+}
+
+# Classify wrapper failures using stderr/content plus exit code.
+# Capacity/quota/rate-limit text wins over timeout exit code so provider
+# governance can route around quota exhaustion instead of recording a stall.
+classify_wrapper_error() {
+    local error_msg="$1"
+    local exit_code="${2:-1}"
+    local default_type="${3:-$ERROR_PROVIDER}"
+    local error_type="$default_type"
+
+    if declare -F classify_error >/dev/null; then
+        error_type="$(classify_error "$error_msg")"
+    fi
+    if [[ -z "$error_type" || "$error_type" == "$ERROR_UNKNOWN" ]]; then
+        error_type="$default_type"
+    fi
+
+    if [[ "$exit_code" == "124" && "$error_type" != "$ERROR_RATE_LIMIT" && "$error_type" != "$ERROR_QUOTA" ]]; then
+        error_type="$ERROR_TIMEOUT"
+    fi
+
+    echo "$error_type"
 }
 
 # Format a structured error response

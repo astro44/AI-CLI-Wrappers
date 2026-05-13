@@ -1,0 +1,78 @@
+{
+  "response": "ok",
+  "reasoning": "",
+  "tokens_used": {
+    "input_tokens": 1,
+    "output_tokens": 1,
+    "estimated_output_tokens": 1,
+    "total_tokens": 2,
+    "cost_usd": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0
+  },
+  "metadata": {
+    "reasoning_available": false,
+    "reasoning_source": "none",
+    "reasoning_absent_reason": "model_not_emitted",
+    "wrapper_context": {
+      "provider": "claude",
+      "request_id": "",
+      "workflow": "",
+      "ticket_id": "",
+      "agent": "",
+      "wrapper": "autonom8_provider_context_json",
+      "model_requested": "",
+      "model_effective": "",
+      "model_resolution": "",
+      "workspace_scope": "",
+      "process_group_mode": ""
+    },
+    "reasoning_capture": {
+      "schema_version": 1,
+      "provider": "claude",
+      "available": false,
+      "source": "none",
+      "absent_reason": "model_not_emitted",
+      "captured_chars": 0,
+      "response_chars": 2,
+      "diagnostic_only": true,
+      "not_required_for_acceptance": true,
+      "quality_gate_role": "observability_only",
+      "methods_attempted": [
+        "wrapper_top_level",
+        "response_payload",
+        "session_log",
+        "stream_log"
+      ]
+    },
+    "failure_signal": {
+      "class": "unknown",
+      "corrective_action": "inspect_provider_result",
+      "retryable": false,
+      "retry_after_seconds": 0,
+      "observed_status": "",
+      "evidence_excerpt": "unknown"
+    },
+    "economics": {
+      "input_tokens": 1,
+      "output_tokens": 1,
+      "total_tokens": 2,
+      "cost_usd": 0,
+      "estimated_output_tokens": 1,
+      "output_input_ratio": 1,
+      "zero_output": false
+    },
+    "tool_yield": {
+      "call_count": 0,
+      "write_count": 0,
+      "error_count": 0,
+      "activity_class": "none",
+      "error_classes": []
+    }
+  },
+  "provider": "claude",
+  "workflow": "",
+  "ticket_id": "",
+  "request_id": "",
+  "model": ""
+}

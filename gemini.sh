@@ -1820,8 +1820,15 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
     ERROR_MSG=$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' || echo "Unknown error")
     rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
     ERROR_TYPE="provider_error"
-    if declare -F classify_error >/dev/null; then
+    if declare -F classify_wrapper_error >/dev/null; then
+      ERROR_TYPE="$(classify_wrapper_error "$ERROR_MSG" "$GEMINI_EXIT" "provider_error")"
+    elif declare -F classify_error >/dev/null; then
       ERROR_TYPE="$(classify_error "$ERROR_MSG")"
+      if [[ $GEMINI_EXIT -eq 124 && "$ERROR_TYPE" != "rate_limit" && "$ERROR_TYPE" != "quota" ]]; then
+        ERROR_TYPE="timeout"
+      fi
+    elif [[ $GEMINI_EXIT -eq 124 ]]; then
+      ERROR_TYPE="timeout"
     fi
     emit_cli_error_response "$ERROR_MSG" "$ERROR_TYPE" "" "$GEMINI_EXIT"
     exit 1
@@ -2335,6 +2342,9 @@ $TOOL_RULES
         : > "$TMPFILE_ERR"
         continue
       fi
+      rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
+      emit_cli_error_response "Gemini capacity exhausted after fallback: $ERROR_MSG" "rate_limit" "$GEMINI_SESSION_ID" "$GEMINI_EXIT" "model_resolution" "$MODEL_RESOLUTION_NOTE"
+      exit 1
     fi
 
     # Check if this is an invalid session error - fail fast, don't retry
@@ -2637,9 +2647,23 @@ else
           GEMINI_CAPACITY_RETRIED=true
           continue
         fi
+        rm -f "$TMPFILE_PROMPT" "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
+        emit_cli_error_response "Gemini capacity exhausted after fallback: $ERROR_MSG" "rate_limit" "$GEMINI_SESSION_ID" "$GEMINI_EXIT" "model_resolution" "$MODEL_RESOLUTION_NOTE"
+        exit 1
       fi
       rm -f "$TMPFILE_PROMPT" "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
-      emit_cli_error_response "$ERROR_MSG" "provider_error" "$GEMINI_SESSION_ID" "$GEMINI_EXIT"
+      ERROR_TYPE="provider_error"
+      if declare -F classify_wrapper_error >/dev/null; then
+        ERROR_TYPE="$(classify_wrapper_error "$ERROR_MSG" "$GEMINI_EXIT" "provider_error")"
+      elif declare -F classify_error >/dev/null; then
+        ERROR_TYPE="$(classify_error "$ERROR_MSG")"
+        if [[ $GEMINI_EXIT -eq 124 && "$ERROR_TYPE" != "rate_limit" && "$ERROR_TYPE" != "quota" ]]; then
+          ERROR_TYPE="timeout"
+        fi
+      elif [[ $GEMINI_EXIT -eq 124 ]]; then
+        ERROR_TYPE="timeout"
+      fi
+      emit_cli_error_response "$ERROR_MSG" "$ERROR_TYPE" "$GEMINI_SESSION_ID" "$GEMINI_EXIT"
       exit 1
     fi
     break

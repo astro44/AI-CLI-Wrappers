@@ -1211,7 +1211,18 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
   if [[ $OPENCODE_EXIT -ne 0 ]]; then
     ERROR_MSG=$(cat "$TMPFILE_ERR" 2>/dev/null | tr -d '\0' || echo "Unknown error")
     rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
-    emit_cli_error_response "$ERROR_MSG" "provider_error" "" "$OPENCODE_EXIT"
+    ERROR_TYPE="provider_error"
+    if declare -F classify_wrapper_error >/dev/null; then
+      ERROR_TYPE="$(classify_wrapper_error "$ERROR_MSG" "$OPENCODE_EXIT" "provider_error")"
+    elif declare -F classify_error >/dev/null; then
+      ERROR_TYPE="$(classify_error "$ERROR_MSG")"
+      if [[ $OPENCODE_EXIT -eq 124 && "$ERROR_TYPE" != "rate_limit" && "$ERROR_TYPE" != "quota" ]]; then
+        ERROR_TYPE="timeout"
+      fi
+    elif [[ $OPENCODE_EXIT -eq 124 ]]; then
+      ERROR_TYPE="timeout"
+    fi
+    emit_cli_error_response "$ERROR_MSG" "$ERROR_TYPE" "" "$OPENCODE_EXIT"
     exit 1
   fi
 
@@ -1538,7 +1549,18 @@ $TOOL_RULES
       OPENCODE_SESSION_ID="$(get_latest_opencode_session "$PWD" 2>/dev/null || true)"
     fi
     rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR"
-    emit_cli_error_response "$ERROR_MSG" "provider_error" "$OPENCODE_SESSION_ID" "$OPENCODE_EXIT"
+    ERROR_TYPE="provider_error"
+    if declare -F classify_wrapper_error >/dev/null; then
+      ERROR_TYPE="$(classify_wrapper_error "$ERROR_MSG" "$OPENCODE_EXIT" "provider_error")"
+    elif declare -F classify_error >/dev/null; then
+      ERROR_TYPE="$(classify_error "$ERROR_MSG")"
+      if [[ $OPENCODE_EXIT -eq 124 && "$ERROR_TYPE" != "rate_limit" && "$ERROR_TYPE" != "quota" ]]; then
+        ERROR_TYPE="timeout"
+      fi
+    elif [[ $OPENCODE_EXIT -eq 124 ]]; then
+      ERROR_TYPE="timeout"
+    fi
+    emit_cli_error_response "$ERROR_MSG" "$ERROR_TYPE" "$OPENCODE_SESSION_ID" "$OPENCODE_EXIT"
     exit 1
   fi
 
