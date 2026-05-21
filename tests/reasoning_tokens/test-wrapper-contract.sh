@@ -159,35 +159,76 @@ assert_tool_telemetry_contract_wiring() {
 }
 
 assert_cursor_tool_telemetry_fixture() {
-  local fixture out file_path
+  local fixture out edit_path multi_path read_path grep_path list_path search_path cmd1 cmd2 cmd3
   fixture="$(mktemp)"
   out="$(mktemp)"
-  file_path="/tmp/autonom8-cursor-telemetry-fixture/src/cursor-proof.js"
+  edit_path="/tmp/autonom8-cursor-telemetry-fixture/src/cursor-proof.js"
+  multi_path="/tmp/autonom8-cursor-telemetry-fixture/src/cursor-multi.js"
+  read_path="/tmp/autonom8-cursor-telemetry-fixture/src/cursor-proof.js"
+  grep_path="/tmp/autonom8-cursor-telemetry-fixture/src/grep-target.js"
+  list_path="/tmp/autonom8-cursor-telemetry-fixture/src/index.js"
+  search_path="/tmp/autonom8-cursor-telemetry-fixture/tests/search-target.spec.js"
+  cmd1="npm test -- --runInBand"
+  cmd2="go test ./sprint/sprint_execution"
+  cmd3="python3 -m pytest tests/unit"
 
   cat > "$fixture" <<JSONL
-{"type":"tool_call","subtype":"started","call_id":"tool-edit-1","tool_call":{"editToolCall":{"args":{"path":"$file_path","streamContent":"export const ok = true;"}}},"timestamp_ms":1779323717008}
-{"type":"tool_call","subtype":"completed","call_id":"tool-edit-1","tool_call":{"editToolCall":{"args":{"path":"$file_path","streamContent":"export const ok = true;"},"result":{"success":{"path":"$file_path","linesAdded":1}}}},"timestamp_ms":1779323717162}
-{"type":"tool_call","subtype":"started","call_id":"tool-read-1","tool_call":{"readToolCall":{"args":{"path":"$file_path"}}},"timestamp_ms":1779323718524}
-{"type":"tool_call","subtype":"completed","call_id":"tool-read-1","tool_call":{"readToolCall":{"args":{"path":"$file_path"},"result":{"success":{"path":"$file_path","content":"export const ok = true;"}}}},"timestamp_ms":1779323718574}
+{"type":"tool_call","subtype":"completed","call_id":"tool-edit-1","tool_call":{"editToolCall":{"args":{"path":"$edit_path","streamContent":"export const ok = true;"},"result":{"success":{"path":"$edit_path","linesAdded":1}}}},"timestamp_ms":1779323717008}
+{"type":"tool_call","subtype":"completed","call_id":"tool-multi-1","tool_call":{"multiEditToolCall":{"args":{"edits":[{"path":"$multi_path","oldText":"before","newText":"after"}]},"result":{"success":{"path":"$multi_path","editsApplied":1}}}},"timestamp_ms":1779323717162}
+{"type":"tool_call","subtype":"completed","call_id":"tool-read-1","tool_call":{"readToolCall":{"args":{"path":"$read_path"},"result":{"success":{"path":"$read_path","content":"export const ok = true;"}}}},"timestamp_ms":1779323718524}
+{"type":"tool_call","subtype":"completed","call_id":"tool-grep-1","tool_call":{"grepToolCall":{"args":{"path":"$grep_path","pattern":"cursorProof"},"result":{"success":{"path":"$grep_path","matches":1}}}},"timestamp_ms":1779323718574}
+{"type":"tool_call","subtype":"completed","call_id":"tool-list-1","tool_call":{"listDirToolCall":{"args":{"path":"$list_path"},"result":{"success":{"path":"$list_path","entries":["cursor-proof.js"]}}}},"timestamp_ms":1779323718624}
+{"type":"tool_call","subtype":"completed","call_id":"tool-search-1","tool_call":{"searchToolCall":{"args":{"path":"$search_path","query":"cursor proof"},"result":{"success":{"path":"$search_path","matches":1}}}},"timestamp_ms":1779323718674}
+{"type":"tool_call","subtype":"completed","call_id":"tool-terminal-1","tool_call":{"terminalToolCall":{"args":{"command":"$cmd1"},"result":{"success":{"exitCode":0}}}},"timestamp_ms":1779323718724}
+{"type":"tool_call","subtype":"completed","call_id":"tool-runcommand-1","tool_call":{"runCommandToolCall":{"args":{"cmd":"$cmd2"},"result":{"success":{"exitCode":0}}}},"timestamp_ms":1779323718774}
+{"type":"tool_call","subtype":"completed","call_id":"tool-shell-1","tool_call":{"shellToolCall":{"args":{"shell_command":"$cmd3"},"result":{"success":{"exitCode":0}}}},"timestamp_ms":1779323718824}
 JSONL
 
   # shellcheck disable=SC1090
   source "$LIB_DIR/tool-telemetry.sh"
   autonom8_tool_activity_json "$(cat "$fixture")" "" "fixture:cursor" > "$out"
 
-  if ! jq -e --arg file "$file_path" '
-    .call_count == 4 and
+  if ! jq -e \
+    --arg edit "$edit_path" \
+    --arg multi "$multi_path" \
+    --arg read "$read_path" \
+    --arg grep "$grep_path" \
+    --arg list "$list_path" \
+    --arg search "$search_path" \
+    --arg cmd1 "$cmd1" \
+    --arg cmd2 "$cmd2" \
+    --arg cmd3 "$cmd3" '
+    .call_count == 9 and
     .write_count == 2 and
-    .read_count == 2 and
+    .read_count == 4 and
+    .command_count == 3 and
     .tool_write_count == 2 and
-    .tool_read_count == 2 and
+    .tool_read_count == 4 and
+    .commands_run_count == 3 and
     .activity_class == "write_active" and
     (.tool_names | index("editToolCall")) and
+    (.tool_names | index("multiEditToolCall")) and
     (.tool_names | index("readToolCall")) and
-    (.files_changed | index($file)) and
-    (.files_read | index($file))
+    (.tool_names | index("grepToolCall")) and
+    (.tool_names | index("listDirToolCall")) and
+    (.tool_names | index("searchToolCall")) and
+    (.tool_names | index("terminalToolCall")) and
+    (.tool_names | index("runCommandToolCall")) and
+    (.tool_names | index("shellToolCall")) and
+    (.result_classes | index("write")) and
+    (.result_classes | index("read")) and
+    (.result_classes | index("shell")) and
+    (.files_changed | index($edit)) and
+    (.files_changed | index($multi)) and
+    (.files_read | index($read)) and
+    (.files_read | index($grep)) and
+    (.files_read | index($list)) and
+    (.files_read | index($search)) and
+    (.commands_run | index($cmd1)) and
+    (.commands_run | index($cmd2)) and
+    (.commands_run | index($cmd3))
   ' "$out" >/dev/null; then
-    echo "[FAIL] cursor tool telemetry fixture did not detect Cursor tool calls"
+    echo "[FAIL] cursor tool telemetry fixture did not detect Cursor tool-call matrix"
     cat "$out"
     rm -f "$fixture" "$out"
     return 1
@@ -195,6 +236,49 @@ JSONL
 
   rm -f "$fixture" "$out"
   echo "[PASS] cursor tool telemetry fixture"
+}
+
+assert_generic_tool_telemetry_fixture() {
+  local fixture out file_path cmd
+  fixture="$(mktemp)"
+  out="$(mktemp)"
+  file_path="src/generic-tool-proof.go"
+  cmd="go test ./..."
+
+  cat > "$fixture" <<JSONL
+{"type":"tool_call","name":"apply_patch","input":{"file_path":"$file_path"},"timestamp":"2026-05-21T00:00:00Z"}
+{"type":"function_call","function":{"name":"Read"},"input":{"path":"$file_path"},"timestamp":"2026-05-21T00:00:01Z"}
+{"toolCalls":[{"name":"Bash","input":{"command":"$cmd"}}],"timestamp":"2026-05-21T00:00:02Z"}
+JSONL
+
+  # shellcheck disable=SC1090
+  source "$LIB_DIR/tool-telemetry.sh"
+  autonom8_tool_activity_json "$(cat "$fixture")" "" "fixture:generic" > "$out"
+
+  if ! jq -e --arg file "$file_path" --arg cmd "$cmd" '
+    .call_count == 3 and
+    .write_count == 1 and
+    .read_count == 1 and
+    .command_count == 1 and
+    .activity_class == "write_active" and
+    (.tool_names | index("apply_patch")) and
+    (.tool_names | index("Read")) and
+    (.tool_names | index("Bash")) and
+    (.result_classes | index("write")) and
+    (.result_classes | index("read")) and
+    (.result_classes | index("shell")) and
+    (.files_changed | index($file)) and
+    (.files_read | index($file)) and
+    (.commands_run | index($cmd))
+  ' "$out" >/dev/null; then
+    echo "[FAIL] generic tool telemetry fixture did not detect common tool-call shapes"
+    cat "$out"
+    rm -f "$fixture" "$out"
+    return 1
+  fi
+
+  rm -f "$fixture" "$out"
+  echo "[PASS] generic tool telemetry fixture"
 }
 
 assert_claude_operational_summary_fixture() {
@@ -375,6 +459,7 @@ run_static_checks() {
   echo "== Static Wrapper Contract Checks =="
   assert_tool_telemetry_contract_wiring "$LIB_DIR/tool-telemetry.sh"
   assert_cursor_tool_telemetry_fixture
+  assert_generic_tool_telemetry_fixture
   assert_wrapper_contract_wiring "$WRAPPER_DIR/claude.sh" "claude"
   assert_wrapper_contract_wiring "$WRAPPER_DIR/gemini.sh" "gemini"
   assert_wrapper_contract_wiring "$WRAPPER_DIR/codex.sh" "codex"
