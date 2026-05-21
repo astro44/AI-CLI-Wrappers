@@ -1,6 +1,6 @@
 # AI-CLI-Wrappers
 
-This directory contains robust shell wrappers that provide a unified interface for various AI CLI tools (Claude, Gemini, Codex, OpenCode, Cursor). These wrappers are designed to be orchestrated by `go-autonom8/climanager` but can also be used independently.
+This directory contains robust shell wrappers that provide a unified interface for various AI CLI tools (Claude, Gemini, Codex, OpenCode, Cursor, Antigravity). These wrappers are designed to be orchestrated by `go-autonom8/climanager` but can also be used independently.
 
 ## Overview
 
@@ -23,6 +23,7 @@ The wrappers standardize the execution of AI agents by handling:
 | `codex.sh` | OpenAI/Codex | Sandbox configuration (`danger-full-access`), playright browser support. |
 | `opencode.sh` | OpenCode | Catalog-backed model normalization/fallback, optimized for fast code generation. |
 | `cursor.sh` | Cursor Agent | Workspace-aware, beta skills support, auto-approval for MCPs. |
+| `agravity.sh` | Google Antigravity (`agy`) | `--print=` non-interactive runs, UUID conversation resume, transcript-derived reasoning/tool telemetry. |
 
 
 ## Unified Interface
@@ -387,6 +388,16 @@ For quota errors, a system message file is written to `<core_dir>/context/system
 - Auto-approves MCP tool usage when `--allowed-tools` is set.
 - Beta skills support via `.cursor/skills/`.
 - Quota status via cached system message files.
+
+### Antigravity (`agravity.sh`)
+- Uses Google's `agy` CLI (Antigravity).
+- Non-interactive runs use `--print=<prompt>`; the wrapper always sets `--print-timeout=<CLI_TIMEOUT>s` so timeouts are enforced on both sides.
+- `--yolo` / `--allowed-tools` maps to `--dangerously-skip-permissions`; `--add-dir <path>` is forwarded to `agy` (and the resolved workspace is added automatically).
+- Conversation state lives at `~/.gemini/antigravity-cli/conversations/<UUID>.pb`; the wrapper discovers the freshest conversation id after each run.
+- `--session-id <UUID>` resumes via `--conversation=<UUID>`; non-UUID logical ids start fresh and the real provider id is captured on completion.
+- Reasoning and tool telemetry are mined from `~/.gemini/antigravity-cli/brain/<UUID>/.system_generated/logs/transcript.jsonl` (assistant `thinking` blocks; `tool_calls[]` per step).
+- The `agy` CLI exposes no `--model` flag — the active model is configured via `~/.gemini/antigravity-cli/settings.json`. The wrapper accepts `--model` for interface parity and records it in `model_resolution`, but does not pass it through.
+- Antigravity does not emit usage metadata; `tokens_used` reports estimated output tokens and a transcript-size-based total estimate.
 
 ## AWS Lambda Integration
 

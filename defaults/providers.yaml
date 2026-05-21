@@ -30,3 +30,9 @@ providers:
       latest: composer 2
       optimal: composer 1.5
     default_model: latest
+  antigravity:
+    auth_mode: subscription
+    models:
+      latest: Gemini 3.5 Pro (High)
+      optimal: Gemini 3.5 Flash (High)
+    default_model: optimal
