@@ -495,6 +495,10 @@ emit_cli_response() {
 
   local tool_activity_json
   tool_activity_json="$(autonom8_tool_activity_json "$tool_activity_input" "$stream_output" "wrapper:claude")"
+  AUTONOM8_OPERATIONAL_SUMMARY_JSON=""
+  if [[ -n "$session_id" ]]; then
+    AUTONOM8_OPERATIONAL_SUMMARY_JSON="$(get_claude_operational_summary "$session_id" 2>/dev/null || true)"
+  fi
 
   RESPONSE_EMITTED=true
 
@@ -590,6 +594,11 @@ emit_cli_error_response() {
         reasoning_absent_reason="available"
       fi
     fi
+  fi
+
+  AUTONOM8_OPERATIONAL_SUMMARY_JSON=""
+  if [[ -n "$session_id" ]]; then
+    AUTONOM8_OPERATIONAL_SUMMARY_JSON="$(get_claude_operational_summary "$session_id" 2>/dev/null || true)"
   fi
 
   RESPONSE_EMITTED=true
@@ -1163,10 +1172,165 @@ get_claude_session_tool_events() {
         type: "tool_use",
         name: (.name // .tool_name // .toolName // empty),
         id: (.id // empty),
-        timestamp: ($entry.timestamp // empty)
+        timestamp: ($entry.timestamp // empty),
+        input: (.input // {})
       }
   ' 2>/dev/null || true
 }
+
+get_claude_operational_summary() {
+  local session_id="$1"
+  local session_file=""
+  session_file="$(get_claude_session_file_by_id "$session_id" 2>/dev/null || true)"
+  [[ -z "$session_file" || ! -f "$session_file" ]] && return 1
+
+  tail -n 1600 "$session_file" 2>/dev/null | jq -s -c \
+    --arg home "$HOME" \
+    --arg pwd "$PWD" \
+    --arg context_dir "${CONTEXT_DIR:-}" '
+    def clean($n):
+      tostring
+      | gsub("[[:space:]]+"; " ")
+      | gsub("^\\s+|\\s+$"; "")
+      | if length > $n then .[0:$n] else . end;
+    def redact:
+      tostring
+      | gsub("(?i)(ANTHROPIC_API_KEY|OPENAI_API_KEY|GEMINI_API_KEY|GOOGLE_API_KEY|CURSOR_API_KEY|API_KEY|ACCESS_TOKEN|TOKEN|SECRET|PASSWORD)=[^[:space:]]+"; "<redacted-env>")
+      | gsub("(?i)Bearer[[:space:]]+[A-Za-z0-9._~+/-]+=*"; "Bearer <redacted>")
+      | gsub("sk-[A-Za-z0-9_-]{10,}"; "sk-<redacted>");
+    def normalize_path:
+      tostring
+      | gsub("^file://"; "")
+      | if (($context_dir | length) > 0 and startswith($context_dir + "/")) then .[($context_dir | length + 1):]
+        elif (($pwd | length) > 0 and startswith($pwd + "/")) then .[($pwd | length + 1):]
+        elif (($home | length) > 0 and startswith($home + "/")) then ("~/" + .[($home | length + 1):])
+        else .
+        end;
+    def path_like:
+      tostring
+      | gsub("[\"`,;:]+$"; "")
+      | normalize_path
+      | select(length > 0)
+      | select(
+          test("(^|/)(src|tests?|public|app|pages|components|styles|lib|pkg|cmd|internal|go-autonom8|tenants|data|docs?)/")
+          or test("\\.(go|js|jsx|mjs|cjs|ts|tsx|css|scss|html|json|md|yaml|yml|sh|py|dart|swift|kt|java|rs|tf|sol|sql)$")
+        );
+    def tool_events:
+      [
+        .[]
+        | select(.type == "assistant" and (.message.content | type == "array"))
+        | .message.content[]?
+        | select((.type // "") == "tool_use")
+        | {name: (.name // .tool_name // .toolName // ""), input: (.input // {})}
+      ];
+    def tool_name_class($name):
+      ($name | tostring | ascii_downcase) as $n
+      | if ($n | test("edit|write|multiedit|apply_patch|create|delete|remove|move|rename|replace")) then "write"
+        elif ($n | test("read|open|view|grep|glob|ls|list|find")) then "read"
+        elif ($n | test("bash|shell|exec|command")) then "command"
+        else "other"
+        end;
+    def values_from($obj):
+      [
+        $obj.path?,
+        $obj.file?,
+        $obj.file_path?,
+        $obj.filepath?,
+        $obj.filename?,
+        $obj.relative_path?,
+        $obj.absolute_path?,
+        $obj.uri?,
+        $obj.notebook_path?
+      ]
+      | map(select(. != null) | path_like);
+    def command_from($obj):
+      ($obj.command? // $obj.cmd? // $obj.shell_command? // $obj.script? // empty)
+      | tostring
+      | redact
+      | clean(300)
+      | select(length > 0);
+    def assistant_texts:
+      [
+        .[]
+        | select(.type == "assistant" and (.message.content | type == "array"))
+        | .message.content[]?
+        | select((.type // "") == "text")
+        | (.text // "")
+        | clean(800)
+        | select(length > 0)
+      ];
+    def tool_errors:
+      [
+        .[]
+        | select(.type == "user" and (.message.content | type == "array"))
+        | .message.content[]?
+        | select((.type // "") == "tool_result")
+        | select((.is_error // false) == true)
+        | (.content // .text // .message // "tool_result_error")
+        | redact
+        | clean(280)
+        | select(length > 0)
+      ];
+    (tool_events) as $tools
+    | (assistant_texts) as $texts
+    | {
+        intent: (($texts[0] // "") | clean(480)),
+        files_read: ([
+          $tools[]
+          | select(tool_name_class(.name) == "read")
+          | values_from(.input)[]
+        ] | unique | .[:20]),
+        files_changed: ([
+          $tools[]
+          | select(tool_name_class(.name) == "write")
+          | values_from(.input)[]
+        ] | unique | .[:20]),
+        commands_run: ([
+          $tools[]
+          | select(tool_name_class(.name) == "command")
+          | command_from(.input)
+        ] | unique | .[:10]),
+        tool_write_count: ([$tools[] | select(tool_name_class(.name) == "write")] | length),
+        errors: (tool_errors | unique | .[:10]),
+        verification: ([
+          $tools[]
+          | select(tool_name_class(.name) == "command")
+          | command_from(.input)
+          | select(test("(?i)(go test|npm test|pnpm test|yarn test|pytest|playwright|lighthouse|axe|eslint|tsc|cargo test|flutter test|xcodebuild|terraform plan)"))
+        ] | unique | .[:10]),
+        final_summary: (($texts[-1] // "") | clean(800)),
+        signed_thinking_blocks: ([
+          .[]
+          | select(.type == "assistant" and (.message.content | type == "array"))
+          | .message.content[]?
+          | select((.type // "") == "thinking")
+          | select(((.signature // .thinking_signature // "") | tostring | length) > 0)
+        ] | length),
+        source: "claude_session_jsonl"
+      }
+      | select(
+          ((.intent // "") | length) > 0
+          or ((.final_summary // "") | length) > 0
+          or ((.files_read // []) | length) > 0
+          or ((.files_changed // []) | length) > 0
+          or ((.commands_run // []) | length) > 0
+          or ((.errors // []) | length) > 0
+          or ((.signed_thinking_blocks // 0) > 0)
+        )
+  ' 2>/dev/null || return 1
+}
+
+if [[ "${AUTONOM8_WRAPPER_UNIT_TEST:-}" == "claude_operational_summary" ]]; then
+  if [[ $# -lt 1 || -z "${1:-}" ]]; then
+    jq -n '{error:"missing session id"}'
+    exit 2
+  fi
+  if ! get_claude_operational_summary "$1"; then
+    jq -n --arg session_id "$1" '{error:"operational summary unavailable", session_id:$session_id}'
+    exit 1
+  fi
+  exit 0
+fi
 
 # Initialize flags
 PERSONA_OVERRIDE=""

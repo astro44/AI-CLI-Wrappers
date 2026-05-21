@@ -48,6 +48,23 @@ autonom8_tool_activity_json() {
         else
           ($raw | split("\n") | map((try fromjson catch null) | select(. != null)))
         end;
+    def cursor_tool_call_name:
+      if ((.tool_call? | type) == "object") then
+        if ((.tool_call.editToolCall? | type) == "object") then "editToolCall"
+        elif ((.tool_call.multiEditToolCall? | type) == "object") then "multiEditToolCall"
+        elif ((.tool_call.readToolCall? | type) == "object") then "readToolCall"
+        elif ((.tool_call.grepToolCall? | type) == "object") then "grepToolCall"
+        elif ((.tool_call.listDirToolCall? | type) == "object") then "listDirToolCall"
+        elif ((.tool_call.searchToolCall? | type) == "object") then "searchToolCall"
+        elif ((.tool_call.terminalToolCall? | type) == "object") then "terminalToolCall"
+        elif ((.tool_call.runCommandToolCall? | type) == "object") then "runCommandToolCall"
+        elif ((.tool_call.shellToolCall? | type) == "object") then "shellToolCall"
+        elif ((.tool_call? | keys | length) > 0) then (.tool_call | keys[0])
+        else empty
+        end
+      else
+        empty
+      end;
     def call_name_from_object:
       if ((.toolCalls? | type) == "array") then
         .toolCalls[]? | (.name // .functionName // .function.name // .toolName // empty)
@@ -57,6 +74,8 @@ autonom8_tool_activity_json() {
         .functionCall.name // .functionCall.functionName // empty
       elif ((.function_call? | type) == "object") then
         .function_call.name // .function_call.function.name // empty
+      elif ((.tool_call? | type) == "object") then
+        cursor_tool_call_name
       elif (((.type? // .payload.type? // "") | lname) | test("(^tool$)|tool_use|tool_call|function_call|tool-call|tool.start|tool_start")) then
         .name // .tool // .tool_name // .toolName // .function.name // .payload.name // .payload.tool // .payload.tool_name // .payload.toolName // empty
       else
@@ -151,6 +170,72 @@ autonom8_tool_activity_json() {
           )
         | (error_text_from_object | select(length > 0) | classify_error_text)
       ];
+    def path_like:
+      tostring
+      | gsub("^file://"; "")
+      | gsub("[\"`,;:]+$"; "")
+      | select(length > 0)
+      | select(
+          test("(^|/)(src|tests?|public|app|pages|components|styles|lib|pkg|cmd|internal|go-autonom8|tenants|data|docs?)/")
+          or test("\\.(go|js|jsx|mjs|cjs|ts|tsx|css|scss|html|json|md|yaml|yml|sh|py|dart|swift|kt|java|rs|tf|sol|sql)$")
+        );
+    def object_path_values:
+      [
+        .path?,
+        .file?,
+        .file_path?,
+        .filepath?,
+        .filename?,
+        .relative_path?,
+        .absolute_path?,
+        .uri?,
+        .input.path?,
+        .input.file?,
+        .input.file_path?,
+        .input.filepath?,
+        .input.filename?,
+        .input.relative_path?,
+        .input.absolute_path?,
+        .input.uri?,
+        (.tool_call? | objects | .. | objects | .path?),
+        (.tool_call? | objects | .. | objects | .file?),
+        (.tool_call? | objects | .. | objects | .file_path?),
+        (.tool_call? | objects | .. | objects | .filepath?),
+        (.tool_call? | objects | .. | objects | .filename?),
+        (.tool_call? | objects | .. | objects | .relative_path?),
+        (.tool_call? | objects | .. | objects | .absolute_path?),
+        (.tool_call? | objects | .. | objects | .uri?),
+        (.tool_call? | objects | .. | objects | .cwd?)
+      ]
+      | map(select(. != null) | path_like);
+    def json_file_paths:
+      [
+        docs[]
+        | .. | objects
+        | object_path_values[]
+      ];
+    def object_command_values:
+      [
+        .command?,
+        .cmd?,
+        .input.command?,
+        .input.cmd?,
+        .input.shell_command?,
+        .input.script?,
+        .args.command?,
+        .args.cmd?,
+        (.tool_call? | objects | .. | objects | .command?),
+        (.tool_call? | objects | .. | objects | .cmd?),
+        (.tool_call? | objects | .. | objects | .shell_command?),
+        (.tool_call? | objects | .. | objects | .script?)
+      ]
+      | map(select(. != null) | tostring | gsub("[[:space:]]+"; " ") | gsub("^\\s+|\\s+$"; "") | select(length > 0));
+    def json_commands:
+      [
+        docs[]
+        | .. | objects
+        | object_command_values[]
+      ];
     def stream_error_classes:
       [
         (if ($raw | test("(?i)tool[^\\n]{0,120}(permission|denied|forbidden|unauthorized|not allowed)")) then "permission" else empty end),
@@ -165,6 +250,10 @@ autonom8_tool_activity_json() {
     | ([$unique_names[] | class_for(.)] | unique) as $classes
     | ((json_error_classes + stream_error_classes) | map(select(length > 0)) | unique) as $error_classes
     | (names | map(select(class_for(.) == "write")) | length) as $write_count
+    | (names | map(select(class_for(.) == "read")) | length) as $read_count
+    | (json_commands | unique) as $commands_run
+    | ($commands_run | length) as $command_count
+    | (json_file_paths | unique | .[:20]) as $file_paths
     | (json_error_count + ([$raw | scan("(?i)tool[^\\n]{0,80}(?:error|failed|failure)")] | length)) as $errors
     | ([json_tool_events[]?.timestamp | select(length > 0)] | sort) as $timestamps
     | (names | length) as $call_count
@@ -173,10 +262,21 @@ autonom8_tool_activity_json() {
     | {
         call_count: $call_count,
         write_count: $write_count,
+        read_count: $read_count,
+        command_count: $command_count,
+        tool_write_count: $write_count,
+        tool_read_count: $read_count,
+        commands_run_count: $command_count,
         error_count: $errors,
         error_classes: $error_classes,
+        tool_errors: $error_classes,
         tool_names: $unique_names,
         result_classes: $classes,
+        file_paths: $file_paths,
+        files_changed: (if $write_count > 0 then $file_paths else [] end),
+        files_read: (if $read_count > 0 then $file_paths else [] end),
+        commands: ($commands_run | .[:10]),
+        commands_run: ($commands_run | .[:10]),
         first_tool_at: $first_tool_at,
         last_tool_at: $last_tool_at,
         activity_class: (
@@ -194,6 +294,49 @@ autonom8_tool_activity_json() {
 autonom8_safe_filename_part() {
   printf "%s" "${1:-}" | tr -c 'A-Za-z0-9_.:-' '_' | sed 's/^_*//; s/_*$//; s/__*/_/g'
 }
+
+autonom8_persist_tool_activity_json() {
+  local payload="${1:-}"
+  [[ -n "$payload" ]] || return 0
+  [[ "${AUTONOM8_TOOL_ACTIVITY_SIDECAR:-1}" != "0" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  printf "%s" "$payload" | jq -e . >/dev/null 2>&1 || return 0
+
+  local work_root="${WORK_DIR:-${WORKSPACE_DIR:-${CONTEXT_DIR:-$(pwd)}}}"
+  [[ -n "$work_root" ]] || return 0
+  local base_dir="${AUTONOM8_TOOL_ACTIVITY_DIR:-$work_root/.sessions/tool_activity}"
+  mkdir -p "$base_dir" 2>/dev/null || return 0
+
+  local session_id req_id provider workflow ticket file tmp
+  session_id="$(printf "%s" "$payload" | jq -r '.session_id // .metadata.wrapper_context.session_id // empty' 2>/dev/null || true)"
+  req_id="$(printf "%s" "$payload" | jq -r '.request_id // .metadata.wrapper_context.request_id // empty' 2>/dev/null || true)"
+  provider="$(printf "%s" "$payload" | jq -r '.provider // .metadata.wrapper_context.provider // empty' 2>/dev/null || true)"
+  workflow="$(printf "%s" "$payload" | jq -r '.workflow // .metadata.wrapper_context.workflow // empty' 2>/dev/null || true)"
+  ticket="$(printf "%s" "$payload" | jq -r '.ticket_id // .metadata.wrapper_context.ticket_id // empty' 2>/dev/null || true)"
+  [[ -n "$session_id" ]] || session_id="${req_id:-no-session}"
+
+  file="$base_dir/$(autonom8_safe_filename_part "$session_id").json"
+  tmp="${file}.$$"
+  printf "%s" "$payload" | jq \
+    --arg captured_at "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date +%s)" \
+    --arg session_id "$session_id" \
+    --arg request_id "$req_id" \
+    --arg provider "$provider" \
+    --arg workflow "$workflow" \
+    --arg ticket_id "$ticket" '
+      (.metadata.tool_activity // {}) as $ta
+      | {
+          captured_at: $captured_at,
+          provider: $provider,
+          session_id: $session_id,
+          request_id: $request_id,
+          workflow: $workflow,
+          ticket_id: $ticket_id,
+          tool_activity: ($ta + {source: (($ta.source // "sidecar") | tostring)})
+        }
+    ' > "$tmp" 2>/dev/null && mv "$tmp" "$file" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+}
+
 
 autonom8_provider_context_json() {
   local provider="${AUTONOM8_PROVIDER:-${A8_PROVIDER:-}}"
@@ -214,6 +357,7 @@ autonom8_provider_context_json() {
     --arg model_resolution "${MODEL_RESOLUTION_NOTE:-}" \
     --arg workspace_scope "${AUTONOM8_PROVIDER_WORKSPACE_SCOPE:-}" \
     --arg process_group_mode "${AUTONOM8_PROCESS_GROUP_MODE:-${AUTONOM8_PROVIDER_PROCESS_GROUP_MODE:-}}" \
+    --arg wrapper_timeout_supervision "${AUTONOM8_WRAPPER_TIMEOUT_SUPERVISION:-}" \
     '{
       provider: $provider,
       request_id: $request_id,
@@ -225,7 +369,8 @@ autonom8_provider_context_json() {
       model_effective: $model_effective,
       model_resolution: $model_resolution,
       workspace_scope: $workspace_scope,
-      process_group_mode: $process_group_mode
+      process_group_mode: $process_group_mode,
+      wrapper_timeout_supervision: $wrapper_timeout_supervision
     }'
 }
 
@@ -320,7 +465,50 @@ autonom8_enrich_provider_payload_json() {
           activity_class: (($ta.activity_class // "none") | tostring),
           error_classes: (($ta.error_classes // []) | if type == "array" then . else [] end)
         };
-    def reasoning_capture_summary:
+    def bounded_array($a; $n):
+      ($a // [])
+      | if type == "array" then . else [] end
+      | map(tostring | gsub("[[:space:]]+"; " ") | gsub("^\\s+|\\s+$"; "") | select(length > 0))
+      | unique
+      | .[:$n];
+    def bounded_text($n):
+      tostring
+      | gsub("[[:space:]]+"; " ")
+      | gsub("^\\s+|\\s+$"; "")
+      | if length > $n then .[0:$n] else . end;
+    def operational_summary:
+      (.metadata.operational_reasoning_summary // {}) as $existing
+      | (.metadata.tool_activity // {}) as $ta
+      | {
+          intent: (((if (($existing.intent // "") | tostring | length) > 0 then $existing.intent else (.response // .error // "") end) | bounded_text(480))),
+          files_read: (if (($existing.files_read // []) | type) == "array" and (($existing.files_read // []) | length) > 0 then bounded_array($existing.files_read; 20) elif (($ta.result_classes // []) | index("read")) then bounded_array($ta.file_paths; 20) else [] end),
+          files_changed: (if (($existing.files_changed // []) | type) == "array" and (($existing.files_changed // []) | length) > 0 then bounded_array($existing.files_changed; 20) elif (($ta.write_count // 0) | num) > 0 then bounded_array($ta.file_paths; 20) else [] end),
+          commands_run: (if (($existing.commands_run // []) | type) == "array" and (($existing.commands_run // []) | length) > 0 then bounded_array($existing.commands_run; 10) else bounded_array($ta.commands; 10) end),
+          tool_write_count: ((($existing.tool_write_count // $ta.write_count // 0) | num) | floor),
+          errors: (
+            if (($existing.errors // []) | type) == "array" and (($existing.errors // []) | length) > 0 then bounded_array($existing.errors; 10)
+            else bounded_array(([.error? // empty, .metadata.failure_signal.evidence_excerpt? // empty] + (if (($ta.error_classes // []) | type) == "array" then ($ta.error_classes // []) else [] end)); 10)
+            end
+          ),
+          verification: (
+            if (($existing.verification // []) | type) == "array" and (($existing.verification // []) | length) > 0 then bounded_array($existing.verification; 10)
+            else bounded_array(((if (($ta.commands // []) | type) == "array" then ($ta.commands // []) else [] end) | map(select(test("(?i)(go test|npm test|pnpm test|yarn test|pytest|playwright|lighthouse|axe|eslint|tsc|cargo test|flutter test|xcodebuild|terraform plan)")))); 10)
+            end
+          ),
+          final_summary: (((if (($existing.final_summary // "") | tostring | length) > 0 then $existing.final_summary else (.response // .error // "") end) | bounded_text(800))),
+          source: (($existing.source // $existing.operational_summary_source // "wrapper_telemetry") | tostring),
+          signed_thinking_blocks: ((($existing.signed_thinking_blocks // 0) | num) | floor)
+        };
+    def operational_summary_available($op):
+      (($op.intent // "") | length) > 0
+      or (($op.final_summary // "") | length) > 0
+      or (($op.files_read // []) | length) > 0
+      or (($op.files_changed // []) | length) > 0
+      or (($op.commands_run // []) | length) > 0
+      or (($op.errors // []) | length) > 0
+      or (($op.tool_write_count // 0) | num) > 0
+      or (($op.signed_thinking_blocks // 0) | num) > 0;
+    def reasoning_capture_summary($op; $op_available):
       (.metadata // {}) as $m
       | ((.reasoning // "") | tostring) as $reasoning
       | (($m.reasoning_available // false) == true) as $available
@@ -328,16 +516,22 @@ autonom8_enrich_provider_payload_json() {
           schema_version: 1,
           provider: $ctx.provider,
           available: $available,
+          private_reasoning_available: $available,
           source: (($m.reasoning_source // "none") | tostring),
           absent_reason: (if $available then "available" else (($m.reasoning_absent_reason // "provider_reasoning_not_emitted") | tostring) end),
           captured_chars: ($reasoning | length),
           response_chars: (((.response // "") | tostring) | length),
+          signed_thinking_blocks: (($op.signed_thinking_blocks // 0) | num | floor),
+          operational_summary_available: $op_available,
+          operational_summary_source: (if $op_available then (($op.source // "wrapper_telemetry") | tostring) else "none" end),
           diagnostic_only: true,
           not_required_for_acceptance: true,
           quality_gate_role: "observability_only",
           methods_attempted: ["wrapper_top_level", "response_payload", "session_log", "stream_log"]
         };
     classify_failure as $class
+    | (operational_summary) as $op
+    | (operational_summary_available($op)) as $op_available
     | .provider = (.provider // $ctx.provider)
     | .workflow = (.workflow // $ctx.workflow)
     | .ticket_id = (.ticket_id // $ctx.ticket_id)
@@ -345,7 +539,8 @@ autonom8_enrich_provider_payload_json() {
     | .model = (.model // $ctx.model_effective)
     | .metadata = (.metadata // {})
     | .metadata.wrapper_context = ((.metadata.wrapper_context // {}) + $ctx)
-    | .metadata.reasoning_capture = ((.metadata.reasoning_capture // {}) + reasoning_capture_summary)
+    | .metadata.operational_reasoning_summary = $op
+    | .metadata.reasoning_capture = ((.metadata.reasoning_capture // {}) + reasoning_capture_summary($op; $op_available))
     | .metadata.failure_signal = ((.metadata.failure_signal // {}) + {
         class: $class,
         corrective_action: action_for($class),
@@ -356,6 +551,23 @@ autonom8_enrich_provider_payload_json() {
       })
     | .metadata.economics = ((.metadata.economics // {}) + token_summary)
     | .metadata.tool_yield = ((.metadata.tool_yield // {}) + tool_summary)
+  ' 2>/dev/null || printf "%s" "$payload"
+}
+
+autonom8_attach_operational_summary_json() {
+  local payload="${1:-}"
+  local operational_summary="${2:-${AUTONOM8_OPERATIONAL_SUMMARY_JSON:-}}"
+  if [[ -z "$operational_summary" || "$operational_summary" == "null" ]]; then
+    printf "%s" "$payload"
+    return 0
+  fi
+  printf "%s" "$operational_summary" | jq -e . >/dev/null 2>&1 || {
+    printf "%s" "$payload"
+    return 0
+  }
+  printf "%s" "$payload" | jq --argjson operational_summary "$operational_summary" '
+    .metadata = (.metadata // {})
+    | .metadata.operational_reasoning_summary = $operational_summary
   ' 2>/dev/null || printf "%s" "$payload"
 }
 
@@ -425,7 +637,9 @@ autonom8_merge_tool_activity() {
   if [[ -z "$tool_activity_json" || "$tool_activity_json" == "null" ]]; then
     local passthrough=""
     passthrough="$(cat)"
+    passthrough="$(autonom8_attach_operational_summary_json "$passthrough")"
     passthrough="$(autonom8_enrich_provider_payload_json "$passthrough" 2>/dev/null || printf "%s" "$passthrough")"
+    autonom8_persist_tool_activity_json "$passthrough"
     autonom8_persist_provider_result_json "$passthrough"
     printf "%s\n" "$passthrough"
     return 0
@@ -447,7 +661,9 @@ autonom8_merge_tool_activity() {
   if [[ $jq_status -ne 0 ]]; then
     return "$jq_status"
   fi
+  merged="$(autonom8_attach_operational_summary_json "$merged")"
   merged="$(autonom8_enrich_provider_payload_json "$merged" 2>/dev/null || printf "%s" "$merged")"
+  autonom8_persist_tool_activity_json "$merged"
   autonom8_persist_provider_result_json "$merged"
   printf "%s\n" "$merged"
 }

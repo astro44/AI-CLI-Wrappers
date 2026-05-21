@@ -108,6 +108,32 @@ assert_wrapper_contract_wiring() {
   echo "[PASS] $name static contract wiring"
 }
 
+assert_gemini_capacity_fast_fail_wiring() {
+  local file="$1"
+
+  bash -n "$file"
+  grep -q "gemini_capacity_fast_fail_pattern()" "$file"
+  grep -q "AUTONOM8_WRAPPER_FAST_FAIL_FILE" "$file"
+  grep -q "AUTONOM8_WRAPPER_FAST_FAIL_PATTERN" "$file"
+  grep -q "wrapper_fast_fail" "$file"
+  grep -q "MODEL_CAPACITY_EXHAUSTED" "$file"
+  grep -q "No capacity available for model" "$file"
+  grep -q "Gemini capacity exhausted after fallback" "$file"
+
+  echo "[PASS] gemini capacity fast-fail wiring"
+}
+
+assert_wrapper_go_timeout_supervision_wiring() {
+  local file="$1"
+  local name="$2"
+
+  bash -n "$file"
+  grep -q "AUTONOM8_WRAPPER_TIMEOUT_SUPERVISION" "$file"
+  grep -q '"${AUTONOM8_WRAPPER_TIMEOUT_SUPERVISION:-}" == "go"' "$file"
+
+  echo "[PASS] $name Go timeout-supervision wiring"
+}
+
 assert_tool_telemetry_contract_wiring() {
   local file="$1"
 
@@ -119,8 +145,106 @@ assert_tool_telemetry_contract_wiring() {
   grep -q "not_required_for_acceptance" "$file"
   grep -q "quality_gate_role" "$file"
   grep -q "methods_attempted" "$file"
+  grep -q "operational_reasoning_summary" "$file"
+  grep -q "operational_summary_available" "$file"
+  grep -q "autonom8_persist_tool_activity_json" "$file"
+  grep -q "commands_run_count" "$file"
+  grep -q "private_reasoning_available" "$file"
+  grep -q "wrapper_timeout_supervision" "$file"
+  grep -q "cursor_tool_call_name" "$file"
+  grep -q "editToolCall" "$file"
+  grep -q "readToolCall" "$file"
 
   echo "[PASS] tool telemetry reasoning_capture wiring"
+}
+
+assert_cursor_tool_telemetry_fixture() {
+  local fixture out file_path
+  fixture="$(mktemp)"
+  out="$(mktemp)"
+  file_path="/tmp/autonom8-cursor-telemetry-fixture/src/cursor-proof.js"
+
+  cat > "$fixture" <<JSONL
+{"type":"tool_call","subtype":"started","call_id":"tool-edit-1","tool_call":{"editToolCall":{"args":{"path":"$file_path","streamContent":"export const ok = true;"}}},"timestamp_ms":1779323717008}
+{"type":"tool_call","subtype":"completed","call_id":"tool-edit-1","tool_call":{"editToolCall":{"args":{"path":"$file_path","streamContent":"export const ok = true;"},"result":{"success":{"path":"$file_path","linesAdded":1}}}},"timestamp_ms":1779323717162}
+{"type":"tool_call","subtype":"started","call_id":"tool-read-1","tool_call":{"readToolCall":{"args":{"path":"$file_path"}}},"timestamp_ms":1779323718524}
+{"type":"tool_call","subtype":"completed","call_id":"tool-read-1","tool_call":{"readToolCall":{"args":{"path":"$file_path"},"result":{"success":{"path":"$file_path","content":"export const ok = true;"}}}},"timestamp_ms":1779323718574}
+JSONL
+
+  # shellcheck disable=SC1090
+  source "$LIB_DIR/tool-telemetry.sh"
+  autonom8_tool_activity_json "$(cat "$fixture")" "" "fixture:cursor" > "$out"
+
+  if ! jq -e --arg file "$file_path" '
+    .call_count == 4 and
+    .write_count == 2 and
+    .read_count == 2 and
+    .tool_write_count == 2 and
+    .tool_read_count == 2 and
+    .activity_class == "write_active" and
+    (.tool_names | index("editToolCall")) and
+    (.tool_names | index("readToolCall")) and
+    (.files_changed | index($file)) and
+    (.files_read | index($file))
+  ' "$out" >/dev/null; then
+    echo "[FAIL] cursor tool telemetry fixture did not detect Cursor tool calls"
+    cat "$out"
+    rm -f "$fixture" "$out"
+    return 1
+  fi
+
+  rm -f "$fixture" "$out"
+  echo "[PASS] cursor tool telemetry fixture"
+}
+
+assert_claude_operational_summary_fixture() {
+  local tmp_home session_id session_dir session_file out_file abs_file secret_cmd
+  tmp_home="$(mktemp -d)"
+  session_id="00000000-0000-4000-8000-000000000001"
+  session_dir="$tmp_home/.claude/projects/-tmp-autonom8-operational-summary"
+  session_file="$session_dir/${session_id}.jsonl"
+  out_file="$(mktemp)"
+  abs_file="$PWD/src/components/impact/map.js"
+  secret_cmd='ANTHROPIC_API_KEY=sk-testfixture-secret123456 go test ./runtime/climanager'
+
+  mkdir -p "$session_dir"
+  jq -cn '{type:"assistant",message:{content:[{type:"text",text:"Inspect the impact dashboard runtime contract and patch the map initialization path."}]}}' >> "$session_file"
+  jq -cn --arg file "$abs_file" '{type:"assistant",message:{content:[{type:"tool_use",name:"Read",input:{file_path:$file}}]}}' >> "$session_file"
+  jq -cn --arg file "$abs_file" '{type:"assistant",message:{content:[{type:"tool_use",name:"Edit",input:{file_path:$file}}]}}' >> "$session_file"
+  jq -cn --arg command "$secret_cmd" '{type:"assistant",message:{content:[{type:"tool_use",name:"Bash",input:{command:$command}}]}}' >> "$session_file"
+  jq -cn '{type:"user",message:{content:[{type:"tool_result",is_error:true,content:"selector not found: data-favela-map-initialized"}]}}' >> "$session_file"
+  jq -cn '{type:"assistant",message:{content:[{type:"thinking",signature:"signed-redacted-fixture"}]}}' >> "$session_file"
+  jq -cn '{type:"assistant",message:{content:[{type:"text",text:"Patched map initialization and verified the focused runtime contract."}]}}' >> "$session_file"
+
+  if ! HOME="$tmp_home" AUTONOM8_WRAPPER_UNIT_TEST=claude_operational_summary "$WRAPPER_DIR/claude.sh" "$session_id" > "$out_file"; then
+    echo "[FAIL] claude operational summary fixture invocation failed"
+    cat "$out_file" || true
+    rm -rf "$tmp_home" "$out_file"
+    return 1
+  fi
+
+  if ! jq -e --arg file "src/components/impact/map.js" --arg command_fragment "go test ./runtime/climanager" '
+    .source == "claude_session_jsonl" and
+    (.intent | contains("impact dashboard runtime contract")) and
+    (.files_read | index($file)) and
+    (.files_changed | index($file)) and
+    (.commands_run | map(contains($command_fragment)) | any) and
+    ((.commands_run | tostring | contains("sk-testfixture")) | not) and
+    ((.commands_run | tostring | contains("ANTHROPIC_API_KEY")) | not) and
+    (.verification | map(contains($command_fragment)) | any) and
+    (.tool_write_count == 1) and
+    (.signed_thinking_blocks == 1) and
+    (.errors | map(contains("data-favela-map-initialized")) | any) and
+    (.final_summary | contains("Patched map initialization"))
+  ' "$out_file" >/dev/null; then
+    echo "[FAIL] claude operational summary fixture contract invalid"
+    cat "$out_file"
+    rm -rf "$tmp_home" "$out_file"
+    return 1
+  fi
+
+  rm -rf "$tmp_home" "$out_file"
+  echo "[PASS] claude operational summary fixture"
 }
 
 assert_wrapper_session_wiring() {
@@ -188,7 +312,10 @@ assert_response_contract_json() {
     (.tokens_used | has("input_tokens") and has("output_tokens") and has("estimated_output_tokens") and has("total_tokens") and has("cost_usd") and has("cache_read_input_tokens") and has("cache_creation_input_tokens")) and
     (.metadata | has("reasoning_available") and has("reasoning_source") and has("token_usage_available") and has("reasoning_absent_reason")) and
     (.metadata | has("reasoning_capture")) and
-    (.metadata.reasoning_capture | has("schema_version") and has("available") and has("source") and has("absent_reason") and has("captured_chars") and has("response_chars") and has("diagnostic_only") and has("not_required_for_acceptance") and has("quality_gate_role") and has("methods_attempted")) and
+    (.metadata | has("operational_reasoning_summary")) and
+    (.metadata.reasoning_capture | has("schema_version") and has("available") and has("private_reasoning_available") and has("source") and has("absent_reason") and has("captured_chars") and has("response_chars") and has("operational_summary_available") and has("operational_summary_source") and has("diagnostic_only") and has("not_required_for_acceptance") and has("quality_gate_role") and has("methods_attempted")) and
+    (.metadata.operational_reasoning_summary | has("intent") and has("files_read") and has("files_changed") and has("commands_run") and has("tool_write_count") and has("errors") and has("verification") and has("final_summary") and has("source") and has("signed_thinking_blocks")) and
+    ((.metadata.tool_activity? // {}) | ((has("commands_run_count") and has("files_changed") and has("files_read")) or (length == 0))) and
     (.metadata.reasoning_capture.diagnostic_only == true) and
     (.metadata.reasoning_capture.not_required_for_acceptance == true) and
     (.metadata.reasoning_capture.quality_gate_role == "observability_only") and
@@ -247,11 +374,18 @@ assert_response_contract_json() {
 run_static_checks() {
   echo "== Static Wrapper Contract Checks =="
   assert_tool_telemetry_contract_wiring "$LIB_DIR/tool-telemetry.sh"
+  assert_cursor_tool_telemetry_fixture
   assert_wrapper_contract_wiring "$WRAPPER_DIR/claude.sh" "claude"
   assert_wrapper_contract_wiring "$WRAPPER_DIR/gemini.sh" "gemini"
   assert_wrapper_contract_wiring "$WRAPPER_DIR/codex.sh" "codex"
   assert_wrapper_contract_wiring "$WRAPPER_DIR/cursor.sh" "cursor"
   assert_wrapper_contract_wiring "$WRAPPER_DIR/opencode.sh" "opencode"
+  assert_wrapper_go_timeout_supervision_wiring "$WRAPPER_DIR/claude.sh" "claude"
+  assert_wrapper_go_timeout_supervision_wiring "$WRAPPER_DIR/gemini.sh" "gemini"
+  assert_wrapper_go_timeout_supervision_wiring "$WRAPPER_DIR/codex.sh" "codex"
+  assert_wrapper_go_timeout_supervision_wiring "$WRAPPER_DIR/cursor.sh" "cursor"
+  assert_wrapper_go_timeout_supervision_wiring "$WRAPPER_DIR/opencode.sh" "opencode"
+  assert_gemini_capacity_fast_fail_wiring "$WRAPPER_DIR/gemini.sh"
   assert_wrapper_session_wiring "$WRAPPER_DIR/gemini.sh" "gemini"
   assert_wrapper_session_wiring "$WRAPPER_DIR/codex.sh" "codex"
   assert_wrapper_skill_lookup_order "$WRAPPER_DIR/claude.sh" "claude"
@@ -259,6 +393,7 @@ run_static_checks() {
   assert_wrapper_skill_lookup_order "$WRAPPER_DIR/codex.sh" "codex"
   assert_wrapper_skill_lookup_order "$WRAPPER_DIR/cursor.sh" "cursor"
   assert_wrapper_skill_lookup_order "$WRAPPER_DIR/opencode.sh" "opencode"
+  assert_claude_operational_summary_fixture
 }
 
 run_live_checks() {
