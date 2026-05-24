@@ -1200,10 +1200,10 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
     # shellcheck disable=SC2086
-    run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+    run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} -- "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
   else
     # shellcheck disable=SC2086
-    opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+    opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} -- "$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
   fi
   OPENCODE_EXIT=$?
   set -e
@@ -1517,16 +1517,16 @@ $TOOL_RULES
     echo "🤖 [OpenCode] Timeout: ${CLI_TIMEOUT}s" >&2
     # shellcheck disable=SC2086
     if [[ -n "$AGENT_LOG" ]]; then
-      run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} "$FULL_PROMPT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
+      run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} -- "$FULL_PROMPT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
     else
-      run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} "$FULL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+      run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} -- "$FULL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
     fi
   else
     # shellcheck disable=SC2086
     if [[ -n "$AGENT_LOG" ]]; then
-      opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} "$FULL_PROMPT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
+      opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} -- "$FULL_PROMPT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
     else
-      opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} "$FULL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+      opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} -- "$FULL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
     fi
   fi
   OPENCODE_EXIT=$?
@@ -1600,8 +1600,16 @@ else
   # shellcheck disable=SC2086
   if [[ ${#IMAGE_PATHS[@]} -gt 0 ]]; then
     DIRECT_PROMPT="$(append_image_prompt_context "$*")"
-    opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} "$DIRECT_PROMPT"
+    if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
+      run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} -- "$DIRECT_PROMPT"
+    else
+      opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS ${OPENCODE_IMAGE_ARGS[@]+"${OPENCODE_IMAGE_ARGS[@]}"} -- "$DIRECT_PROMPT"
+    fi
   else
-    opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS "$@"
+    if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
+      run_with_timeout "$CLI_TIMEOUT" opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS -- "$@"
+    else
+      opencode run -m "$OPENCODE_MODEL" $SESSION_ARGS -- "$@"
+    fi
   fi
 fi

@@ -12,9 +12,18 @@ ERROR_QUOTA="quota"
 ERROR_INVALID_INPUT="invalid_input"
 ERROR_INVALID_MODEL="invalid_model"
 ERROR_PROVIDER="provider_error"
+ERROR_WRAPPER_PROMPT_AS_FILE="wrapper_prompt_as_file"
 ERROR_UNKNOWN="unknown"
 
 # Patterns for error classification
+# Wrapper invocation patterns
+PROMPT_AS_FILE_PATTERNS=(
+    "file not found:.*instructions:"
+    "file not found:.*execute the following skill"
+    "file not found:.*input data"
+    "file not found:.*persona"
+)
+
 # Timeout patterns
 TIMEOUT_PATTERNS=(
     "timed out"
@@ -110,6 +119,14 @@ INVALID_MODEL_PATTERNS=(
 classify_error() {
     local error_msg="$1"
     local error_lower=$(echo "$error_msg" | tr '[:upper:]' '[:lower:]')
+
+    # Check prompt-as-file wrapper invocation before broad auth/profile text.
+    for pattern in "${PROMPT_AS_FILE_PATTERNS[@]}"; do
+        if echo "$error_lower" | grep -qiE "$pattern"; then
+            echo "$ERROR_WRAPPER_PROMPT_AS_FILE"
+            return 0
+        fi
+    done
 
     # Check timeout patterns
     for pattern in "${TIMEOUT_PATTERNS[@]}"; do
