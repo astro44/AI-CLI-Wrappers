@@ -49,6 +49,12 @@ if [[ -f "$WRAPPER_LIFECYCLE_LIB" ]]; then
   source "$WRAPPER_LIFECYCLE_LIB"
 fi
 
+LIVE_MONITOR_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib/live-monitor.sh"
+if [[ -f "$LIVE_MONITOR_LIB" ]]; then
+  # shellcheck disable=SC1090
+  source "$LIVE_MONITOR_LIB"
+fi
+
 # Cleanup function to kill child processes on script termination
 cleanup() {
   if declare -F autonom8_wrapper_write_cleanup_event >/dev/null; then
@@ -56,6 +62,9 @@ cleanup() {
   fi
   if declare -F autonom8_wrapper_stop_parent_monitor >/dev/null; then
     autonom8_wrapper_stop_parent_monitor
+  fi
+  if declare -F autonom8_stop_live_monitor >/dev/null; then
+    autonom8_stop_live_monitor "cursor"
   fi
   if declare -F autonom8_wrapper_reap_child_tree >/dev/null; then
     autonom8_wrapper_reap_child_tree "cursor" "${CURSOR_PID:-}" "${WORK_DIR:-${WORKSPACE_DIR:-$(pwd)}}" "wrapper_cleanup"
@@ -373,6 +382,11 @@ run_with_timeout() {
   shift
   ensure_cursor_keychain_ready
 
+  if [[ "${AUTONOM8_WRAPPER_TIMEOUT_SUPERVISION:-}" == "go" ]]; then
+    "$@"
+    return $?
+  fi
+
   local timeout_cmd=""
   if command -v timeout &>/dev/null; then
     timeout_cmd="timeout"
@@ -532,7 +546,9 @@ emit_cli_response() {
         input_tokens: ((.usage.input_tokens // .usage.inputTokens // .input_tokens // .inputTokens // .token_usage.input_tokens // .token_usage.prompt_tokens // .prompt_tokens // 0) | as_int),
         output_tokens: ((.usage.output_tokens // .usage.outputTokens // .output_tokens // .outputTokens // .token_usage.output_tokens // .token_usage.completion_tokens // .completion_tokens // 0) | as_int),
         total_tokens: ((.usage.total_tokens // .usage.totalTokens // .total_tokens // .totalTokens // .token_usage.total_tokens // .token_usage.total // .total_tokens_used // 0) | as_int),
-        cost_usd: ((.usage.cost_usd // .usage.cost // .cost_usd // .token_usage.cost_usd // .cost // 0) | as_num)
+        cost_usd: ((.usage.cost_usd // .usage.cost // .cost_usd // .token_usage.cost_usd // .cost // 0) | as_num),
+        cache_read_input_tokens: ((.usage.cache_read_input_tokens // .usage.cache_read_tokens // .usage.cacheReadInputTokens // .usage.cacheReadTokens // .usage.cached_content_token_count // .usage.cachedContentTokenCount // .cache_read_input_tokens // .cache_read_tokens // .cacheReadInputTokens // .cacheReadTokens // .token_usage.cache_read_input_tokens // .token_usage.cache_read_tokens // .token_usage.cacheReadInputTokens // .token_usage.cacheReadTokens // 0) | as_int),
+        cache_creation_input_tokens: ((.usage.cache_creation_input_tokens // .usage.cache_creation_tokens // .usage.cacheCreationInputTokens // .usage.cacheCreationTokens // .usage.cacheWriteInputTokens // .usage.cacheWriteTokens // .cache_creation_input_tokens // .cache_creation_tokens // .cacheCreationInputTokens // .cacheCreationTokens // .cacheWriteInputTokens // .cacheWriteTokens // .token_usage.cache_creation_input_tokens // .token_usage.cache_creation_tokens // .token_usage.cacheCreationInputTokens // .token_usage.cacheCreationTokens // .token_usage.cacheWriteInputTokens // .token_usage.cacheWriteTokens // 0) | as_int)
       }
       | if .total_tokens == 0 and ((.input_tokens + .output_tokens) > 0)
         then .total_tokens = (.input_tokens + .output_tokens)
@@ -1024,9 +1040,13 @@ ensure_cursor_workspace_scope() {
 }
 
 # Determine core directory based on script location
-# Script is in bin/cursor.sh, so CORE_DIR is parent of bin/
+# Resolve repo root whether the wrapper is installed in <repo>/bin or checked out at repo root.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CORE_DIR="$(dirname "$SCRIPT_DIR")"
+if [[ "$(basename "$SCRIPT_DIR")" == "bin" ]]; then
+  CORE_DIR="$(dirname "$SCRIPT_DIR")"
+else
+  CORE_DIR="$SCRIPT_DIR"
+fi
 
 resolve_agent_markdown_path() {
   local candidate="${1:-}"
@@ -1337,11 +1357,13 @@ get_cursor_session_token_usage() {
     ] as $u
     | select(($u | length) > 0)
     | ($u[-1]) as $x
-    | {
-        input_tokens: (($x.input_tokens // $x.input // $x.prompt_tokens // 0) | as_int),
-        output_tokens: (($x.output_tokens // $x.output // $x.completion_tokens // 0) | as_int),
-        total_tokens: (($x.total_tokens // $x.total // (($x.input_tokens // $x.input // 0) + ($x.output_tokens // $x.output // 0))) | as_int),
-        cost_usd: (($x.cost_usd // $x.cost // 0) | as_num)
+      | {
+        input_tokens: (($x.input_tokens // $x.inputTokens // $x.input // $x.prompt_tokens // 0) | as_int),
+        output_tokens: (($x.output_tokens // $x.outputTokens // $x.output // $x.completion_tokens // 0) | as_int),
+        total_tokens: (($x.total_tokens // $x.totalTokens // $x.total // (($x.input_tokens // $x.inputTokens // $x.input // 0) + ($x.output_tokens // $x.outputTokens // $x.output // 0))) | as_int),
+        cost_usd: (($x.cost_usd // $x.cost // 0) | as_num),
+        cache_read_input_tokens: (($x.cache_read_input_tokens // $x.cache_read_tokens // $x.cacheReadInputTokens // $x.cacheReadTokens // $x.cached_content_token_count // $x.cachedContentTokenCount // 0) | as_int),
+        cache_creation_input_tokens: (($x.cache_creation_input_tokens // $x.cache_creation_tokens // $x.cacheCreationInputTokens // $x.cacheCreationTokens // $x.cacheWriteInputTokens // $x.cacheWriteTokens // 0) | as_int)
       }
   ' "$session_file" | tail -1
 }
@@ -2283,7 +2305,14 @@ $TOOL_RULES
     WORKSPACE_DIR="$TENANT_DIR"
     WORKSPACE_SOURCE="tenant_fallback"
   fi
-  log_verbose "Invoking cursor-agent CLI (Workspace: ${WORKSPACE_DIR}, Source: ${WORKSPACE_SOURCE}, YOLO: $YOLO_MODE)"
+    # Start live event monitor for provider observability
+  if declare -F autonom8_monitor_init >/dev/null; then
+    autonom8_monitor_init "cursor" "${WRAPPER_REQ_ID:-}" "$TMPFILE_ERR" "${WORK_DIR:-$(pwd)}" "${HOME}/.cursor/projects"
+  elif declare -F autonom8_start_live_monitor >/dev/null; then
+    autonom8_start_live_monitor "cursor" "${WRAPPER_REQ_ID:-}" "$TMPFILE_ERR" "${WORK_DIR:-$(pwd)}" "${HOME}/.cursor/projects"
+  fi
+
+log_verbose "Invoking cursor-agent CLI (Workspace: ${WORKSPACE_DIR}, Source: ${WORKSPACE_SOURCE}, YOLO: $YOLO_MODE)"
   ensure_cursor_workspace_scope "$WORKSPACE_DIR"
   if cursor_agent_want_approve_mcps; then
     MCP_CONFIG_PATH="$(get_cursor_mcp_config || true)"
@@ -2356,23 +2385,60 @@ $TOOL_RULES
   fi
 
   set +e
-  if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
-    log_verbose "Running cursor-agent with timeout: ${CLI_TIMEOUT}s"
-    if [[ -n "$AGENT_LOG" ]]; then
-      run_with_timeout "$CLI_TIMEOUT" "$CURSOR_AGENT_BIN" "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
+  CURSOR_MONITOR_STREAM=false
+  if [[ "$CURSOR_OUTPUT_FORMAT" == "stream-json" ]] && declare -F autonom8_monitor_cursor_jsonl_stream >/dev/null; then
+    CURSOR_MONITOR_STREAM=true
+  fi
+
+  if [[ "$CURSOR_MONITOR_STREAM" == "true" ]]; then
+    if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
+      log_verbose "Running cursor-agent with timeout: ${CLI_TIMEOUT}s"
+      if [[ -n "$AGENT_LOG" ]]; then
+        run_with_timeout "$CLI_TIMEOUT" "$CURSOR_AGENT_BIN" "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" \
+          2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") \
+          > >(tee "$TMPFILE_OUTPUT" | autonom8_monitor_cursor_jsonl_stream "${WRAPPER_REQ_ID:-}" "${AUTONOM8_LIVE_MONITOR_ACTIVITY_FILE:-}")
+      else
+        run_with_timeout "$CLI_TIMEOUT" "$CURSOR_AGENT_BIN" "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" \
+          2> "$TMPFILE_ERR" \
+          > >(tee "$TMPFILE_OUTPUT" | autonom8_monitor_cursor_jsonl_stream "${WRAPPER_REQ_ID:-}" "${AUTONOM8_LIVE_MONITOR_ACTIVITY_FILE:-}")
+      fi
+      CURSOR_EXIT=$?
     else
-      run_with_timeout "$CLI_TIMEOUT" "$CURSOR_AGENT_BIN" "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+      if [[ -n "$AGENT_LOG" ]]; then
+        cursor_agent_cli "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" \
+          2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") \
+          > >(tee "$TMPFILE_OUTPUT" | autonom8_monitor_cursor_jsonl_stream "${WRAPPER_REQ_ID:-}" "${AUTONOM8_LIVE_MONITOR_ACTIVITY_FILE:-}")
+      else
+        cursor_agent_cli "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" \
+          2> "$TMPFILE_ERR" \
+          > >(tee "$TMPFILE_OUTPUT" | autonom8_monitor_cursor_jsonl_stream "${WRAPPER_REQ_ID:-}" "${AUTONOM8_LIVE_MONITOR_ACTIVITY_FILE:-}")
+      fi
+      CURSOR_EXIT=$?
     fi
-    CURSOR_EXIT=$?
   else
-    if [[ -n "$AGENT_LOG" ]]; then
-      cursor_agent_cli "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
+    if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
+      log_verbose "Running cursor-agent with timeout: ${CLI_TIMEOUT}s"
+      if [[ -n "$AGENT_LOG" ]]; then
+        run_with_timeout "$CLI_TIMEOUT" "$CURSOR_AGENT_BIN" "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
+      else
+        run_with_timeout "$CLI_TIMEOUT" "$CURSOR_AGENT_BIN" "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+      fi
+      CURSOR_EXIT=$?
     else
-      cursor_agent_cli "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+      if [[ -n "$AGENT_LOG" ]]; then
+        cursor_agent_cli "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> >(tee -a "$AGENT_LOG" > "$TMPFILE_ERR") > "$TMPFILE_OUTPUT"
+      else
+        cursor_agent_cli "${CURSOR_ARGS[@]}" "$CURSOR_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
+      fi
+      CURSOR_EXIT=$?
     fi
-    CURSOR_EXIT=$?
   fi
   set -e
+
+  # Stop live event monitor
+  if declare -F autonom8_stop_live_monitor >/dev/null; then
+    autonom8_stop_live_monitor "cursor" "${WRAPPER_REQ_ID:-}"
+  fi
 
   # O-9: Append stdout response to agent log (stderr tee only captures progress/errors,
   # cursor sends the actual response to stdout which may be missing from logs)

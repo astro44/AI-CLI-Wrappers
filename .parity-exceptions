@@ -1,0 +1,6 @@
+# .parity-exceptions — Allowed function-level drift between Autonom8-core/bin/ and AI-CLI-Wrappers/
+# Format: <file> <function_name>
+# Lines starting with # are ignored
+#
+# agravity.sh is AI-CLI-Wrappers-only (no core equivalent)
+# Listed here as documentation; the script already SKIPs missing files

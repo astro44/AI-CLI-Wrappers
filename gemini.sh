@@ -42,6 +42,12 @@ if [[ -f "$WRAPPER_LIFECYCLE_LIB" ]]; then
   source "$WRAPPER_LIFECYCLE_LIB"
 fi
 
+LIVE_MONITOR_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib/live-monitor.sh"
+if [[ -f "$LIVE_MONITOR_LIB" ]]; then
+  # shellcheck disable=SC1090
+  source "$LIVE_MONITOR_LIB"
+fi
+
 if [[ "${NODE_OPTIONS:-}" != *"max-old-space-size"* ]]; then
   export NODE_OPTIONS="--max-old-space-size=${GEMINI_NODE_MAX_OLD_SPACE_SIZE_MB}${NODE_OPTIONS:+ ${NODE_OPTIONS}}"
 fi
@@ -121,6 +127,9 @@ cleanup() {
   fi
   if declare -F autonom8_wrapper_stop_parent_monitor >/dev/null; then
     autonom8_wrapper_stop_parent_monitor
+  fi
+  if declare -F autonom8_stop_live_monitor >/dev/null; then
+    autonom8_stop_live_monitor "gemini"
   fi
   persist_gemini_interrupted_artifact || true
   if [[ "${preserve_child}" == "true" ]]; then
@@ -216,6 +225,11 @@ run_with_timeout() {
     done < <(gemini_command_args "${@:2}")
   fi
 
+  if [[ "${AUTONOM8_WRAPPER_TIMEOUT_SUPERVISION:-}" == "go" ]]; then
+    "${cmd_args[@]}"
+    return $?
+  fi
+
   local timeout_cmd=""
   if command -v timeout &>/dev/null; then
     timeout_cmd="timeout"
@@ -223,7 +237,7 @@ run_with_timeout() {
     timeout_cmd="gtimeout"
   fi
 
-  if [[ -n "$timeout_cmd" && "${AUTONOM8_WRAPPER_FORCE_FALLBACK_TIMEOUT:-0}" != "1" && "${AUTONOM8_WRAPPER_CHILD_SESSION:-0}" != "1" ]]; then
+  if [[ -n "$timeout_cmd" && "${AUTONOM8_WRAPPER_FORCE_FALLBACK_TIMEOUT:-0}" != "1" && "${AUTONOM8_WRAPPER_CHILD_SESSION:-0}" != "1" && -z "${AUTONOM8_WRAPPER_FAST_FAIL_FILE:-}" ]]; then
     # Run timeout in foreground to preserve stdin (piped input)
     # Use --foreground to allow signal handling with job control
     "$timeout_cmd" --foreground --signal=TERM --kill-after=5 "$timeout_secs" "${cmd_args[@]}"
@@ -278,6 +292,23 @@ run_with_timeout() {
     while kill -0 $pid 2>/dev/null && [[ $elapsed -lt $timeout_secs ]]; do
       sleep 1
       ((elapsed++))
+      if [[ -n "${AUTONOM8_WRAPPER_FAST_FAIL_FILE:-}" && -n "${AUTONOM8_WRAPPER_FAST_FAIL_PATTERN:-}" && -s "${AUTONOM8_WRAPPER_FAST_FAIL_FILE:-}" ]]; then
+        if LC_ALL=C grep -Eiq "${AUTONOM8_WRAPPER_FAST_FAIL_PATTERN}" "${AUTONOM8_WRAPPER_FAST_FAIL_FILE}" 2>/dev/null; then
+          if declare -F autonom8_wrapper_reap_child_tree >/dev/null; then
+            autonom8_wrapper_reap_child_tree "gemini" "$pid" "${WORK_DIR:-${WORKSPACE_DIR:-$(pwd)}}" "wrapper_fast_fail"
+          else
+            kill $pid 2>/dev/null || true
+            sleep 0.5
+            kill -9 $pid 2>/dev/null || true
+          fi
+          if declare -F autonom8_wrapper_stop_parent_monitor >/dev/null; then
+            autonom8_wrapper_stop_parent_monitor
+          fi
+          wait $pid 2>/dev/null || true
+          GEMINI_PID=""
+          return "${AUTONOM8_WRAPPER_FAST_FAIL_EXIT_CODE:-86}"
+        fi
+      fi
     done
 
     if kill -0 $pid 2>/dev/null; then
@@ -1017,9 +1048,13 @@ restore_gemini_workspace_settings() {
 }
 
 # Determine core directory based on script location
-# Script is in bin/gemini.sh, so CORE_DIR is parent of bin/
+# Resolve repo root whether the wrapper is installed in <repo>/bin or checked out at repo root.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CORE_DIR="$(dirname "$SCRIPT_DIR")"
+if [[ "$(basename "$SCRIPT_DIR")" == "bin" ]]; then
+  CORE_DIR="$(dirname "$SCRIPT_DIR")"
+else
+  CORE_DIR="$SCRIPT_DIR"
+fi
 
 resolve_agent_markdown_path() {
   local candidate="${1:-}"
@@ -1213,6 +1248,10 @@ is_gemini_capacity_error() {
   local error_lower=""
   error_lower="$(printf "%s" "$error_msg" | tr '[:upper:]' '[:lower:]')"
   printf "%s" "$error_lower" | grep -qiE 'model_capacity_exhausted|resource_exhausted|no capacity available for model|ratelimitexceeded|exhausted your capacity on this model|quota will reset after'
+}
+
+gemini_capacity_fast_fail_pattern() {
+  printf "%s" 'MODEL_CAPACITY_EXHAUSTED|RESOURCE_EXHAUSTED|No capacity available for model|rateLimitExceeded|Too Many Requests|quota will reset after|exhausted your capacity on this model'
 }
 
 retry_with_gemini_capacity_fallback() {
@@ -1807,7 +1846,7 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
 
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
-    cat "$TMPFILE_PROMPT" | run_with_timeout "$CLI_TIMEOUT" gemini "${GEMINI_ARGS[@]}" 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
+    cat "$TMPFILE_PROMPT" | AUTONOM8_WRAPPER_FAST_FAIL_FILE="$TMPFILE_ERR" AUTONOM8_WRAPPER_FAST_FAIL_PATTERN="$(gemini_capacity_fast_fail_pattern)" AUTONOM8_WRAPPER_FAST_FAIL_EXIT_CODE=86 run_with_timeout "$CLI_TIMEOUT" gemini "${GEMINI_ARGS[@]}" 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
   else
     cat "$TMPFILE_PROMPT" | gemini "${GEMINI_ARGS[@]}" 2> >(tee "$TMPFILE_ERR" >&3) > "$TMPFILE_OUTPUT"
   fi
@@ -2274,14 +2313,21 @@ $TOOL_RULES
   if [[ ${#GEMINI_ARGS[@]} -gt 0 ]]; then
     GEMINI_CMD+=("${GEMINI_ARGS[@]}")
   fi
-  log_verbose "Invoking gemini CLI (Workspace: ${WORKSPACE_DIR:-none}, Tenant: ${TENANT_DIR:-none}, YOLO: $YOLO_MODE, Model: ${MODEL:-default})"
+    # Start live event monitor for provider observability
+  if declare -F autonom8_monitor_init >/dev/null; then
+    autonom8_monitor_init "gemini" "${WRAPPER_REQ_ID:-}" "$TMPFILE_ERR" "${WORK_DIR:-$(pwd)}"
+  elif declare -F autonom8_start_live_monitor >/dev/null; then
+    autonom8_start_live_monitor "gemini" "${WRAPPER_REQ_ID:-}" "$TMPFILE_ERR" "${WORK_DIR:-$(pwd)}"
+  fi
+
+log_verbose "Invoking gemini CLI (Workspace: ${WORKSPACE_DIR:-none}, Tenant: ${TENANT_DIR:-none}, YOLO: $YOLO_MODE, Model: ${MODEL:-default})"
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
     log_verbose "Running gemini with timeout: ${CLI_TIMEOUT}s"
     if [[ -n "$AGENT_LOG" ]]; then
-      cat "$TMPFILE_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "${GEMINI_CMD[@]}" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT" "$AGENT_LOG")
+      cat "$TMPFILE_PROMPT" | AUTONOM8_WRAPPER_FAST_FAIL_FILE="$TMPFILE_ERR" AUTONOM8_WRAPPER_FAST_FAIL_PATTERN="$(gemini_capacity_fast_fail_pattern)" AUTONOM8_WRAPPER_FAST_FAIL_EXIT_CODE=86 run_with_timeout "$CLI_TIMEOUT" "${GEMINI_CMD[@]}" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT" "$AGENT_LOG")
     else
-      cat "$TMPFILE_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "${GEMINI_CMD[@]}" 2> >(tee "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT")
+      cat "$TMPFILE_PROMPT" | AUTONOM8_WRAPPER_FAST_FAIL_FILE="$TMPFILE_ERR" AUTONOM8_WRAPPER_FAST_FAIL_PATTERN="$(gemini_capacity_fast_fail_pattern)" AUTONOM8_WRAPPER_FAST_FAIL_EXIT_CODE=86 run_with_timeout "$CLI_TIMEOUT" "${GEMINI_CMD[@]}" 2> >(tee "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT")
     fi
     GEMINI_EXIT=$?
   else
@@ -2293,6 +2339,11 @@ $TOOL_RULES
     GEMINI_EXIT=$?
   fi
   set -e
+
+  # Stop live event monitor
+  if declare -F autonom8_stop_live_monitor >/dev/null; then
+    autonom8_stop_live_monitor "gemini" "${WRAPPER_REQ_ID:-}"
+  fi
 
   # O-9: stdout is streamed live above; append only a footer with the captured byte count.
   if [[ -n "$AGENT_LOG" && -f "$TMPFILE_OUTPUT" && -s "$TMPFILE_OUTPUT" ]]; then
@@ -2613,7 +2664,7 @@ else
 
     set +e
     if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
-      cat "$TMPFILE_PROMPT" | run_with_timeout "$CLI_TIMEOUT" gemini $GEMINI_SESSION_ARG "${GEMINI_ARGS[@]}" 2> >(tee "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT")
+      cat "$TMPFILE_PROMPT" | AUTONOM8_WRAPPER_FAST_FAIL_FILE="$TMPFILE_ERR" AUTONOM8_WRAPPER_FAST_FAIL_PATTERN="$(gemini_capacity_fast_fail_pattern)" AUTONOM8_WRAPPER_FAST_FAIL_EXIT_CODE=86 run_with_timeout "$CLI_TIMEOUT" gemini $GEMINI_SESSION_ARG "${GEMINI_ARGS[@]}" 2> >(tee "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT")
       GEMINI_EXIT=$?
     else
       cat "$TMPFILE_PROMPT" | gemini $GEMINI_SESSION_ARG "${GEMINI_ARGS[@]}" 2> >(tee "$TMPFILE_ERR" >&3) > >(stream_stdout_to_files "$TMPFILE_OUTPUT")

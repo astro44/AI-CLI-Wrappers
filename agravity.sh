@@ -64,6 +64,9 @@ cleanup() {
     kill -9 "$AGRAVITY_PID" 2>/dev/null || true
   fi
   pkill -P $$ 2>/dev/null || true
+  if declare -F autonom8_stop_live_monitor >/dev/null 2>&1; then
+    autonom8_stop_live_monitor "agravity" "${WRAPPER_REQ_ID:-}" 2>/dev/null || true
+  fi
   rm -f "$TMPFILE_OUTPUT" "$TMPFILE_ERR" 2>/dev/null || true
 }
 trap cleanup EXIT TERM INT
@@ -698,6 +701,9 @@ if [[ -f "$SCRIPT_DIR/lib/model_utils.sh" ]]; then
     # shellcheck disable=SC1091
     source "$SCRIPT_DIR/lib/model_utils.sh"
 fi
+if [[ -f "$SCRIPT_DIR/lib/live-monitor.sh" ]]; then
+    source "$SCRIPT_DIR/lib/live-monitor.sh"
+fi
 
 MODEL_REQUESTED_RAW=""
 MODEL_RESOLUTION_NOTE=""
@@ -1159,6 +1165,10 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
 
   log_verbose "Invoking agy CLI for skill (session args: ${AGY_ARGS[*]})"
 
+  if declare -F autonom8_start_live_monitor >/dev/null 2>&1; then
+    autonom8_start_live_monitor "agravity" "${WRAPPER_REQ_ID:-}" "$TMPFILE_ERR" "${WORK_DIR:-$(pwd)}" "${HOME}/.gemini/antigravity-cli/conversations"
+  fi
+
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
     run_with_timeout "$CLI_TIMEOUT" "$AGRAVITY_BIN" ${AGY_ARGS[@]+"${AGY_ARGS[@]}"} "--print=$SKILL_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
@@ -1167,6 +1177,10 @@ CRITICAL: Return ONLY valid JSON matching the skill's output schema. No markdown
   fi
   AGRAVITY_EXIT=$?
   set -e
+
+  if declare -F autonom8_stop_live_monitor >/dev/null 2>&1; then
+    autonom8_stop_live_monitor "agravity" "${WRAPPER_REQ_ID:-}" 2>/dev/null || true
+  fi
 
   AGRAVITY_SESSION_ID="$(get_latest_agravity_session 2>/dev/null || true)"
 
@@ -1432,6 +1446,10 @@ $TOOL_RULES
     log_verbose "Agent stream logging to $AGENT_LOG"
   fi
 
+  if declare -F autonom8_start_live_monitor >/dev/null 2>&1; then
+    autonom8_start_live_monitor "agravity" "${WRAPPER_REQ_ID:-}" "$TMPFILE_ERR" "${WORKSPACE_DIR:-$(pwd)}" "${HOME}/.gemini/antigravity-cli/conversations"
+  fi
+
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
     echo "🤖 [Antigravity] Timeout: ${CLI_TIMEOUT}s" >&2
@@ -1449,6 +1467,10 @@ $TOOL_RULES
   fi
   AGRAVITY_EXIT=$?
   set -e
+
+  if declare -F autonom8_stop_live_monitor >/dev/null 2>&1; then
+    autonom8_stop_live_monitor "agravity" "${WRAPPER_REQ_ID:-}" 2>/dev/null || true
+  fi
 
   if [[ -n "$AGENT_LOG" && -f "$TMPFILE_OUTPUT" && -s "$TMPFILE_OUTPUT" ]]; then
     echo "" >> "$AGENT_LOG"
@@ -1522,6 +1544,10 @@ else
 
   echo "🤖 [Antigravity] Direct invocation" >&2
 
+  if declare -F autonom8_start_live_monitor >/dev/null 2>&1; then
+    autonom8_start_live_monitor "agravity" "${WRAPPER_REQ_ID:-}" "$TMPFILE_ERR" "${WORK_DIR:-$(pwd)}" ""
+  fi
+
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
     run_with_timeout "$CLI_TIMEOUT" "$AGRAVITY_BIN" ${AGY_ARGS[@]+"${AGY_ARGS[@]}"} "--print=$DIRECT_PROMPT" 2> "$TMPFILE_ERR" > "$TMPFILE_OUTPUT"
@@ -1530,6 +1556,10 @@ else
   fi
   AGRAVITY_EXIT=$?
   set -e
+  if declare -F autonom8_stop_live_monitor >/dev/null 2>&1; then
+    autonom8_stop_live_monitor "agravity" "${WRAPPER_REQ_ID:-}" 2>/dev/null || true
+  fi
+
 
   AGRAVITY_SESSION_ID="$(get_latest_agravity_session 2>/dev/null || true)"
 

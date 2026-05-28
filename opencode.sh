@@ -40,6 +40,12 @@ if [[ -f "$WRAPPER_LIFECYCLE_LIB" ]]; then
   source "$WRAPPER_LIFECYCLE_LIB"
 fi
 
+LIVE_MONITOR_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib/live-monitor.sh"
+if [[ -f "$LIVE_MONITOR_LIB" ]]; then
+  # shellcheck disable=SC1090
+  source "$LIVE_MONITOR_LIB"
+fi
+
 # OpenCode model is supplied by runtime/provider configuration. The wrapper must
 # not choose a concrete model unless --model is passed by the orchestrator.
 OPENCODE_MODEL=""
@@ -51,6 +57,9 @@ cleanup() {
   fi
   if declare -F autonom8_wrapper_stop_parent_monitor >/dev/null; then
     autonom8_wrapper_stop_parent_monitor
+  fi
+  if declare -F autonom8_stop_live_monitor >/dev/null; then
+    autonom8_stop_live_monitor "opencode"
   fi
   if declare -F autonom8_wrapper_reap_child_tree >/dev/null; then
     autonom8_wrapper_reap_child_tree "opencode" "${OPENCODE_PID:-}" "${WORK_DIR:-${WORKSPACE_DIR:-$(pwd)}}" "wrapper_cleanup"
@@ -102,6 +111,11 @@ opencode() {
 run_with_timeout() {
   local timeout_secs="$1"
   shift
+
+  if [[ "${AUTONOM8_WRAPPER_TIMEOUT_SUPERVISION:-}" == "go" ]]; then
+    "$@"
+    return $?
+  fi
 
   local timeout_cmd=""
   if command -v timeout &>/dev/null; then
@@ -625,9 +639,13 @@ build_session_args() {
 }
 
 # Determine core directory based on script location
-# Script is in bin/opencode.sh, so CORE_DIR is parent of bin/
+# Resolve repo root whether the wrapper is installed in <repo>/bin or checked out at repo root.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CORE_DIR="$(dirname "$SCRIPT_DIR")"
+if [[ "$(basename "$SCRIPT_DIR")" == "bin" ]]; then
+  CORE_DIR="$(dirname "$SCRIPT_DIR")"
+else
+  CORE_DIR="$SCRIPT_DIR"
+fi
 
 resolve_agent_markdown_path() {
   local candidate="${1:-}"
@@ -1458,6 +1476,13 @@ $TOOL_RULES
   TMPFILE_ERR="$(mktemp)"
   OPENCODE_SESSION_ID=""
 
+  # Start live event monitor for provider observability
+  if declare -F autonom8_monitor_init >/dev/null; then
+    autonom8_monitor_init "opencode" "${WRAPPER_REQ_ID:-}" "$TMPFILE_ERR" "${WORK_DIR:-$(pwd)}"
+  elif declare -F autonom8_start_live_monitor >/dev/null; then
+    autonom8_start_live_monitor "opencode" "${WRAPPER_REQ_ID:-}" "$TMPFILE_ERR" "${WORK_DIR:-$(pwd)}"
+  fi
+
   set +e
   # Pass the entire prompt as the message to opencode run
   # Get session ID from `opencode session list` after run completes
@@ -1531,6 +1556,11 @@ $TOOL_RULES
   fi
   OPENCODE_EXIT=$?
   set -e
+
+  # Stop live event monitor
+  if declare -F autonom8_stop_live_monitor >/dev/null; then
+    autonom8_stop_live_monitor "opencode" "${WRAPPER_REQ_ID:-}"
+  fi
 
   # O-9: Append stdout response to agent log (stderr tee only captures progress/errors,
   # opencode sends the actual response to stdout which may be missing from logs)

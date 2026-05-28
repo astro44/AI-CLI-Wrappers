@@ -321,6 +321,108 @@ These logs capture:
 
 This enables post-hoc debugging and audit trails per ticket.
 
+
+## Real-Time Provider Activity Monitor
+
+All wrappers integrate with `lib/live-monitor.sh` (656 LOC) to observe provider activity in real time. The monitor writes structured JSONL heartbeats to a per-request activity file, enabling the Go-side orchestrator to distinguish "provider is thinking" from "provider is stuck" without relying solely on stdout bytes.
+
+### Problem
+
+Provider sessions can produce zero observable stdout for extended periods — reasoning, tool execution, rate-limit backoff, and sandbox operations all happen silently. Without an activity signal, the orchestrator's zero-output watchdog kills healthy sessions that simply haven't produced terminal output yet.
+
+### Architecture
+
+```
+┌─────────────┐     ┌──────────────────┐     ┌──────────────────────────────────────────┐
+│  Provider    │────▶│  Wrapper (bash)   │────▶│  .autonom8/provider_activity/<req>.jsonl  │
+│  CLI process │     │  live-monitor.sh  │     │  {"ts":...,"event_class":...,"detail":..} │
+└─────────────┘     └──────────────────┘     └──────────────────────────────────────────┘
+                           ▲                              │
+                     stderr + session                     ▼
+                     file polling (5s)            Go CLIManager reads
+                                                  as liveness signal
+```
+
+The monitor runs as a background polling loop alongside the provider process. Every 5 seconds it:
+1. Checks stderr file growth and classifies new lines (reasoning, tool_use, rate_limit, error patterns)
+2. Discovers provider session files (`.jsonl`/`.log` in provider-specific directories)
+3. Classifies session events using provider-specific or generic parsers
+4. Writes a heartbeat event to the activity JSONL file
+
+### Setup
+
+Each wrapper applies a 4-point integration:
+
+| Point | Code | Purpose |
+|-------|------|---------|
+| Source + init | `source lib/live-monitor.sh` + `autonom8_monitor_init "<provider>"` | Load library, create no-op stream stub |
+| Cleanup trap | `autonom8_stop_live_monitor` in EXIT handler | Kill background loop on script exit |
+| Start | `autonom8_start_live_monitor` before each execution path | Launch background monitor |
+| Stop | `autonom8_stop_live_monitor` after each execution path | Stop monitor, write final event |
+
+The `autonom8_monitor_init(provider)` call creates a no-op JSONL stream stub via `eval` for any provider name. Adding a new wrapper requires only these 4 integration points (~6 lines per execution path).
+
+### Activity File Format
+
+Path: `<work_dir>/.autonom8/provider_activity/<AUTONOM8_REQUEST_ID>.jsonl`
+
+Each line is a JSON object:
+```json
+{"ts":"2026-05-28T04:15:30Z","provider":"codex","request_id":"abc123","event_class":"session_reasoning","detail":"new_lines=4"}
+```
+
+**Event classes:**
+| Class | Meaning |
+|-------|---------|
+| `monitor_start` | Monitor background loop started |
+| `monitor_stopped` | Monitor loop terminated |
+| `stderr_activity` | New stderr output detected (with byte count) |
+| `stderr_error` | Error pattern found in stderr |
+| `stderr_rate_limit` | Rate-limit signal in stderr |
+| `session_reasoning` | Provider is actively reasoning (thinking/planning) |
+| `session_tool_use` | Provider is executing a tool/function call |
+| `session_function_call` | Provider called a function (code execution, API call) |
+| `session_task_started` | Provider started a new task or subtask |
+| `session_task_complete` | Provider completed a task |
+| `codex_reasoning` | Codex-specific: reasoning event from `--json` stream |
+| `codex_function_call` | Codex-specific: function call from `--json` stream |
+| `codex_code_write` | Codex-specific: file write from `--json` stream |
+
+### Provider-Specific Classifiers
+
+Each provider has specialized stderr and session classifiers that recognize provider-native patterns:
+
+| Provider | Stderr patterns | Session discovery | Session format |
+|----------|----------------|-------------------|----------------|
+| **Codex** | `reasoning:`, `function_call:`, `write_file:`, `apply_patch:` | `~/.codex/sessions/` | `.payload.type` dispatch |
+| **Claude** | `session:`, `tool_use:`, `cost:`, `tokens:` | `~/.claude/projects/` | Generic fallback |
+| **Gemini** | `thinking`, `function_call`, `grounding`, `safety_rating` | `~/.gemini/` | Generic fallback |
+| **Cursor** | `composer`, `apply`, `tool:`, `indexing` | `~/.cursor/projects/` | `.event` dispatch |
+| **OpenCode** | `thinking`, `tool`, `session`, `inference` | (none) | Generic fallback |
+| **Agravity** | `thinking`, `function_call`, `grounding`, `safety_rating` | `~/.gemini/antigravity-cli/conversations/` | Generic fallback |
+
+All classifiers have generic fallbacks — `_autonom8_classify_generic_stderr`, `_autonom8_discover_generic_session`, and `_autonom8_classify_generic_session` — so new providers work out of the box with basic activity detection.
+
+### Codex JSONL Stream Piping
+
+Codex wrappers additionally pipe `codex exec --json` stdout through `autonom8_monitor_codex_jsonl_stream()`, which classifies each JSONL event in real time:
+
+```bash
+codex exec --json ... | autonom8_monitor_codex_jsonl_stream "$REQ_ID" "$ACTIVITY_FILE"
+```
+
+This provides per-event granularity (reasoning steps, function calls, code writes) rather than the 5-second polling resolution. Exit codes pass through correctly via `pipefail` since the stream function always exits 0.
+
+### Future: Go-Side Integration
+
+The Go CLIManager's progress goroutine (`manager.go`) already polls every 5 seconds for stdout bytes and disk mutations. The activity JSONL file is designed to be read as a 5th liveness signal:
+
+```
+<ContextDir>/.autonom8/provider_activity/<requestCorrelationID>.jsonl
+```
+
+The `AUTONOM8_REQUEST_ID` environment variable (set by CLIManager at line 6572) matches the shell-side `WRAPPER_REQ_ID`, ensuring the file path is deterministic. A reader function can seek to the last-read offset, parse new events, and update `lastActivity` to defer the zero-output watchdog.
+
 ## Prompt Size Management
 
 Each wrapper defines provider-appropriate limits:

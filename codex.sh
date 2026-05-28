@@ -38,6 +38,19 @@ if [[ -f "$WRAPPER_LIFECYCLE_LIB" ]]; then
   source "$WRAPPER_LIFECYCLE_LIB"
 fi
 
+LIVE_MONITOR_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib/live-monitor.sh"
+if [[ -f "$LIVE_MONITOR_LIB" ]]; then
+  # shellcheck disable=SC1090
+  source "$LIVE_MONITOR_LIB"
+fi
+codex_json_stream_sink() {
+  if [[ -n "${AUTONOM8_LIVE_MONITOR_ACTIVITY_FILE:-}" ]] && declare -F autonom8_monitor_codex_jsonl_stream >/dev/null; then
+    autonom8_monitor_codex_jsonl_stream "${WRAPPER_REQ_ID:-}" "${AUTONOM8_LIVE_MONITOR_ACTIVITY_FILE:-}"
+  else
+    cat >/dev/null
+  fi
+}
+
 # Cleanup function to kill child processes on script termination
 cleanup() {
   if declare -F autonom8_wrapper_write_cleanup_event >/dev/null; then
@@ -45,6 +58,9 @@ cleanup() {
   fi
   if declare -F autonom8_wrapper_stop_parent_monitor >/dev/null; then
     autonom8_wrapper_stop_parent_monitor
+  fi
+  if declare -F autonom8_stop_live_monitor >/dev/null; then
+    autonom8_stop_live_monitor "codex"
   fi
   if declare -F autonom8_wrapper_reap_child_tree >/dev/null; then
     autonom8_wrapper_reap_child_tree "codex" "${CODEX_PID:-}" "${WORK_DIR:-$(pwd)}" "wrapper_cleanup"
@@ -114,6 +130,11 @@ run_with_timeout() {
     while IFS= read -r -d '' arg; do
       cmd_args+=("$arg")
     done < <(codex_command_args "${@:2}")
+  fi
+
+  if [[ "${AUTONOM8_WRAPPER_TIMEOUT_SUPERVISION:-}" == "go" ]]; then
+    "${cmd_args[@]}"
+    return $?
   fi
 
   local timeout_cmd=""
@@ -579,9 +600,13 @@ ensure_codex_mcp_servers() {
 }
 
 # Determine core directory based on script location
-# Script is in bin/codex.sh, so CORE_DIR is parent of bin/
+# Resolve repo root whether the wrapper is installed in <repo>/bin or checked out at repo root.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CORE_DIR="$(dirname "$SCRIPT_DIR")"
+if [[ "$(basename "$SCRIPT_DIR")" == "bin" ]]; then
+  CORE_DIR="$(dirname "$SCRIPT_DIR")"
+else
+  CORE_DIR="$SCRIPT_DIR"
+fi
 
 resolve_agent_markdown_path() {
   local candidate="${1:-}"
@@ -1360,6 +1385,11 @@ if [[ "$DRY_RUN" == "true" ]]; then
   export CODEX_SANDBOX=1
   export SKIP_WEBKIT=1
   export SKIP_FIREFOX=1
+  if declare -F autonom8_monitor_init >/dev/null; then
+    autonom8_monitor_init "codex" "${WRAPPER_REQ_ID:-}" "$TMPFILE_ERR" "${WORK_DIR:-$(pwd)}" "${HOME}/.codex/sessions"
+  elif declare -F autonom8_start_live_monitor >/dev/null; then
+    autonom8_start_live_monitor "codex" "${WRAPPER_REQ_ID:-}" "$TMPFILE_ERR" "${WORK_DIR:-$(pwd)}" "${HOME}/.codex/sessions"
+  fi
 
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
@@ -1368,13 +1398,13 @@ if [[ "$DRY_RUN" == "true" ]]; then
         # Resume mode: --sandbox/-o not supported, capture stdout directly with '-' for stdin prompt
         (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3))
       else
-        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $EPHEMERAL_ARG $SANDBOX_ARG $BYPASS_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null)
+        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec --json $MODEL_ARG $EPHEMERAL_ARG $SANDBOX_ARG $BYPASS_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > >(codex_json_stream_sink))
       fi
     else
       if [[ -n "$RESUME_SESSION_ID" ]]; then
         echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3)
       else
-        echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $EPHEMERAL_ARG $SANDBOX_ARG $BYPASS_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null
+        echo "$SKILL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec --json $MODEL_ARG $EPHEMERAL_ARG $SANDBOX_ARG $BYPASS_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > >(codex_json_stream_sink)
       fi
     fi
   else
@@ -1382,18 +1412,21 @@ if [[ "$DRY_RUN" == "true" ]]; then
       if [[ -n "$RESUME_SESSION_ID" ]]; then
         (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3))
       else
-        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $EPHEMERAL_ARG $SANDBOX_ARG $BYPASS_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null)
+        (cd "$WORK_DIR" && echo "$SKILL_PROMPT" | "$CODEX_CMD" exec --json $MODEL_ARG $EPHEMERAL_ARG $SANDBOX_ARG $BYPASS_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > >(codex_json_stream_sink))
       fi
     else
       if [[ -n "$RESUME_SESSION_ID" ]]; then
         echo "$SKILL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3)
       else
-        echo "$SKILL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $EPHEMERAL_ARG $SANDBOX_ARG $BYPASS_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null
+        echo "$SKILL_PROMPT" | "$CODEX_CMD" exec --json $MODEL_ARG $EPHEMERAL_ARG $SANDBOX_ARG $BYPASS_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > >(codex_json_stream_sink)
       fi
     fi
   fi
   CODEX_EXIT=$?
   set -e
+  if declare -F autonom8_stop_live_monitor >/dev/null; then
+    autonom8_stop_live_monitor "codex" "${WRAPPER_REQ_ID:-}"
+  fi
 
   if [[ $CODEX_EXIT -eq 0 && -z "$CODEX_SESSION_ID" && "$ALLOW_SESSION_DISCOVERY" == "true" ]]; then
     CODEX_SESSION_ID="$(get_latest_codex_session)"
@@ -1855,9 +1888,9 @@ $TOOL_RULES
     log_verbose "Creating new session requested by caller: $MANAGE_SESSION (discovering provider-real Codex session after successful run)"
   fi
 
-  # Note: Removed --json flag because it causes streaming JSONL output which conflicts with -o flag
-  # The -o flag already writes only the last message, and --output-schema enforces JSON structure
-  # Redirect stdout to /dev/null to prevent duplicate output (codex writes to both file and stdout)
+  # Fresh Codex calls stream --json stdout into the live monitor while -o still
+  # captures the final assistant message. Resume calls intentionally keep the
+  # legacy stdout path until resume-streaming behavior is proven separately.
 
   # Execute in working dir if possible
   # Export CODEX_SANDBOX so Playwright skips WebKit and Firefox (crashes in sandbox)
@@ -1889,6 +1922,13 @@ $TOOL_RULES
     log_verbose "Using model: $MODEL"
   fi
 
+  # Start live event monitor for provider observability
+  if declare -F autonom8_monitor_init >/dev/null; then
+    autonom8_monitor_init "codex" "${WRAPPER_REQ_ID:-}" "$TMPFILE_ERR" "${WORK_DIR:-$(pwd)}" "${HOME}/.codex/sessions"
+  elif declare -F autonom8_start_live_monitor >/dev/null; then
+    autonom8_start_live_monitor "codex" "${WRAPPER_REQ_ID:-}" "$TMPFILE_ERR" "${WORK_DIR:-$(pwd)}" "${HOME}/.codex/sessions"
+  fi
+
   log_verbose "Invoking codex CLI (WorkDir: ${WORK_DIR:-none}, Bypass: ${BYPASS_ARG:-none}, Temp: ${TEMPERATURE:-default}, Resume: ${RESUME_SESSION_ID:-none}, Model: ${MODEL_ARG:-default})"
   # Temporarily disable set -e to capture exit code properly
   set +e
@@ -1903,9 +1943,9 @@ $TOOL_RULES
         fi
       else
         if [[ -n "$AGENT_LOG" ]]; then
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > /dev/null)
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec --json $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > >(codex_json_stream_sink))
         else
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null)
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec --json $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > >(codex_json_stream_sink))
         fi
       fi
       CODEX_EXIT=$?
@@ -1918,9 +1958,9 @@ $TOOL_RULES
         fi
       else
         if [[ -n "$AGENT_LOG" ]]; then
-          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > /dev/null
+          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec --json $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > >(codex_json_stream_sink)
         else
-          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null
+          echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec --json $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > >(codex_json_stream_sink)
         fi
       fi
       CODEX_EXIT=$?
@@ -1935,9 +1975,9 @@ $TOOL_RULES
         fi
       else
         if [[ -n "$AGENT_LOG" ]]; then
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > /dev/null)
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec --json $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > >(codex_json_stream_sink))
         else
-          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null)
+          (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec --json $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > >(codex_json_stream_sink))
         fi
       fi
       CODEX_EXIT=$?
@@ -1950,15 +1990,20 @@ $TOOL_RULES
         fi
       else
         if [[ -n "$AGENT_LOG" ]]; then
-          echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > /dev/null
+          echo "$FULL_PROMPT" | "$CODEX_CMD" exec --json $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee -a "$AGENT_LOG" "$TMPFILE_ERR" >&3) > >(codex_json_stream_sink)
         else
-          echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null
+          echo "$FULL_PROMPT" | "$CODEX_CMD" exec --json $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $SCHEMA_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > >(codex_json_stream_sink)
         fi
       fi
       CODEX_EXIT=$?
     fi
   fi
   set -e
+
+  # Stop live event monitor
+  if declare -F autonom8_stop_live_monitor >/dev/null; then
+    autonom8_stop_live_monitor "codex" "${WRAPPER_REQ_ID:-}"
+  fi
 
   # O-9: Append stdout response to agent log (stderr tee captures tool calls/thinking,
   # but the final JSON response goes to stdout via -o flag and may be missed)
@@ -2161,6 +2206,11 @@ else
   TMPFILE_ERR="$(mktemp)"
 
   log_verbose "Running in direct prompt mode (WorkDir: ${WORK_DIR:-none}, Resume: ${RESUME_SESSION_ID:-none}, Model: ${MODEL_ARG:-default})"
+  if declare -F autonom8_monitor_init >/dev/null; then
+    autonom8_monitor_init "codex" "${WRAPPER_REQ_ID:-}" "$TMPFILE_ERR" "${WORK_DIR:-$(pwd)}" "${HOME}/.codex/sessions"
+  elif declare -F autonom8_start_live_monitor >/dev/null; then
+    autonom8_start_live_monitor "codex" "${WRAPPER_REQ_ID:-}" "$TMPFILE_ERR" "${WORK_DIR:-$(pwd)}" "${HOME}/.codex/sessions"
+  fi
 
   set +e
   if [[ -n "$CLI_TIMEOUT" && "$CLI_TIMEOUT" -gt 0 ]]; then
@@ -2168,13 +2218,13 @@ else
       if [[ -n "$RESUME_SESSION_ID" ]]; then
         (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3))
       else
-        (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null)
+        (cd "$WORK_DIR" && echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec --json $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > >(codex_json_stream_sink))
       fi
     else
       if [[ -n "$RESUME_SESSION_ID" ]]; then
         echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3)
       else
-        echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null
+        echo "$FULL_PROMPT" | run_with_timeout "$CLI_TIMEOUT" "$CODEX_CMD" exec --json $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > >(codex_json_stream_sink)
       fi
     fi
   else
@@ -2182,18 +2232,21 @@ else
       if [[ -n "$RESUME_SESSION_ID" ]]; then
         (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3))
       else
-        (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null)
+        (cd "$WORK_DIR" && echo "$FULL_PROMPT" | "$CODEX_CMD" exec --json $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > >(codex_json_stream_sink))
       fi
     else
       if [[ -n "$RESUME_SESSION_ID" ]]; then
         echo "$FULL_PROMPT" | "$CODEX_CMD" exec resume $MODEL_ARG $BYPASS_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} "$RESUME_SESSION_ID" - > "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3)
       else
-        echo "$FULL_PROMPT" | "$CODEX_CMD" exec $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > /dev/null
+        echo "$FULL_PROMPT" | "$CODEX_CMD" exec --json $MODEL_ARG $SANDBOX_ARG $BYPASS_ARG $TEMP_ARG ${IMAGE_ARGS[@]+"${IMAGE_ARGS[@]}"} -o "$TMPFILE_OUTPUT" 2> >(tee "$TMPFILE_ERR" >&3) > >(codex_json_stream_sink)
       fi
     fi
   fi
   CODEX_EXIT=$?
   set -e
+  if declare -F autonom8_stop_live_monitor >/dev/null; then
+    autonom8_stop_live_monitor "codex" "${WRAPPER_REQ_ID:-}"
+  fi
 
   STDERR_TEXT="$(cat "$TMPFILE_ERR" 2>/dev/null || true)"
 
