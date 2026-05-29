@@ -543,6 +543,125 @@ _autonom8_discover_gemini_session() {
   return 0
 }
 
+# ── Agravity classifiers ─────────────────────────────────────────────────
+
+_autonom8_classify_agravity_stderr() {
+  local content="$1"
+  local request_id="$2"
+  local activity_file="$3"
+
+  local byte_count
+  byte_count="$(printf "%s" "$content" | wc -c | tr -d " ")"
+  local wrote_event=false
+
+  if printf "%s" "$content" | grep -qiE "writ(e|ing|ten)|creat(e|ing|ed)|updat(e|ing|ed)"; then
+    autonom8_monitor_write_event "agravity" "$request_id" "file_write" \
+      "bytes=$byte_count" "$activity_file"
+    wrote_event=true
+  fi
+  if printf "%s" "$content" | grep -qiE "function.call|tool.call|executing|RUN_COMMAND|VIEW_FILE|EDIT_FILE"; then
+    autonom8_monitor_write_event "agravity" "$request_id" "function_call" \
+      "bytes=$byte_count" "$activity_file"
+    wrote_event=true
+  fi
+  if printf "%s" "$content" | grep -qiE "thinking|reasoning|PLANNER_RESPONSE"; then
+    autonom8_monitor_write_event "agravity" "$request_id" "reasoning" \
+      "bytes=$byte_count" "$activity_file"
+    wrote_event=true
+  fi
+  if [[ "$wrote_event" != "true" ]]; then
+    autonom8_monitor_write_event "agravity" "$request_id" "stderr_activity" \
+      "bytes=$byte_count" "$activity_file"
+  fi
+}
+
+# Agravity session JSONL classifier — parses brain transcript.jsonl.
+# Transcript entries have: .source (USER_EXPLICIT|SYSTEM|MODEL),
+# .type (PLANNER_RESPONSE|RUN_COMMAND|VIEW_FILE|etc), .thinking (optional), .tool_calls (optional)
+_autonom8_classify_agravity_session() {
+  local content="$1"
+  local request_id="$2"
+  local activity_file="$3"
+
+  command -v jq >/dev/null 2>&1 || return 0
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    local source step_type has_thinking has_tools
+    source="$(printf "%s" "$line" | jq -r ".source // empty" 2>/dev/null || true)"
+    step_type="$(printf "%s" "$line" | jq -r ".type // empty" 2>/dev/null || true)"
+
+    case "$source" in
+      MODEL)
+        has_thinking="$(printf "%s" "$line" | jq -r 'if (.thinking // null) != null and (.thinking | length) > 0 then "yes" else "no" end' 2>/dev/null || echo no)"
+        if [[ "$has_thinking" == "yes" ]]; then
+          autonom8_monitor_write_event "agravity" "$request_id" "reasoning" \
+            "type=$step_type;source=brain_transcript" "$activity_file"
+        fi
+
+        has_tools="$(printf "%s" "$line" | jq -r 'if (.tool_calls // null) != null and (.tool_calls | length) > 0 then "yes" else "no" end' 2>/dev/null || echo no)"
+        if [[ "$has_tools" == "yes" ]]; then
+          local tool_name
+          tool_name="$(printf "%s" "$line" | jq -r ".tool_calls[0].name // empty" 2>/dev/null || true)"
+          autonom8_monitor_write_event "agravity" "$request_id" "function_call" \
+            "name=$tool_name;source=brain_transcript" "$activity_file"
+        fi
+
+        if [[ "$has_thinking" != "yes" && "$has_tools" != "yes" ]]; then
+          case "$step_type" in
+            PLANNER_RESPONSE)
+              autonom8_monitor_write_event "agravity" "$request_id" "agent_message" \
+                "type=planner;source=brain_transcript" "$activity_file"
+              ;;
+          esac
+        fi
+        ;;
+      SYSTEM)
+        case "$step_type" in
+          RUN_COMMAND)
+            autonom8_monitor_write_event "agravity" "$request_id" "function_call" \
+              "name=run_command;source=brain_transcript" "$activity_file"
+            ;;
+          VIEW_FILE|READ_FILE)
+            autonom8_monitor_write_event "agravity" "$request_id" "file_read" \
+              "name=$step_type;source=brain_transcript" "$activity_file"
+            ;;
+          EDIT_FILE|WRITE_FILE)
+            autonom8_monitor_write_event "agravity" "$request_id" "file_write" \
+              "name=$step_type;source=brain_transcript" "$activity_file"
+            ;;
+          COMMAND_OUTPUT)
+            autonom8_monitor_write_event "agravity" "$request_id" "function_call_output" \
+              "source=brain_transcript" "$activity_file"
+            ;;
+        esac
+        ;;
+    esac
+  done <<< "$content"
+}
+
+# Discover agravity brain transcript: find latest transcript.jsonl under ~/.gemini/antigravity-cli/brain/
+_autonom8_discover_agravity_session() {
+  local session_hint="$1"
+  local start_epoch="${2:-0}"
+  local brain_dir="${HOME}/.gemini/antigravity-cli/brain"
+  [[ -d "$brain_dir" ]] || return 0
+
+  local candidates latest
+  if (( start_epoch > 0 )); then
+    local ref_file="/tmp/.autonom8_monitor_ref_$$"
+    touch -t "$(date -r "$start_epoch" +"%Y%m%d%H%M.%S" 2>/dev/null || date -d "@$start_epoch" +"%Y%m%d%H%M.%S" 2>/dev/null)" "$ref_file" 2>/dev/null || touch "$ref_file"
+    candidates="$(find "$brain_dir" -path "*/.system_generated/logs/transcript.jsonl" -type f -newer "$ref_file" 2>/dev/null)"
+    rm -f "$ref_file" 2>/dev/null
+  else
+    candidates="$(find "$brain_dir" -path "*/.system_generated/logs/transcript.jsonl" -type f -mmin -5 2>/dev/null)"
+  fi
+
+  [[ -n "$candidates" ]] || return 0
+  latest="$(printf "%s" "$candidates" | xargs ls -t 2>/dev/null | head -1)"
+  [[ -n "$latest" ]] && printf "%s" "$latest"
+}
+
 # ── Cursor classifiers ──────────────────────────────────────────────────────
 
 _autonom8_classify_cursor_stderr() {

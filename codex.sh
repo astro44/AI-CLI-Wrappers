@@ -911,12 +911,39 @@ get_codex_session_reasoning() {
   session_file="$(get_codex_session_file_by_id "$session_id" 2>/dev/null || true)"
   [[ -z "$session_file" || ! -f "$session_file" ]] && return 1
 
-  local reasoning
+  local reasoning=""
+
+  # Try 1: reasoning summary from response_item reasoning events (future Codex versions may populate this)
+  reasoning="$(jq -rs '
+    [.[] | select(.type == "response_item" and (.payload.type // .payload.item.type) == "reasoning")
+     | (.payload.summary // [])[] | strings]
+    | if length > 0 then last else "" end
+  ' "$session_file" 2>/dev/null || true)"
+  [[ -n "$reasoning" && "$reasoning" != "null" ]] && { printf "%s" "$reasoning"; return 0; }
+
+  # Try 2: agent_message final_answer — implementation summary as reasoning proxy
+  reasoning="$(jq -rs '
+    [.[] | select(.type == "event_msg" and .payload.type == "agent_message" and .payload.phase == "final_answer")
+     | (.payload.message // "")]
+    | if length > 0 then last else "" end
+  ' "$session_file" 2>/dev/null || true)"
+  if [[ -n "$reasoning" && "$reasoning" != "null" && "$reasoning" != "" ]]; then
+    local summary=""
+    summary="$(printf "%s" "$reasoning" | jq -r '
+      if type == "string" then (fromjson? // {}) else . end
+      | [.implementation.summary // empty, (.verification.issues_found_and_fixed // [] | join("; "))]
+      | map(select(length > 0)) | join(" | ")
+    ' 2>/dev/null || true)"
+    [[ -n "$summary" ]] && { printf "%s" "$summary"; return 0; }
+  fi
+
+  # Try 3: derive reasoning from function_call command sequence
   reasoning="$(tail -n 4000 "$session_file" 2>/dev/null | jq -r '
-    select(.type == "event_msg" and .payload.type == "agent_reasoning")
-    | (.payload.text // empty)
-  ' | tail -n 5 | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' | sed 's/^ //;s/ $//')"
-  [[ -n "$reasoning" ]] && printf "%s" "$reasoning"
+    select(.type == "response_item" and (.payload.type // .payload.item.type) == "function_call")
+    | (.payload.arguments // .payload.item.arguments // "{}") | fromjson? // {}
+    | .cmd // empty
+  ' 2>/dev/null | tail -n 8 | sed 's/^/> /' | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' | sed 's/^ //;s/ $//')"
+  [[ -n "$reasoning" ]] && printf "Agent commands: %s" "$reasoning"
 }
 
 get_codex_session_tool_events() {
