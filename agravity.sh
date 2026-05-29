@@ -252,10 +252,10 @@ get_agravity_session_reasoning() {
   [[ -z "$path" ]] && return 1
 
   local text=""
-  text="$(jq -r '
-    select(.source == "MODEL" and (.thinking // "") != "")
-    | .thinking
-  ' "$path" 2>/dev/null | tail -n 1 || true)"
+  text="$(jq -rs '
+    [.[] | select(.source == "MODEL" and .thinking != null and (.thinking | length) > 0)]
+    | if length > 0 then last | .thinking else "" end
+  ' "$path" 2>/dev/null || true)"
 
   [[ -z "$text" || "$text" == "null" ]] && return 1
   printf "%s" "$text"
