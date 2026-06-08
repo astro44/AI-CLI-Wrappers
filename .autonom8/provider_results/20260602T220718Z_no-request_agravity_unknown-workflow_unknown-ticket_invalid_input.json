@@ -1,0 +1,102 @@
+{
+  "response": "",
+  "reasoning": "",
+  "tokens_used": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "estimated_output_tokens": 0,
+    "total_tokens": 0,
+    "cost_usd": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0
+  },
+  "metadata": {
+    "token_usage_available": false,
+    "reasoning_available": false,
+    "reasoning_source": "none",
+    "reasoning_absent_reason": "error_path",
+    "wrapper_context": {
+      "provider": "agravity",
+      "request_id": "",
+      "workflow": "",
+      "ticket_id": "",
+      "agent": "",
+      "wrapper": "agravity.sh",
+      "model_requested": "",
+      "model_effective": "",
+      "model_resolution": "",
+      "workspace_scope": "",
+      "process_group_mode": "",
+      "wrapper_timeout_supervision": ""
+    },
+    "operational_reasoning_summary": {
+      "intent": "",
+      "files_read": [],
+      "files_changed": [],
+      "commands_run": [],
+      "tool_write_count": 0,
+      "errors": [
+        "No prompt provided (pipe via stdin or pass as args)"
+      ],
+      "verification": [],
+      "final_summary": "",
+      "source": "wrapper_telemetry",
+      "signed_thinking_blocks": 0
+    },
+    "reasoning_capture": {
+      "schema_version": 1,
+      "provider": "agravity",
+      "available": false,
+      "private_reasoning_available": false,
+      "source": "none",
+      "absent_reason": "error_path",
+      "captured_chars": 0,
+      "response_chars": 0,
+      "signed_thinking_blocks": 0,
+      "operational_summary_available": true,
+      "operational_summary_source": "wrapper_telemetry",
+      "diagnostic_only": true,
+      "not_required_for_acceptance": true,
+      "quality_gate_role": "observability_only",
+      "methods_attempted": [
+        "wrapper_top_level",
+        "response_payload",
+        "session_log",
+        "stream_log"
+      ]
+    },
+    "failure_signal": {
+      "class": "invalid_input",
+      "corrective_action": "fix_wrapper_invocation_or_provider_config",
+      "retryable": false,
+      "retry_after_seconds": 0,
+      "observed_status": "",
+      "evidence_excerpt": "invalid_input | invalid_input | No prompt provided (pipe via stdin or pass as args)"
+    },
+    "economics": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "total_tokens": 0,
+      "cost_usd": 0,
+      "estimated_output_tokens": 0,
+      "output_input_ratio": 0,
+      "zero_output": true
+    },
+    "tool_yield": {
+      "call_count": 0,
+      "write_count": 0,
+      "error_count": 0,
+      "activity_class": "none",
+      "error_classes": []
+    }
+  },
+  "error": "No prompt provided (pipe via stdin or pass as args)",
+  "error_type": "invalid_input",
+  "exit_code": 2,
+  "recoverable": false,
+  "provider": "agravity",
+  "workflow": "",
+  "ticket_id": "",
+  "request_id": "",
+  "model": ""
+}

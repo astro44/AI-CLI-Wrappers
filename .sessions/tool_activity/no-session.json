@@ -1,0 +1,11 @@
+{
+  "captured_at": "2026-06-02T22:07:18Z",
+  "provider": "agravity",
+  "session_id": "no-session",
+  "request_id": "",
+  "workflow": "",
+  "ticket_id": "",
+  "tool_activity": {
+    "source": "sidecar"
+  }
+}

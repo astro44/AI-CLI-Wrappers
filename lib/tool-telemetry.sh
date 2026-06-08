@@ -48,6 +48,16 @@ autonom8_tool_activity_json() {
         else
           ($raw | split("\n") | map((try fromjson catch null) | select(. != null)))
         end;
+    def response_docs:
+      [
+        docs[]
+        | objects
+        | .response?
+        | select(type == "string" and length > 0)
+        | (try fromjson catch null)
+        | select(. != null)
+      ];
+    def all_docs: (docs + response_docs);
     def cursor_tool_call_name:
       if ((.tool_call? | type) == "object") then
         if ((.tool_call.editToolCall? | type) == "object") then "editToolCall"
@@ -210,9 +220,32 @@ autonom8_tool_activity_json() {
       | map(select(. != null) | path_like);
     def json_file_paths:
       [
-        docs[]
+        all_docs[]
         | .. | objects
         | object_path_values[]
+      ];
+    def delivery_file_path_from_value:
+      if . == null then empty
+      elif type == "string" then path_like
+      elif type == "object" then
+        (.path? // .file? // .file_path? // .filepath? // .filename? // .relative_path? // empty)
+        | path_like
+      else empty
+      end;
+    def delivery_file_values:
+      (.files_created?, .files_modified?, .files_deleted?, .files_changed?, .modified_files?, .created_files?, .changed_files?)
+      | if . == null then empty elif type == "array" then .[] else . end
+      | delivery_file_path_from_value;
+    def implementation_file_values:
+      if ((.implementation? | type) == "object") then
+        .implementation | keys[] | path_like
+      else empty
+      end;
+    def json_delivery_file_paths:
+      [
+        all_docs[]
+        | .. | objects
+        | (delivery_file_values, implementation_file_values)
       ];
     def object_command_values:
       [
@@ -253,27 +286,29 @@ autonom8_tool_activity_json() {
     | (names | map(select(class_for(.) == "read")) | length) as $read_count
     | (json_commands | unique) as $commands_run
     | ($commands_run | length) as $command_count
-    | (json_file_paths | unique | .[:20]) as $file_paths
+    | (json_delivery_file_paths | unique | .[:20]) as $delivery_file_paths
+    | ([$write_count, ($delivery_file_paths | length)] | max) as $effective_write_count
+    | ((json_file_paths + $delivery_file_paths) | unique | .[:20]) as $file_paths
     | (json_error_count + ([$raw | scan("(?i)tool[^\\n]{0,80}(?:error|failed|failure)")] | length)) as $errors
     | ([json_tool_events[]?.timestamp | select(length > 0)] | sort) as $timestamps
     | (names | length) as $call_count
-    | (if ($timestamps | length) > 0 then $timestamps[0] elif $call_count > 0 then now_iso else "" end) as $first_tool_at
-    | (if ($timestamps | length) > 0 then $timestamps[-1] elif $call_count > 0 then now_iso else "" end) as $last_tool_at
+    | (if ($timestamps | length) > 0 then $timestamps[0] elif ($call_count > 0 or $effective_write_count > 0) then now_iso else "" end) as $first_tool_at
+    | (if ($timestamps | length) > 0 then $timestamps[-1] elif ($call_count > 0 or $effective_write_count > 0) then now_iso else "" end) as $last_tool_at
     | {
         call_count: $call_count,
-        write_count: $write_count,
+        write_count: $effective_write_count,
         read_count: $read_count,
         command_count: $command_count,
-        tool_write_count: $write_count,
+        tool_write_count: $effective_write_count,
         tool_read_count: $read_count,
         commands_run_count: $command_count,
         error_count: $errors,
         error_classes: $error_classes,
         tool_errors: $error_classes,
         tool_names: $unique_names,
-        result_classes: $classes,
+        result_classes: (($classes + (if $effective_write_count > 0 then ["write"] else [] end)) | unique),
         file_paths: $file_paths,
-        files_changed: (if $write_count > 0 then $file_paths else [] end),
+        files_changed: (if $effective_write_count > 0 then (if ($delivery_file_paths | length) > 0 then $delivery_file_paths else $file_paths end) else [] end),
         files_read: (if $read_count > 0 then $file_paths else [] end),
         commands: ($commands_run | .[:10]),
         commands_run: ($commands_run | .[:10]),
@@ -281,7 +316,7 @@ autonom8_tool_activity_json() {
         last_tool_at: $last_tool_at,
         activity_class: (
           if $errors > 0 then "tool_errors"
-          elif $write_count > 0 then "write_active"
+          elif $effective_write_count > 0 then "write_active"
           elif $call_count > 0 then "tool_active"
           else "none"
           end

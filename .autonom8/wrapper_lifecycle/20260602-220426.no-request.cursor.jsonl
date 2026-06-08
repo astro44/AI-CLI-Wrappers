@@ -1,0 +1,1 @@
+{"at":"2026-06-02T22:04:26Z","event":"cleanup","provider":"cursor","request_id":"no-request","wrapper_pid":67061,"wrapper_ppid":66606,"expected_parent_pid":"","child_pid":"","work_dir":"/Users/astrix/repos/AI-CLI-Wrappers","detail":"wrapper_cleanup;parent_alive=unknown;child_alive=false;wrapper_ppid=66606"}

@@ -281,6 +281,45 @@ JSONL
   echo "[PASS] generic tool telemetry fixture"
 }
 
+assert_delivery_json_tool_telemetry_fallback_fixture() {
+  local fixture out created_path modified_path implementation_path
+  fixture="$(mktemp)"
+  out="$(mktemp)"
+  created_path="src/styles/main.css"
+  modified_path="src/pages/index.html"
+  implementation_path="src/js/main.js"
+
+  cat > "$fixture" <<JSON
+{"response":"{\"status\":\"implemented\",\"files_created\":[{\"path\":\"$created_path\"}],\"files_modified\":[\"$modified_path\"],\"implementation\":{\"$implementation_path\":\"wired page init\"}}","metadata":{"token_usage_available":true}}
+JSON
+
+  # shellcheck disable=SC1090
+  source "$LIB_DIR/tool-telemetry.sh"
+  autonom8_tool_activity_json "$(cat "$fixture")" "" "fixture:delivery-json" > "$out"
+
+  if ! jq -e \
+    --arg created "$created_path" \
+    --arg modified "$modified_path" \
+    --arg implementation "$implementation_path" '
+    .call_count == 0 and
+    .write_count == 3 and
+    .tool_write_count == 3 and
+    .activity_class == "write_active" and
+    (.result_classes | index("write")) and
+    (.files_changed | index($created)) and
+    (.files_changed | index($modified)) and
+    (.files_changed | index($implementation))
+  ' "$out" >/dev/null; then
+    echo "[FAIL] delivery JSON telemetry fallback did not detect declared file writes"
+    cat "$out"
+    rm -f "$fixture" "$out"
+    return 1
+  fi
+
+  rm -f "$fixture" "$out"
+  echo "[PASS] delivery JSON telemetry fallback fixture"
+}
+
 assert_claude_operational_summary_fixture() {
   local tmp_home session_id session_dir session_file out_file abs_file secret_cmd
   tmp_home="$(mktemp -d)"
@@ -460,6 +499,7 @@ run_static_checks() {
   assert_tool_telemetry_contract_wiring "$LIB_DIR/tool-telemetry.sh"
   assert_cursor_tool_telemetry_fixture
   assert_generic_tool_telemetry_fixture
+  assert_delivery_json_tool_telemetry_fallback_fixture
   assert_wrapper_contract_wiring "$WRAPPER_DIR/claude.sh" "claude"
   assert_wrapper_contract_wiring "$WRAPPER_DIR/gemini.sh" "gemini"
   assert_wrapper_contract_wiring "$WRAPPER_DIR/codex.sh" "codex"

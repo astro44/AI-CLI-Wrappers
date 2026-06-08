@@ -487,6 +487,26 @@ emit_cli_response() {
     reasoning_absent_reason="model_not_emitted"
   fi
 
+  # Fallback: promote operational summary as reasoning proxy when thinking is encrypted
+  if [[ "$reasoning_available" != "true" && -n "$session_id" ]]; then
+    local ops_reasoning=""
+    ops_reasoning="$(get_claude_operational_summary "$session_id" 2>/dev/null || true)"
+    if [[ -n "$ops_reasoning" ]]; then
+      local ops_intent ops_summary ops_combined
+      ops_intent="$(printf "%s" "$ops_reasoning" | jq -r '.intent // empty' 2>/dev/null || true)"
+      ops_summary="$(printf "%s" "$ops_reasoning" | jq -r '.final_summary // empty' 2>/dev/null || true)"
+      ops_combined="${ops_intent:+$ops_intent}${ops_intent:+${ops_summary:+ | }}${ops_summary}"
+      if [[ ${#ops_combined} -gt 10 ]]; then
+        reasoning_text="$(compact_reasoning_text "$ops_combined" | cut -c1-600)"
+        reasoning_available=true
+        reasoning_source="operational_summary"
+        reasoning_absent_reason="available"
+      else
+        reasoning_absent_reason="insufficient_reasoning_length"
+      fi
+    fi
+  fi
+
   local response_chars=${#response_text}
   local estimated_output_tokens=$((response_chars / 4))
   if [[ $response_chars -gt 0 && $estimated_output_tokens -le 0 ]]; then
@@ -606,6 +626,24 @@ emit_cli_error_response() {
         reasoning_available=true
         reasoning_source="session_log_error_fallback"
         reasoning_absent_reason="available"
+      fi
+    fi
+
+    # Error-path fallback: promote operational summary as reasoning proxy
+    if [[ "$reasoning_available" != "true" ]]; then
+      local ops_err_reasoning=""
+      ops_err_reasoning="$(get_claude_operational_summary "$session_id" 2>/dev/null || true)"
+      if [[ -n "$ops_err_reasoning" ]]; then
+        local ops_err_intent ops_err_summary ops_err_combined
+        ops_err_intent="$(printf "%s" "$ops_err_reasoning" | jq -r '.intent // empty' 2>/dev/null || true)"
+        ops_err_summary="$(printf "%s" "$ops_err_reasoning" | jq -r '.final_summary // empty' 2>/dev/null || true)"
+        ops_err_combined="${ops_err_intent:+$ops_err_intent}${ops_err_intent:+${ops_err_summary:+ | }}${ops_err_summary}"
+        if [[ ${#ops_err_combined} -gt 10 ]]; then
+          reasoning_text="$(compact_reasoning_text "$ops_err_combined" | cut -c1-600)"
+          reasoning_available=true
+          reasoning_source="operational_summary"
+          reasoning_absent_reason="available"
+        fi
       fi
     fi
   fi
@@ -2283,11 +2321,16 @@ $TOOL_RULES
       log_verbose "Using model: $MODEL"
     fi
 
-        # Start live event monitor for provider observability
+        # Start live event monitor for provider observability.
+        # 5th arg = session_hint: --print --output-format json emits nothing
+        # incremental to stdout/stderr, so the monitor tails Claude's on-disk
+        # transcript (~/.claude/projects/**/<session>.jsonl) for live reasoning/
+        # tool-use activity. Without it Claude only ever logs monitor_start/stop
+        # and the worker's no-activity watchdog SIGTERMs a working call.
     if declare -F autonom8_monitor_init >/dev/null; then
-      autonom8_monitor_init "claude" "${WRAPPER_REQ_ID:-}" "$TMPFILE_ERR" "${WORK_DIR:-$(pwd)}"
+      autonom8_monitor_init "claude" "${WRAPPER_REQ_ID:-}" "$TMPFILE_ERR" "${WORK_DIR:-$(pwd)}" "${HOME}/.claude/projects"
     elif declare -F autonom8_start_live_monitor >/dev/null; then
-      autonom8_start_live_monitor "claude" "${WRAPPER_REQ_ID:-}" "$TMPFILE_ERR" "${WORK_DIR:-$(pwd)}"
+      autonom8_start_live_monitor "claude" "${WRAPPER_REQ_ID:-}" "$TMPFILE_ERR" "${WORK_DIR:-$(pwd)}" "${HOME}/.claude/projects"
     fi
 
 log_verbose "Invoking claude CLI (WorkDir: ${WORK_DIR:-none}, Bypass: ${BYPASS_ARG:-none}, Session: ${SESSION_ARG:-none}, Model: ${MODEL_ARG:-default}, Mode: ${MODE_ARG:-default}, Format: $OUTPUT_FORMAT)"

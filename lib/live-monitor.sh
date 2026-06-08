@@ -491,14 +491,79 @@ _autonom8_classify_claude_stderr() {
   fi
 }
 
+# Claude session JSONL classifier — Claude Code writes a live transcript at
+# ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl while it works. Each line
+# is an assistant/user turn whose .message.content[] carries the content blocks:
+#   thinking    -> reasoning            (private reasoning observed; text is not
+#                                         durably persisted, so we only signal it
+#                                         occurred — never synthesize its content)
+#   tool_use    -> function_call        (carries .name)
+#   tool_result -> function_call_output
+#   text        -> agent_message
+# One transcript line can hold several blocks, so we emit one event per block.
 _autonom8_classify_claude_session() {
   local content="$1"
   local request_id="$2"
   local activity_file="$3"
+
+  command -v jq >/dev/null 2>&1 || return 0
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    local blocks
+    blocks="$(printf "%s" "$line" | jq -r '
+      (.message.content // empty)
+      | if type == "array" then .[] else empty end
+      | select(type == "object")
+      | [(.type // ""), (.name // "")] | @tsv
+    ' 2>/dev/null || true)"
+    [[ -n "$blocks" ]] || continue
+
+    while IFS=$'\t' read -r block_type tool_name; do
+      case "$block_type" in
+        thinking)
+          autonom8_monitor_write_event "claude" "$request_id" "reasoning" \
+            "source=session_jsonl" "$activity_file"
+          ;;
+        tool_use)
+          autonom8_monitor_write_event "claude" "$request_id" "function_call" \
+            "name=${tool_name};source=session_jsonl" "$activity_file"
+          ;;
+        tool_result)
+          autonom8_monitor_write_event "claude" "$request_id" "function_call_output" \
+            "source=session_jsonl" "$activity_file"
+          ;;
+        text)
+          autonom8_monitor_write_event "claude" "$request_id" "agent_message" \
+            "source=session_jsonl" "$activity_file"
+          ;;
+      esac
+    done <<< "$blocks"
+  done <<< "$content"
 }
 
+# Discover the Claude session transcript: newest *.jsonl under ~/.claude/projects
+# created/touched after the monitor started. Mirrors the codex/cursor discoverers
+# — match by freshness, not by id, because a fresh call's session id is only known
+# once Claude returns.
 _autonom8_discover_claude_session() {
-  return 0
+  local session_dir="$1"
+  local start_epoch="${2:-0}"
+  [[ -d "$session_dir" ]] || return 0
+
+  local candidates latest
+  if (( start_epoch > 0 )); then
+    local ref_file="/tmp/.autonom8_monitor_ref_$$"
+    touch -t "$(date -r "$start_epoch" +"%Y%m%d%H%M.%S" 2>/dev/null || date -d "@$start_epoch" +"%Y%m%d%H%M.%S" 2>/dev/null)" "$ref_file" 2>/dev/null || touch "$ref_file"
+    candidates="$(find "$session_dir" -name "*.jsonl" -type f -newer "$ref_file" 2>/dev/null)"
+    rm -f "$ref_file" 2>/dev/null
+  else
+    candidates="$(find "$session_dir" -name "*.jsonl" -type f -mmin -2 2>/dev/null)"
+  fi
+
+  [[ -n "$candidates" ]] || return 0
+  latest="$(printf "%s" "$candidates" | xargs ls -t 2>/dev/null | head -1)"
+  [[ -n "$latest" ]] && printf "%s" "$latest"
 }
 
 # ── Gemini classifiers ──────────────────────────────────────────────────────
